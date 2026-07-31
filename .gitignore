@@ -1,0 +1,24 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 环境变量（密钥）
+.env
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE 配置（可选）
+.idea/
+.vscode/
+
+# Claude Code 本地缓存
+.claude/
+
+# 运行时生成的资料缓存
+materials/
+reports/
+knowledge/
