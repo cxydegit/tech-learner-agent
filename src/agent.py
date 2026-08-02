@@ -257,20 +257,87 @@ def run_read(url: str) -> None:
     console.print(Panel(Markdown(report), title="✅ 文档解读完成", style="green"))
 
 
+def _parse_entries(raw: str) -> list[dict]:
+    """从 LLM 响应中稳健地解析知识点 JSON 数组。
+
+    兼容：去掉 ```json 代码块包裹、从文本中抽取第一个 JSON 数组。
+
+    Returns:
+        [{topic, tags, content}, ...]，解析失败返回 []
+    """
+    text = raw.strip()
+    # 去掉 ```json ... ``` 包裹
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    def _as_list(data):
+        return [d for d in data if isinstance(d, dict)] if isinstance(data, list) else []
+
+    # 直接解析整个响应
+    try:
+        return _as_list(json.loads(text))
+    except Exception:
+        pass
+
+    # 抽取第一个 JSON 数组块
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
+        try:
+            return _as_list(json.loads(m.group(0)))
+        except Exception:
+            pass
+    return []
+
+
 def run_note(tech: str, conversation_log: str) -> None:
-    """运行知识沉淀任务。
+    """运行知识沉淀任务（确定性管道）。
+
+    流程：LLM 提取知识点(JSON) → 逐条去重/合并入库 → 更新索引。
 
     Args:
         tech: 技术名称
         conversation_log: 本轮学习的对话记录或文档内容
     """
-    from .prompts import NOTE_SYSTEM_PROMPT
+    from .prompts import EXTRACT_SYSTEM_PROMPT
+    from .storage import persist_note
 
     console.print(Panel(f"📝 开始整理「{tech}」的学习笔记...", style="bold blue"))
-    agent = Agent(NOTE_SYSTEM_PROMPT)
-    result = agent.run(
-        f"请从以下学习内容中提取关键知识点，整理到知识库中。\n"
-        f"技术领域：{tech}\n\n"
-        f"学习内容：\n{conversation_log[:6000]}"
+
+    # 1. LLM 提取关键知识点（单次调用，输出 JSON）
+    content = conversation_log[:12000]
+    console.print("🧠 [bold cyan]LLM 提取知识点...[/bold cyan]")
+    raw = _generate_text(
+        EXTRACT_SYSTEM_PROMPT,
+        f"技术领域：{tech}\n\n===== 学习内容开始 =====\n{content}\n===== 学习内容结束 =====",
     )
-    console.print(Panel(Markdown(result), title="✅ 知识沉淀完成", style="green"))
+    entries = _parse_entries(raw)
+
+    if not entries:
+        console.print("[yellow]⚠ 未提取到可入库的知识点。[/yellow]")
+        console.print(Panel(Markdown(raw), title="LLM 原始返回", style="dim"))
+        return
+
+    # 2. 逐条去重/合并并入库
+    new_count = merged_count = 0
+    results: list[dict] = []
+    for e in entries:
+        topic = (e.get("topic") or "").strip()
+        body = (e.get("content") or "").strip()
+        if not topic or not body:
+            continue
+        tags = e.get("tags") or [tech]
+        result = persist_note(tech, topic, body, tags)
+        results.append(result)
+        if result["action"] == "new":
+            new_count += 1
+        else:
+            merged_count += 1
+
+    console.print(f"✅ 本次沉淀：新增 [bold]{new_count}[/bold] 篇，合并更新 [bold]{merged_count}[/bold] 篇")
+    for r in results:
+        label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
+        console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")
+
+    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(results)} 个知识点已写入 `knowledge/`。"
+                                  f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))

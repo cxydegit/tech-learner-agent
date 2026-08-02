@@ -3,7 +3,6 @@
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from .config import config
 
@@ -26,33 +25,88 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r"[^\w\-]", "-", name.strip()).strip("-").lower()
 
 
-def save_note(tech: str, topic: str, content: str) -> Path:
-    """保存一篇知识笔记。
+def _topics_overlap(a: str, b: str) -> bool:
+    """判断两个知识点标题是否高度相似（用于去重）。
+
+    满足以下任一条件即视为重叠：
+    - 完全相等
+    - 一方是另一方的子串
+    - 去掉停用词后，共享的关键词占比 >= 40%
+    """
+    a, b = a.lower().strip(), b.lower().strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if a in b or b in a:
+        return True
+
+    def _words(s: str) -> set[str]:
+        # 中文按字词切分，英文按空格切分；去停用词
+        stop = {"的", "了", "和", "与", "在", "用", "是", "对", "个", "the", "a", "an",
+                "and", "of", "in", "to", "for", "on", "with", "by"}
+        w = set(re.findall(r"[a-zA-Z0-9]+", s)) | set(re.findall(r"[一-鿿]", s))
+        return {x for x in w if x not in stop}
+
+    wa, wb = _words(a), _words(b)
+    if not wa or not wb:
+        return False
+    intersect = wa & wb
+    overlap = max(len(intersect) / len(wa), len(intersect) / len(wb))
+    return overlap >= 0.4
+
+
+def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None) -> dict:
+    """持久化一条知识笔记，自动去重/合并。
+
+    若知识库中已有高度相似的主题，则作为"补充"合并到已有笔记文件；
+    否则创建新的 dated 笔记文件并更新索引。
 
     Args:
         tech: 技术名称（如 "spring-boot"）
         topic: 知识点主题（如 "依赖注入"）
-        content: Markdown 格式的笔记内容
+        content: Markdown 格式的笔记正文
+        tags: 标签列表
 
     Returns:
-        保存的文件路径
+        {"action": "new"|"merged", "path": str（相对 knowledge/）, "topic": str}
     """
     ensure_knowledge_base()
-
     tech_dir = config.KNOWLEDGE_DIR / sanitize_filename(tech)
     tech_dir.mkdir(parents=True, exist_ok=True)
 
+    # 去重：寻找相似主题的已有笔记
+    existing = get_existing_notes(tech)
+    match = next((n for n in existing if _topics_overlap(n["topic"], topic)), None)
+
+    if match:
+        # 合并：追加"补充"章节到已有文件
+        existing_path = config.KNOWLEDGE_DIR / match["path"]
+        _append_section(existing_path, content)
+        return {"action": "merged", "path": match["path"], "topic": match["topic"]}
+
+    # 新建：dated 文件 + 更新索引
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"{date_str}-{sanitize_filename(topic)}.md"
     filepath = tech_dir / filename
+    filepath.write_text(_with_header(topic, tags, content), encoding="utf-8")
+    update_index(tech, topic, filepath)
+    return {"action": "new", "path": str(filepath.relative_to(config.KNOWLEDGE_DIR)), "topic": topic}
 
-    # 如果文件已存在，追加内容
-    if filepath.exists():
-        existing = filepath.read_text(encoding="utf-8")
-        content = existing + "\n\n---\n\n## 补充（更新于 {date_str}）\n\n".format(date_str=date_str) + content
 
-    filepath.write_text(content, encoding="utf-8")
-    return filepath
+def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
+    """给笔记正文加上标题和标签头部。"""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    tag_str = " ".join(f"#{t}" for t in (tags or []))
+    return f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n{content.lstrip()}"
+
+
+def _append_section(existing_path: Path, content: str) -> None:
+    """在已有笔记文件后追加"补充"章节。"""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    existing = existing_path.read_text(encoding="utf-8")
+    combined = existing.rstrip() + f"\n\n---\n\n## 补充（更新于 {date_str}）\n\n" + content
+    existing_path.write_text(combined, encoding="utf-8")
 
 
 def update_index(tech: str, topic: str, filepath: Path) -> None:
