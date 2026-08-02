@@ -49,15 +49,17 @@ def search_tool(query: str, max_results: int = 10) -> dict[str, Any]:
 # 网页抓取工具
 # ============================================================
 
-def fetch_tool(url: str) -> dict[str, Any]:
+def fetch_tool(url: str, max_chars: int = 0) -> dict[str, Any]:
     """使用 Firecrawl 抓取网页内容为 Markdown。
 
     Args:
         url: 目标网页 URL
+        max_chars: 截取的最大字符数；0 表示使用配置的 MAX_FETCH_CHARS
 
     Returns:
         dict: {"url": str, "markdown": str, "title": str}
     """
+    limit = max_chars or config.MAX_FETCH_CHARS
     app = FirecrawlApp(api_key=config.FIRECRAWL_API_KEY)
     response = app.scrape_url(url)
 
@@ -82,9 +84,9 @@ def fetch_tool(url: str) -> dict[str, Any]:
 
     return {
         "url": url,
-        "markdown": markdown[:8000],  # truncate to avoid context overflow
+        "markdown": markdown[:limit],
         "title": title,
-        "truncated": len(markdown) > 8000,
+        "truncated": len(markdown) > limit,
     }
 
 

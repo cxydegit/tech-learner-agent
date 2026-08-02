@@ -9,6 +9,13 @@ from rich.console import Console
 from .config import config
 from .agent import run_collect, run_read, run_note
 
+# Windows 原生控制台默认 GBK 编码，无法输出 emoji/部分中文符号。
+# 强制 stdout/stderr 使用 UTF-8，避免 Rich 渲染 emoji 时报 UnicodeEncodeError。
+if sys.stdout:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if sys.stderr:
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 console = Console()
 
 

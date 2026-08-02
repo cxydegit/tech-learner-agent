@@ -11,7 +11,7 @@ from rich.panel import Panel
 
 from .config import config
 from .prompts import REACT_SYSTEM_PROMPT
-from .tools import execute_tool, get_tool_descriptions
+from .tools import execute_tool, fetch_tool, save_file_tool, get_tool_descriptions
 
 console = Console()
 
@@ -185,23 +185,76 @@ def run_collect(tech_name: str) -> None:
     console.print(Panel(Markdown(result), title="✅ 资料收集完成", style="green"))
 
 
+def _generate_text(system_prompt: str, user_content: str) -> str:
+    """执行一次（非循环的）LLM 生成，返回响应文本。
+
+    适用于"URL → 抓取 → 生成 → 保存"这类确定性管道任务，
+    不需要 Agent 自主选择工具，因而跳过 ReAct 循环以降低开销和失败率。
+
+    Args:
+        system_prompt: 系统提示词
+        user_content: 用户内容（已抓取的文档等）
+
+    Returns:
+        LLM 生成的文本
+    """
+    client = OpenAI(
+        api_key=config.OPENAI_API_KEY,
+        base_url=config.OPENAI_BASE_URL,
+    )
+    response = client.chat.completions.create(
+        model=config.LLM_MODEL,
+        max_tokens=config.LLM_MAX_TOKENS,
+        temperature=0.5,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    )
+    return response.choices[0].message.content
+
+
 def run_read(url: str) -> None:
-    """运行文档阅读辅助任务。
+    """运行文档阅读辅助任务（确定性管道）。
+
+    流程：Firecrawl 抓取 → LLM 解读 → 保存 reports/ 报告。
 
     Args:
         url: 文档 URL
     """
+    from datetime import datetime
     from .prompts import READ_SYSTEM_PROMPT
+    from .storage import sanitize_filename
 
     console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
     console.print(f"[dim]{url}[/dim]")
 
-    agent = Agent(READ_SYSTEM_PROMPT)
-    result = agent.run(
-        f"请解读以下文档，并生成解读报告：\n{url}\n"
-        f"保存到 reports/ 目录下。"
+    # 1. 抓取文档内容
+    fetched = fetch_tool(url)
+    if not fetched.get("markdown"):
+        console.print("[red]❌ 抓取文档内容失败，请检查 URL 是否有效。[/red]")
+        if fetched.get("error"):
+            console.print(f"[dim]{fetched['error']}[/dim]")
+        return
+    console.print(f"✅ 抓取成功，内容 {len(fetched['markdown'])} 字符"
+                  f"{'（已截断，仅截取片段）' if fetched.get('truncated') else ''}")
+
+    # 2. 生成解读报告（单次 LLM 调用）
+    console.print("🧠 [bold cyan]LLM 生成解读报告...[/bold cyan]")
+    report = _generate_text(
+        READ_SYSTEM_PROMPT,
+        f"请解读以下文档内容，生成结构化解读报告。\n"
+        f"原文地址：{url}\n"
+        f"文档标题：{fetched.get('title') or '未知'}\n\n"
+        f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
     )
-    console.print(Panel(Markdown(result), title="✅ 文档解读完成", style="green"))
+
+    # 3. 保存报告
+    title = fetched.get("title") or "文档"
+    filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().strftime('%Y%m%d')}-解读.md"
+    save_result = save_file_tool(f"reports/{filename}", report)
+    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
+    console.print(Panel(Markdown(report), title="✅ 文档解读完成", style="green"))
 
 
 def run_note(tech: str, conversation_log: str) -> None:

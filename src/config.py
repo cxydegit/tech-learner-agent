@@ -32,6 +32,9 @@ class Config:
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
     MAX_FETCH_PAGES: int = int(os.getenv("MAX_FETCH_PAGES", "5"))
 
+    # 抓取内容长度限制（字符数）
+    MAX_FETCH_CHARS: int = int(os.getenv("MAX_FETCH_CHARS", "16000"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """验证必要配置，返回缺失项列表"""
