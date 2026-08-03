@@ -22,6 +22,11 @@ class Config:
     LLM_MODEL: str = os.getenv("MODEL_NAME", "")
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
+    # Agent 是否使用原生 function calling（true）或文本正则解析（false）。
+    # 默认 false：阿里云百炼 qwen3.7-plus 等模型不返回原生 tool_calls（返回文本形式），
+    # 用文本解析更稳定；遇到支持原生 function calling 的模型可设 AGENT_USE_FUNCTION_CALLING=true。
+    AGENT_USE_FUNCTION_CALLING: bool = os.getenv("AGENT_USE_FUNCTION_CALLING", "false").lower() == "true"
+
     # 路径配置
     BASE_DIR: Path = Path(__file__).parent.parent
     MATERIALS_DIR: Path = BASE_DIR / "materials"

@@ -162,22 +162,59 @@ TOOL_REGISTRY = {
     "search": {
         "function": search_tool,
         "description": "搜索互联网资料。参数: query (str) — 搜索关键词, max_results (int, 可选) — 最大结果数",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词"},
+                "max_results": {"type": "integer", "description": "最大返回结果数（可选）"},
+            },
+            "required": ["query"],
+        },
     },
     "fetch": {
         "function": fetch_tool,
         "description": "抓取网页内容为 Markdown。参数: url (str) — 目标网页 URL",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "目标网页 URL"},
+            },
+            "required": ["url"],
+        },
     },
     "save_file": {
         "function": save_file_tool,
         "description": "保存内容到本地文件。参数: path (str) — 相对路径, content (str) — 文件内容",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对于项目根目录的文件路径"},
+                "content": {"type": "string", "description": "文件内容（Markdown 文本）"},
+            },
+            "required": ["path", "content"],
+        },
     },
     "read_file": {
         "function": read_file_tool,
         "description": "读取本地文件。参数: path (str) — 相对路径",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "相对于项目根目录的文件路径"},
+            },
+            "required": ["path"],
+        },
     },
     "list_files": {
         "function": list_files_tool,
         "description": "列出目录结构。参数: directory (str, 可选) — 相对目录路径",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "directory": {"type": "string", "description": "相对于项目根目录的目录路径（可选）"},
+            },
+            "required": [],
+        },
     },
 }
 
@@ -188,6 +225,25 @@ def get_tool_descriptions() -> str:
     for name, info in TOOL_REGISTRY.items():
         lines.append(f"- **{name}**: {info['description']}")
     return "\n".join(lines)
+
+
+def get_tool_schemas() -> list[dict]:
+    """生成 OpenAI function calling 的 tools 参数列表。
+
+    Returns:
+        [{"type": "function", "function": {name, description, parameters}}, ...]
+    """
+    schemas = []
+    for name, info in TOOL_REGISTRY.items():
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": info["description"],
+                "parameters": info["schema"],
+            },
+        })
+    return schemas
 
 
 def execute_tool(name: str, params: dict[str, Any]) -> str:

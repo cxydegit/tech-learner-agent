@@ -7,7 +7,7 @@ import click
 from rich.console import Console
 
 from .config import config
-from .agent import run_collect, run_read, run_note
+from .agent import run_collect, run_read, run_note, run_dig
 
 # Windows 原生控制台默认 GBK 编码，无法输出 emoji/部分中文符号。
 # 强制 stdout/stderr 使用 UTF-8，避免 Rich 渲染 emoji 时报 UnicodeEncodeError。
@@ -35,12 +35,27 @@ def cli():
 
 @cli.command()
 @click.argument("tech_name")
-def collect(tech_name: str):
-    """收集指定技术的学习资料。
+@click.argument("level", required=False, type=click.Choice(["入门", "进阶"], case_sensitive=False))
+def collect(tech_name: str, level: str = None):
+    """收集指定技术的学习资料（全面学习，按级别）。
 
-    TECH_NAME: 要学习的技术名称，如 "Spring Boot 3"、"FastAPI"
+    TECH_NAME: 技术名称，如 "Spring Boot 3"、"FastAPI"（含空格需加引号）
+    LEVEL: 可选，入门 或 进阶，默认入门
     """
-    run_collect(tech_name)
+    run_collect(tech_name, level or "入门")
+
+
+@cli.command()
+@click.argument("tech_name")
+@click.argument("direction", nargs=-1, required=True)
+def dig(tech_name: str, direction: tuple):
+    """深挖指定技术的具体方向。
+
+    TECH_NAME: 技术名称，如 "Spring Boot"（含空格需加引号）
+    DIRECTION: 具体方向，如 "注解原理"、"底层框架"（多词自动拼接）
+    """
+    direction_text = " ".join(direction)
+    run_dig(tech_name, direction_text)
 
 
 @cli.command()

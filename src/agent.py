@@ -11,7 +11,7 @@ from rich.panel import Panel
 
 from .config import config
 from .prompts import REACT_SYSTEM_PROMPT
-from .tools import execute_tool, fetch_tool, save_file_tool, get_tool_descriptions
+from .tools import execute_tool, search_tool, fetch_tool, save_file_tool, get_tool_descriptions, get_tool_schemas
 
 console = Console()
 
@@ -43,6 +43,10 @@ class Agent:
             "content": full_system,
         })
 
+        # 是否启用原生 function calling（默认开启，可用 AGENT_USE_FUNCTION_CALLING=false 关闭）
+        self.use_function_calling = config.AGENT_USE_FUNCTION_CALLING
+        self.tool_schemas = get_tool_schemas() if self.use_function_calling else None
+
     def run(self, user_input: str) -> str:
         """执行 Agent 的主循环，返回最终结果。
 
@@ -61,8 +65,29 @@ class Agent:
         while loop_count < MAX_LOOP_COUNT:
             loop_count += 1
 
-            # 调用 LLM
-            response_text = self._call_llm()
+            # 调用 LLM（带 tools 时会走原生 function calling）
+            message = self._call_llm()
+
+            # 情况一：原生 function calling —— 模型返回结构化 tool_calls
+            if getattr(message, "tool_calls", None):
+                for tc in message.tool_calls:
+                    name = tc.function.name
+                    try:
+                        params = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        params = {}
+                    console.print(f"🔧 [bold cyan]调用工具: {name}[/bold cyan]")
+                    result = execute_tool(name, params)
+                    # 以 role="tool" 回填结果，SDK 会按 tool_call_id 关联
+                    self.conversation.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
+                continue
+
+            # 情况二：文本解析 fallback（非 function calling 模型）
+            response_text = message.content or ""
 
             # 检查是否完成
             final_answer = self._extract_final_answer(response_text)
@@ -96,32 +121,43 @@ class Agent:
             "role": "user",
             "content": "已达到最大循环次数。请基于目前收集到的信息，给出 Final Answer。"
         })
-        response_text = self._call_llm()
-        return self._extract_final_answer(response_text) or response_text
+        message = self._call_llm()
+        return self._extract_final_answer(message.content or "") or (message.content or "")
 
-    def _call_llm(self) -> str:
+    def _call_llm(self) -> object:
         """
-        调用 LLM（OpenAI 兼容接口，如阿里云百炼），返回响应文本。
+        调用 LLM（OpenAI 兼容接口，如阿里云百炼），返回响应 message 对象。
+
+        Returns:
+            response.choices[0].message：含 content 与 tool_calls 字段
         """
-        # 直接使用 self.conversation 作为 messages
-        # self.conversation 已经是 [{"role": "system", ...}, {"role": "user", ...}, ...] 格式
-        response = self.client.chat.completions.create(
-            model=config.LLM_MODEL,  # 从 .env 读取，例如 "qwen-plus"
-            max_tokens=config.LLM_MAX_TOKENS,  # 最大输出长度
-            messages=self.conversation,  # 包含 system + 全部历史对话
-            temperature=0.7,  # 可选项，控制随机性（也可以从 config 读）
-        )
+        kwargs = {
+            "model": config.LLM_MODEL,  # 从 .env 读取，例如 "qwen-plus"
+            "max_tokens": config.LLM_MAX_TOKENS,  # 最大输出长度
+            "messages": self.conversation,  # 包含 system + 全部历史对话
+            "temperature": 0.7,  # 可选项，控制随机性（也可以从 config 读）
+        }
+        if self.tool_schemas:
+            kwargs["tools"] = self.tool_schemas
+            kwargs["tool_choice"] = "auto"
 
-        # 提取回复内容（OpenAI 标准格式）
-        text = response.choices[0].message.content
+        response = self.client.chat.completions.create(**kwargs)
+        message = response.choices[0].message
 
-        # 将 assistant 的回复追加到对话历史，供下一轮使用
-        self.conversation.append({
-            "role": "assistant",
-            "content": text,
-        })
+        # 将 assistant 回复追加到对话历史，供下一轮使用
+        assistant_msg: dict = {"role": "assistant", "content": message.content or ""}
+        if getattr(message, "tool_calls", None):
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in message.tool_calls
+            ]
+        self.conversation.append(assistant_msg)
 
-        return text
+        return message
 
     def _parse_action(self, text: str) -> tuple[Optional[str], dict]:
         """从 LLM 响应中解析 Action 和 Action Input。
@@ -139,17 +175,55 @@ class Agent:
 
         action_name = action_match.group(1).strip()
 
-        # 匹配 Action Input: {...}
-        # 尝试提取 JSON 块
-        input_match = re.search(r"Action Input:\s*(\{.*?\})", text, re.DOTALL)
-        if input_match:
-            try:
-                params = json.loads(input_match.group(1))
-                return action_name, params
-            except json.JSONDecodeError:
-                pass
+        # 匹配 Action Input: 之后的 JSON 对象
+        input_match = re.search(r"Action Input:\s*", text)
+        if not input_match:
+            return action_name, {}
 
-        return action_name, {}
+        params = self._extract_json_object(text[input_match.end():])
+        return action_name, params
+
+    @staticmethod
+    def _extract_json_object(s: str) -> dict:
+        """从文本中提取第一个完整的 JSON 对象。
+
+        用花括号配对 + 字符串状态机定位 JSON 边界，避免非贪婪正则
+        在内容里的 `}`（如 markdown 代码块）处提前截断。
+
+        Args:
+            s: 从 "Action Input:" 之后开始的文本
+
+        Returns:
+            解析出的 dict；解析失败返回 {}
+        """
+        s = s.lstrip()
+        if not s.startswith("{"):
+            return {}
+
+        depth = 0
+        in_str = False
+        escape = False
+        for i, ch in enumerate(s):
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(s[: i + 1])
+                        except json.JSONDecodeError:
+                            return {}
+        return {}
 
     def _extract_final_answer(self, text: str) -> Optional[str]:
         """从 LLM 响应中提取 Final Answer。
@@ -166,23 +240,153 @@ class Agent:
         return None
 
 
-def run_collect(tech_name: str) -> None:
-    """运行资料收集任务。
+def run_collect(tech_name: str, level: str = "入门") -> None:
+    """运行资料收集任务（确定性管道，全面学习，按级别）。
+
+    流程：按级别生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
 
     Args:
         tech_name: 要学习的技术名称
+        level: 学习级别，入门 或 进阶
     """
-    from .prompts import COLLECT_SYSTEM_PROMPT
+    from .prompts import COLLECT_COMPOSE_PROMPT
 
-    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料...", style="bold blue"))
-    agent = Agent(COLLECT_SYSTEM_PROMPT)
-    result = agent.run(
-        f"请帮我收集「{tech_name}」的学习资料。\n"
-        f"搜索关键词建议：{tech_name} tutorial, {tech_name} official documentation, "
-        f"{tech_name} getting started, {tech_name} best practices.\n"
-        f"最终将结果保存到 materials/{tech_name.lower().replace(' ', '-')}-materials.md"
+    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料（{level}级）...", style="bold blue"))
+
+    # 1. 按级别生成搜索词（对应 COLLECT_PROMPT 的搜索策略）
+    base = tech_name.strip()
+    if level == "进阶":
+        queries = [
+            f"{base} advanced guide",
+            f"{base} best practices",
+            f"{base} performance tuning",
+        ]
+    else:  # 入门
+        queries = [
+            f"{base} official documentation",
+            f"{base} getting started",
+            f"{base} github examples",
+        ]
+
+    # 2. 逐条搜索并去重
+    raw_results: list[dict] = []
+    for q in queries:
+        console.print(f"🔍 [bold cyan]搜索:[/bold cyan] {q}")
+        r = search_tool(q)
+        raw_results.extend(r.get("results", []))
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for r in raw_results:
+        url = r.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            results.append(r)
+    console.print(f"✅ 共收集到 [bold]{len(results)}[/bold] 条去重资源")
+
+    # 3. 抓取排名靠前的文档
+    fetched_blocks: list[str] = []
+    for r in results[: config.MAX_FETCH_PAGES]:
+        url = r["url"]
+        console.print(f"📄 [bold cyan]抓取:[/bold cyan] {url}")
+        f = fetch_tool(url)
+        if f.get("markdown"):
+            fetched_blocks.append(
+                f"### {f.get('title') or url}\n来源：{url}\n\n{f['markdown'][:4000]}"
+            )
+
+    # 4. 单次 LLM 生成报告（无工具，无循环）
+    console.print("🧠 [bold cyan]LLM 生成学习资料清单...[/bold cyan]")
+    resource_lines = [
+        f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
+        for r in results[:10]
+    ]
+    user_content = (
+        f"技术名称：{tech_name}\n级别：{level}\n\n"
+        f"===== 搜索结果（标题 | 链接 | 摘要）=====\n"
+        + "\n".join(resource_lines)
+        + f"\n\n===== 抓取的文档内容 =====\n"
+        + "\n".join(fetched_blocks)
     )
-    console.print(Panel(Markdown(result), title="✅ 资料收集完成", style="green"))
+    report = _generate_text(COLLECT_COMPOSE_PROMPT, user_content)
+
+    # 5. 保存（代码直接写入，不经工具参数序列化）
+    safe = tech_name.lower().replace(" ", "-")
+    save_result = save_file_tool(f"materials/{safe}-materials.md", report)
+    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
+    console.print(Panel(Markdown(report[:3000]), title="✅ 资料收集完成", style="green"))
+
+
+def run_dig(tech_name: str, direction: str) -> None:
+    """运行资料深挖任务（确定性管道，定向深挖）。
+
+    流程：按方向生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
+
+    Args:
+        tech_name: 要学习的技术名称
+        direction: 具体深挖方向
+    """
+    from .prompts import DIG_COMPOSE_PROMPT
+
+    console.print(Panel(f"🔍 开始深挖「{tech_name}」的「{direction}」...", style="bold blue"))
+
+    # 1. 按方向生成搜索词（对应 DIG_PROMPT 的搜索策略）
+    base = tech_name.strip()
+    direction = direction.strip()
+    queries = [
+        f"{base} {direction}",
+        f"{base} {direction} github",
+        f"{base} {direction} internals",
+    ]
+
+    # 2. 逐条搜索并去重
+    raw_results: list[dict] = []
+    for q in queries:
+        console.print(f"🔍 [bold cyan]搜索:[/bold cyan] {q}")
+        r = search_tool(q)
+        raw_results.extend(r.get("results", []))
+
+    seen: set[str] = set()
+    results: list[dict] = []
+    for r in raw_results:
+        url = r.get("url", "")
+        if url and url not in seen:
+            seen.add(url)
+            results.append(r)
+    console.print(f"✅ 共收集到 [bold]{len(results)}[/bold] 条去重资源")
+
+    # 3. 抓取排名靠前的文档
+    fetched_blocks: list[str] = []
+    for r in results[: config.MAX_FETCH_PAGES]:
+        url = r["url"]
+        console.print(f"📄 [bold cyan]抓取:[/bold cyan] {url}")
+        f = fetch_tool(url)
+        if f.get("markdown"):
+            fetched_blocks.append(
+                f"### {f.get('title') or url}\n来源：{url}\n\n{f['markdown'][:4000]}"
+            )
+
+    # 4. 单次 LLM 生成报告（无工具，无循环）
+    console.print("🧠 [bold cyan]LLM 生成深度资料...[/bold cyan]")
+    resource_lines = [
+        f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
+        for r in results[:10]
+    ]
+    user_content = (
+        f"技术名称：{tech_name}\n具体方向：{direction}\n\n"
+        f"===== 搜索结果（标题 | 链接 | 摘要）=====\n"
+        + "\n".join(resource_lines)
+        + f"\n\n===== 抓取的文档内容 =====\n"
+        + "\n".join(fetched_blocks)
+    )
+    report = _generate_text(DIG_COMPOSE_PROMPT, user_content)
+
+    # 5. 保存（代码直接写入，不经工具参数序列化）
+    safe_tech = tech_name.lower().replace(" ", "-")
+    safe_dir = direction.lower().replace(" ", "-")
+    save_result = save_file_tool(f"materials/{safe_tech}-{safe_dir}-dig.md", report)
+    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
+    console.print(Panel(Markdown(report[:3000]), title="✅ 资料深挖完成", style="green"))
 
 
 def _generate_text(system_prompt: str, user_content: str) -> str:
