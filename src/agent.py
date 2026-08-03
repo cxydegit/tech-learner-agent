@@ -418,10 +418,59 @@ def _generate_text(system_prompt: str, user_content: str) -> str:
     return response.choices[0].message.content
 
 
+def _parse_classify(raw: str) -> dict:
+    """从 LLM 响应中稳健地解析文档分类结果。
+
+    兼容：去掉 ```json 代码块包裹、抽取第一个 JSON 对象。
+
+    Returns:
+        {"is_technical": bool, "reason": str}，解析失败返回空 dict
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 兜底：用花括号配对抽取第一个 JSON 对象
+    obj = Agent._extract_json_object(text)
+    return obj if isinstance(obj, dict) else {}
+
+
+def _classify_technical(url: str, title: str, markdown: str) -> tuple[bool, str]:
+    """识别文档是否为技术文档（LLM 分类门）。
+
+    Args:
+        url: 文档 URL
+        title: 文档标题
+        markdown: 抓取到的内容
+
+    Returns:
+        (is_technical, reason)；解析失败时默认视为技术文档（is_technical=True）避免误拦截
+    """
+    from .prompts import CLASSIFY_DOC_PROMPT
+
+    raw = _generate_text(
+        CLASSIFY_DOC_PROMPT,
+        f"文档标题：{title or '未知'}\n链接：{url}\n\n"
+        f"===== 内容片段 =====\n{markdown[:3000]}\n===== 内容结束 =====",
+    )
+    decision = _parse_classify(raw)
+    is_tech = str(decision.get("is_technical", "true")).strip().lower() in ("true", "1", "yes")
+    reason = str(decision.get("reason", "")).strip()
+    return is_tech, reason
+
+
 def run_read(url: str) -> None:
     """运行文档阅读辅助任务（确定性管道）。
 
-    流程：Firecrawl 抓取 → LLM 解读 → 保存 reports/ 报告。
+    流程：Firecrawl 抓取 → LLM 分类识别技术文档 → LLM 解读 → 保存 reports/ 报告。
 
     Args:
         url: 文档 URL
@@ -442,6 +491,17 @@ def run_read(url: str) -> None:
         return
     console.print(f"✅ 抓取成功，内容 {len(fetched['markdown'])} 字符"
                   f"{'（已截断，仅截取片段）' if fetched.get('truncated') else ''}")
+
+    # 1.5 技术文档识别（LLM 分类门）：非技术文档则中止，不进入解读
+    console.print("🔍 [bold cyan]识别是否为技术文档...[/bold cyan]")
+    is_technical, reason = _classify_technical(url, fetched.get("title") or "", fetched["markdown"])
+    if not is_technical:
+        console.print(Panel(
+            f"[yellow]⚠ 该文档似乎不是技术文档，跳过解读[/yellow]\n[dim]原因：{reason or '未提供'}[/dim]",
+            title="⏭ 已跳过",
+            style="yellow",
+        ))
+        return
 
     # 2. 生成解读报告（单次 LLM 调用）
     console.print("🧠 [bold cyan]LLM 生成解读报告...[/bold cyan]")
