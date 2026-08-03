@@ -240,7 +240,7 @@ class Agent:
         return None
 
 
-def run_collect(tech_name: str, level: str = "入门") -> None:
+def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
     """运行资料收集任务（确定性管道，全面学习，按级别）。
 
     流程：按级别生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
@@ -248,6 +248,7 @@ def run_collect(tech_name: str, level: str = "入门") -> None:
     Args:
         tech_name: 要学习的技术名称
         level: 学习级别，入门 或 进阶
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
     """
     from .prompts import COLLECT_COMPOSE_PROMPT
 
@@ -316,8 +317,16 @@ def run_collect(tech_name: str, level: str = "入门") -> None:
     console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
     console.print(Panel(Markdown(report[:3000]), title="✅ 资料收集完成", style="green"))
 
+    # 6. 更新会话状态（若在 /learn 会话中）
+    if session is not None:
+        session.tech = tech_name
+        session.level = level
+        session.materials_path = save_result["path"]
+        session.add_history("collect", f"收集「{tech_name}」({level}) → {save_result['path']}")
+        session.save()
 
-def run_dig(tech_name: str, direction: str) -> None:
+
+def run_dig(tech_name: str, direction: str, session=None) -> None:
     """运行资料深挖任务（确定性管道，定向深挖）。
 
     流程：按方向生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
@@ -325,6 +334,7 @@ def run_dig(tech_name: str, direction: str) -> None:
     Args:
         tech_name: 要学习的技术名称
         direction: 具体深挖方向
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
     """
     from .prompts import DIG_COMPOSE_PROMPT
 
@@ -387,6 +397,13 @@ def run_dig(tech_name: str, direction: str) -> None:
     save_result = save_file_tool(f"materials/{safe_tech}-{safe_dir}-dig.md", report)
     console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
     console.print(Panel(Markdown(report[:3000]), title="✅ 资料深挖完成", style="green"))
+
+    # 6. 更新会话状态（若在 /learn 会话中）
+    if session is not None:
+        session.tech = tech_name
+        session.materials_path = save_result["path"]
+        session.add_history("dig", f"深挖「{tech_name}」的「{direction}」 → {save_result['path']}")
+        session.save()
 
 
 def _generate_text(system_prompt: str, user_content: str) -> str:
@@ -467,13 +484,14 @@ def _classify_technical(url: str, title: str, markdown: str) -> tuple[bool, str]
     return is_tech, reason
 
 
-def run_read(url: str) -> None:
+def run_read(url: str, session=None) -> None:
     """运行文档阅读辅助任务（确定性管道）。
 
     流程：Firecrawl 抓取 → LLM 分类识别技术文档 → LLM 解读 → 保存 reports/ 报告。
 
     Args:
         url: 文档 URL
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
     """
     from datetime import datetime
     from .prompts import READ_SYSTEM_PROMPT
@@ -520,6 +538,14 @@ def run_read(url: str) -> None:
     console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
     console.print(Panel(Markdown(report), title="✅ 文档解读完成", style="green"))
 
+    # 4. 更新会话状态（若在 /learn 会话中）
+    if session is not None:
+        session.urls.append(url)
+        session.visited.add(url)
+        session.notes.append({"url": url, "title": title, "report": report})
+        session.add_history("read", f"解读 {url} → {save_result['path']}")
+        session.save()
+
 
 def _parse_entries(raw: str) -> list[dict]:
     """从 LLM 响应中稳健地解析知识点 JSON 数组。
@@ -554,7 +580,7 @@ def _parse_entries(raw: str) -> list[dict]:
     return []
 
 
-def run_note(tech: str, conversation_log: str) -> None:
+def run_note(tech: str, conversation_log: str, session=None) -> None:
     """运行知识沉淀任务（确定性管道）。
 
     流程：LLM 提取知识点(JSON) → 逐条去重/合并入库 → 更新索引。
@@ -562,6 +588,7 @@ def run_note(tech: str, conversation_log: str) -> None:
     Args:
         tech: 技术名称
         conversation_log: 本轮学习的对话记录或文档内容
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
     """
     from .prompts import EXTRACT_SYSTEM_PROMPT
     from .storage import persist_note
@@ -605,3 +632,9 @@ def run_note(tech: str, conversation_log: str) -> None:
 
     console.print(Panel(Markdown(f"知识沉淀完成，共 {len(results)} 个知识点已写入 `knowledge/`。"
                                   f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))
+
+    # 3. 更新会话状态（若在 /learn 会话中）
+    if session is not None:
+        session.notes.extend(results)
+        session.add_history("note", f"沉淀 {len(results)} 个知识点")
+        session.save()
