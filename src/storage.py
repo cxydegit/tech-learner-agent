@@ -56,11 +56,60 @@ def _topics_overlap(a: str, b: str) -> bool:
     return overlap >= 0.4
 
 
+def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | None:
+    """语义去重：先召回同一领域 top1，相似度达标或主题重叠即视为同一知识点。
+
+    设计取舍（替代纯字符串）：
+    - 语义召回 top1 是主信号：相似度 >= RAG_DEDUP_THRESHOLD 即合并，
+      能抓住"字面不同但语义相同"的改写（纯字符串 overlap 抓不到）。
+    - 轻量 overlap 作为辅助确认：相似度未达阈值但主题高度重叠时也可合并。
+    - 两者都不中则回退到纯字符串匹配（覆盖 RAG 未索引 / 不可用场景）。
+
+    Args:
+        tech: 技术名称（原始大小写，如 "FastAPI"）
+        topic: 新知识点标题
+        existing: 该技术领域已有的笔记列表（见 get_existing_notes）
+
+    Returns:
+        命中的已有笔记 dict（{"path", "topic", ...}），否则 None
+    """
+    try:
+        from .rag import semantic_search_knowledge
+        # 限定同一技术领域，避免跨领域误合并
+        hits = semantic_search_knowledge(topic, top_k=1, tech=sanitize_filename(tech))
+        if hits:
+            h = hits[0]
+            hit_topic = h.get("topic") or ""
+            # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
+            # 而 existing 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
+            hit_path = h.get("path") or ""
+            if hit_path.startswith("knowledge/"):
+                hit_path = hit_path[len("knowledge/"):]
+            strong = h.get("similarity", 0) >= config.RAG_DEDUP_THRESHOLD
+            overlap = _topics_overlap(topic, hit_topic or hit_path)
+            if (strong or overlap) and hit_path:
+                match = next((n for n in existing if n["path"] == hit_path), None)
+                if match:
+                    return match
+    except Exception:  # noqa: BLE001 —— RAG 不可用时回退到字符串匹配
+        pass
+    return next((n for n in existing if _topics_overlap(n["topic"], topic)), None)
+
+
+def _update_rag_index(filepath: Path) -> None:
+    """笔记写库后增量更新 RAG 索引（失败静默，不影响主流程）。"""
+    try:
+        from .rag import index_paths
+        index_paths([filepath])
+    except Exception:  # noqa: BLE001 —— 索引失败不应阻断沉淀
+        pass
+
+
 def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None) -> dict:
     """持久化一条知识笔记，自动去重/合并。
 
-    若知识库中已有高度相似的主题，则作为"补充"合并到已有笔记文件；
-    否则创建新的 dated 笔记文件并更新索引。
+    若知识库中已有语义相近的主题，则作为"补充"合并到已有笔记文件；
+    否则创建新的 dated 笔记文件并更新索引。写入后增量更新 RAG 索引。
 
     Args:
         tech: 技术名称（如 "spring-boot"）
@@ -75,14 +124,15 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     tech_dir = config.KNOWLEDGE_DIR / sanitize_filename(tech)
     tech_dir.mkdir(parents=True, exist_ok=True)
 
-    # 去重：寻找相似主题的已有笔记
+    # 去重：先语义召回 + overlap 确认，回退到纯字符串匹配
     existing = get_existing_notes(tech)
-    match = next((n for n in existing if _topics_overlap(n["topic"], topic)), None)
+    match = _find_dedup_match(tech, topic, existing)
 
     if match:
         # 合并：追加"补充"章节到已有文件
         existing_path = config.KNOWLEDGE_DIR / match["path"]
         _append_section(existing_path, content)
+        _update_rag_index(existing_path)
         return {"action": "merged", "path": match["path"], "topic": match["topic"]}
 
     # 新建：dated 文件 + 更新索引
@@ -91,7 +141,8 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     filepath = tech_dir / filename
     filepath.write_text(_with_header(topic, tags, content), encoding="utf-8")
     update_index(tech, topic, filepath)
-    return {"action": "new", "path": str(filepath.relative_to(config.KNOWLEDGE_DIR)), "topic": topic}
+    _update_rag_index(filepath)
+    return {"action": "new", "path": filepath.relative_to(config.KNOWLEDGE_DIR).as_posix(), "topic": topic}
 
 
 def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
@@ -175,7 +226,7 @@ def get_existing_notes(tech: str) -> list[dict]:
             topic = name
 
         notes.append({
-            "path": str(f.relative_to(config.KNOWLEDGE_DIR)),
+            "path": f.relative_to(config.KNOWLEDGE_DIR).as_posix(),  # 统一 POSIX 分隔符，与 RAG 索引一致
             "topic": topic,
             "date": date_str,
             "content": f.read_text(encoding="utf-8")[:2000],  # 只取前 2000 字符用于去重

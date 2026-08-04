@@ -23,5 +23,11 @@ materials/
 reports/
 knowledge/
 
+# RAG 向量索引（运行时生成）
+.chroma/
+
+# 学习会话状态（运行时生成）
+.leamsessions/
+
 #用于面试
 docs/interview

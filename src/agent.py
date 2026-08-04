@@ -484,10 +484,44 @@ def _classify_technical(url: str, title: str, markdown: str) -> tuple[bool, str]
     return is_tech, reason
 
 
+def _confirm_reuse() -> bool:
+    """询问用户是否复用已有解读报告（默认不复用，避免误跳过新文档）。"""
+    try:
+        ans = input("是否复用已有解读，跳过抓取？[y/N] ").strip().lower()
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _reuse_cached_report(cached: dict, url: str, session=None) -> None:
+    """把 RAG 缓存命中的已有解读展示出来，并同步到会话状态。"""
+    # 优先读取完整报告文件；文件丢失时退回缓存的片段
+    report_path = config.BASE_DIR / cached["path"]
+    if report_path.exists():
+        report = report_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        report = cached.get("content", "")
+
+    console.print(Panel(
+        f"[dim]{cached['path']}[/dim]\n相似度 {cached['similarity']:.2f}",
+        title="📄 复用已有解读",
+        style="cyan",
+    ))
+    console.print(Markdown(report))
+
+    if session is not None:
+        session.urls.append(url)
+        session.visited.add(url)
+        session.notes.append({"url": url, "title": cached["path"], "report": report})
+        session.add_history("read", f"复用缓存解读 {url} → {cached['path']}")
+        session.save()
+
+
 def run_read(url: str, session=None) -> None:
     """运行文档阅读辅助任务（确定性管道）。
 
-    流程：Firecrawl 抓取 → LLM 分类识别技术文档 → LLM 解读 → 保存 reports/ 报告。
+    流程：RAG 历史召回（命中已有解读则提示复用）→ Firecrawl 抓取
+    → LLM 分类识别技术文档 → LLM 解读 → 保存 reports/ 报告。
 
     Args:
         url: 文档 URL
@@ -499,6 +533,23 @@ def run_read(url: str, session=None) -> None:
 
     console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
     console.print(f"[dim]{url}[/dim]")
+
+    # 0. RAG 历史召回：该 URL 已有解读则提示复用（失败静默，不影响抓取）
+    try:
+        from .rag import check_read_cache
+        cached = check_read_cache(url)
+    except Exception:  # noqa: BLE001
+        cached = None
+    if cached:
+        console.print(Panel(
+            f"📌 检测到该 URL 已有解读报告：\n[bold]{cached['path']}[/bold]"
+            f"（相似度 {cached['similarity']:.2f}）",
+            title="⏭ RAG 缓存命中",
+            style="cyan",
+        ))
+        if _confirm_reuse():
+            _reuse_cached_report(cached, url, session=session)
+            return
 
     # 1. 抓取文档内容
     fetched = fetch_tool(url)

@@ -99,6 +99,25 @@ def note(tech: str, file_path: str = None, content: str = None):
     run_note(tech, conversation_log)
 
 
+@cli.command()
+def index():
+    """建立 / 增量更新 RAG 语义索引（knowledge/ + materials/ + reports/）。
+
+    使用 DashScope text-embedding-v3 嵌入分块，存入本地 Chroma（.chroma/）。
+    已索引且内容未变化的文件会自动跳过，不会重复计费。
+    """
+    from .rag import index_documents
+
+    console.print("🧠 [bold cyan]构建 RAG 语义索引...[/bold cyan]")
+    result = index_documents()
+    console.print(f"✅ 索引完成：新增 [bold]{result['indexed']}[/bold] 个文件，"
+                  f"跳过 [bold]{result['skipped']}[/bold] 个未变化文件")
+    if result["errors"]:
+        console.print("[yellow]部分文件索引失败：[/yellow]")
+        for e in result["errors"]:
+            console.print(f"  [dim]{e}[/dim]")
+
+
 # ============================================================
 # /learn 交互式学习会话
 # ============================================================

@@ -33,6 +33,20 @@ class Config:
     REPORTS_DIR: Path = BASE_DIR / "reports"
     KNOWLEDGE_DIR: Path = BASE_DIR / "knowledge"
 
+    # RAG / Embedding 配置
+    # Embedding 后端：阿里云百炼 text-embedding-v3（走现有 OPENAI_BASE_URL 兼容端点，零新依赖）
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
+    # Chroma 本地持久化目录（运行时生成，已加入 .gitignore）
+    CHROMA_DIR: Path = BASE_DIR / ".chroma"
+    RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "5"))
+    # 语义去重阈值：余弦相似度，召回 top1 且轻量 overlap 确认后才合并
+    RAG_DEDUP_THRESHOLD: float = float(os.getenv("RAG_DEDUP_THRESHOLD", "0.55"))
+    # read 历史召回阈值：命中已有解读则提示复用（URL 路径片段作查询词，语义噪声大，阈值取高）
+    RAG_READ_THRESHOLD: float = float(os.getenv("RAG_READ_THRESHOLD", "0.62"))
+    # 文档分块参数（字符数）
+    RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
+    RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
+
     # 搜索配置
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
     MAX_FETCH_PAGES: int = int(os.getenv("MAX_FETCH_PAGES", "5"))
