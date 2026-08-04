@@ -22,3 +22,6 @@ __pycache__/
 materials/
 reports/
 knowledge/
+
+#用于面试
+docs/interview
