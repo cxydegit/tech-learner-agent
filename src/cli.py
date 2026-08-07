@@ -100,16 +100,19 @@ def note(tech: str, file_path: str = None, content: str = None):
 
 
 @cli.command()
-def index():
+@click.option("--force", "-f", is_flag=True,
+              help="忽略变更检测，强制重新切块嵌入（分块器升级 / 切块参数调整后需要）")
+def index(force: bool = False):
     """建立 / 增量更新 RAG 语义索引（knowledge/ + materials/ + reports/）。
 
     使用 DashScope text-embedding-v3 嵌入分块，存入本地 Chroma（.chroma/）。
-    已索引且内容未变化的文件会自动跳过，不会重复计费。
+    已索引且内容未变化的文件会自动跳过，不会重复计费；分块器升级后用 --force
+    或直接跑（版本号变更会自动触发全量重切）。
     """
     from .rag import index_documents
 
     console.print("🧠 [bold cyan]构建 RAG 语义索引...[/bold cyan]")
-    result = index_documents()
+    result = index_documents(force=force)
     console.print(f"✅ 索引完成：新增 [bold]{result['indexed']}[/bold] 个文件，"
                   f"跳过 [bold]{result['skipped']}[/bold] 个未变化文件")
     if result["errors"]:
