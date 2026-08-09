@@ -47,6 +47,10 @@ class Config:
     RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
     RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
 
+    # LangGraph checkpointer 持久化（SqliteSaver，跨会话/跨进程恢复）
+    GRAPH_DB_DIR: Path = BASE_DIR / ".graph"
+    GRAPH_DB_PATH: Path = GRAPH_DB_DIR / "checkpoints.sqlite"
+
     # 搜索配置
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
     MAX_FETCH_PAGES: int = int(os.getenv("MAX_FETCH_PAGES", "5"))

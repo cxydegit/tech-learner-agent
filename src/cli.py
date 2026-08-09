@@ -7,6 +7,8 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
 
 from .config import config
 from .agent import run_collect, run_read, run_note, run_dig
@@ -126,132 +128,188 @@ def index(force: bool = False):
 # ============================================================
 
 _HELP_TEXT = """可用命令：
-  collect <技术名> [入门|进阶]   收集学习资料（级别默认入门）
+  collect <技术名> [入门|进阶]   收集学习资料（不指定级别时交互式询问）
   dig <技术名> <具体方向>        深挖指定技术的具体方向
   read <url>                      解读技术文档
   note                            将本次会话内容沉淀为知识笔记
   /status                         查看会话状态
   /done                           沉淀并结束会话
-  /quit                           保存并退出
+  /quit                           退出（状态已持久化）
   /help                           查看帮助
 
 提示：技术名含空格时用引号包裹，如 collect "Spring Boot"、dig "Claude Code" 底层框架
 """
 
 
-def _print_status(session) -> None:
-    console.print(f"[bold]会话:[/bold] {session.session_id}")
-    console.print(f"[bold]技术主题:[/bold] {session.tech or '（未设置）'}  [bold]级别:[/bold] {session.level}")
-    console.print(f"[bold]收集到的链接:[/bold] {len(session.urls)}")
-    console.print(f"[bold]已解读文档:[/bold] {len(session.visited)}")
-    console.print(f"[bold]资料清单:[/bold] {session.materials_path or '（无）'}")
-    console.print(f"[bold]本次沉淀笔记:[/bold] {len(session.notes)} 条")
-    if session.history:
-        console.print("[bold]交互记录:[/bold]")
-        for h in session.history:
-            console.print(f"  [{h['time']}] {h['action']}: {h['detail']}")
+def _drive(graph, config, payload, render: str = "plain") -> dict:
+    """驱动一次图执行；遇 interrupt 暂停询问，以 Command(resume) 恢复。
+
+    Args:
+        graph: build_graph 编译后的状态图
+        config: {"configurable": {"thread_id": ...}}
+        payload: 命令输入（dict）或恢复用的 Command
+        render: 结束时 last_output 的渲染方式（plain / markdown）
+
+    Returns:
+        最终状态 dict（含 last_output）
+    """
+    from langgraph.types import Command
+
+    while True:
+        stream = graph.stream_events(payload, config, version="v3")
+        if not stream.interrupted:
+            final = stream.output
+            last = (final or {}).get("last_output")
+            if last:
+                if render == "markdown":
+                    console.print(Markdown(last))
+                else:
+                    console.print(last)
+            return final
+        resumed = False
+        for intr in stream.interrupts:
+            console.print(f"\n[bold cyan]🧭 {intr.value}[/bold cyan]")
+            payload = Command(resume=input("> ").strip())
+            resumed = True
+        if not resumed:
+            # 理论不可达：interrupted 却无 interrupt 负载，避免死循环
+            return stream.output
 
 
-def _do_note(session, run_note) -> None:
-    """把本次会话读到的文档内容汇总，交给 run_note 沉淀。"""
-    if not session.tech:
-        console.print("[yellow]⚠ 会话还没有技术主题，先 collect <技术名>[/yellow]")
-        return
-    parts = []
-    for n in session.notes:
-        if n.get("report"):
-            parts.append(f"来源：{n.get('url')}\n{n['report']}")
-    content = "\n\n".join(parts)
-    if not content.strip():
-        console.print("[yellow]⚠ 没有可沉淀的内容，先 read 一些文档[/yellow]")
-        return
-    run_note(session.tech, content, session=session)
+def _print_graph_status(graph, config) -> None:
+    """/status：从 checkpointer 读取当前会话状态。"""
+    snap = graph.get_state(config)
+    values = snap.values or {}
+    console.print(f"[bold]会话线程:[/bold] {config['configurable']['thread_id']}")
+    console.print(f"[bold]技术主题:[/bold] {values.get('tech') or '（未设置）'}  "
+                  f"[bold]级别:[/bold] {values.get('level') or '（未设置）'}")
+    console.print(f"[bold]收集到的链接:[/bold] {len(values.get('urls') or [])}")
+    console.print(f"[bold]已解读文档:[/bold] {len(values.get('visited') or [])}")
+    console.print(f"[bold]解读/沉淀记录:[/bold] {len(values.get('notes') or [])}")
+    if snap.next:
+        console.print(f"[bold]下一步:[/bold] {snap.next}")
+
+
+def _handle_read_graph(graph, gconfig, url) -> None:
+    """/learn 里的 read：RAG 缓存命中时询问是否复用，否则走图解读。"""
+    from .agent import _confirm_reuse
+
+    try:
+        from .rag import check_read_cache
+        cached = check_read_cache(url)
+    except Exception:  # noqa: BLE001 —— RAG 不可用时静默降级
+        cached = None
+    if cached:
+        console.print(Panel(
+            f"📌 检测到该 URL 已有解读报告：\n[bold]{cached['path']}[/bold]"
+            f"（相似度 {cached['similarity']:.2f}）",
+            title="⏭ RAG 缓存命中",
+            style="cyan",
+        ))
+        if _confirm_reuse():
+            report_path = config.BASE_DIR / cached["path"]
+            if report_path.exists():
+                report = report_path.read_text(encoding="utf-8", errors="replace")
+            else:
+                report = cached.get("content", "")
+            # 直接更新图状态（不跑节点），记录该文档已读
+            graph.update_state(gconfig, {
+                "visited": [url],
+                "notes": [{"url": url, "title": cached["path"], "report": report}],
+            })
+            console.print(Markdown(report))
+            return
+    _drive(graph, gconfig, {"command": "read", "args": [url]}, render="markdown")
 
 
 @cli.command()
 @click.argument("session_id", required=False)
 def learn(session_id: str = None):
-    """进入交互式学习会话（/learn REPL）。
+    """进入交互式学习会话（/learn REPL，LangGraph 图驱动）。
 
-    SESSION_ID: 可选，恢复指定会话；不传则新建会话
+    SESSION_ID: 可选，恢复指定会话（对应 checkpointer 的 thread_id）；不传则新建
     """
-    from .session import LearnSession
+    from .graph import open_graph
 
-    # 恢复或新建会话
+    # 会话 ID = LangGraph thread_id（SqliteSaver 的持久化游标）
     if session_id:
-        try:
-            session = LearnSession.load(session_id)
-            console.print(f"[green]已恢复会话:[/green] {session_id}")
-        except FileNotFoundError:
-            console.print(f"[red]会话不存在: {session_id}[/red]")
-            return
+        thread_id = session_id
+        console.print(f"[green]已恢复会话:[/green] {session_id}")
     else:
-        session_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        session = LearnSession(session_id=session_id)
-        console.print(f"[green]已创建新会话:[/green] {session_id}")
+        thread_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        console.print(f"[green]已创建新会话:[/green] {thread_id}")
 
-    console.print("[dim]进入学习会话。输入命令开始，/help 查看帮助，/quit 退出。[/dim]")
+    console.print("[dim]进入学习会话（LangGraph 图驱动）。输入命令开始，/help 查看帮助，/quit 退出。[/dim]")
 
-    while True:
-        try:
-            line = input(f"{session.tech or session.session_id} > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            console.print("\n[dim]退出会话[/dim]")
-            session.save()
-            break
-        if not line:
-            continue
+    with open_graph() as graph:
+        config = {"configurable": {"thread_id": thread_id}}
 
-        # 斜杠命令
-        if line.startswith("/"):
-            verb = line[1:].strip().split()
-            cmd = verb[0] if verb else ""
-            if cmd in ("quit", "exit"):
-                session.save()
-                console.print("[dim]会话已保存，退出。[/dim]")
+        # 恢复旧线程：已有状态则先展示
+        if graph.get_state(config).values:
+            console.print("[dim]—— 上次会话状态 ——[/dim]")
+            _print_graph_status(graph, config)
+
+        while True:
+            try:
+                line = input(f"{thread_id} > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[dim]退出会话（状态已由 checkpointer 保存）[/dim]")
                 break
-            elif cmd == "status":
-                _print_status(session)
-            elif cmd == "done":
-                _do_note(session, run_note)
-                session.save()
-                console.print("[dim]会话已沉淀并保存，退出。[/dim]")
-                break
-            elif cmd == "help":
-                console.print(_HELP_TEXT)
+            if not line:
+                continue
+
+            # 斜杠命令
+            if line.startswith("/"):
+                verb = line[1:].strip().split()
+                cmd = verb[0] if verb else ""
+                if cmd in ("quit", "exit"):
+                    console.print("[dim]会话已保存（checkpointer），退出。[/dim]")
+                    break
+                elif cmd == "status":
+                    _print_graph_status(graph, config)
+                elif cmd == "done":
+                    _drive(graph, config, {"command": "note"})
+                    console.print("[dim]已沉淀并保存，退出。[/dim]")
+                    break
+                elif cmd == "help":
+                    console.print(_HELP_TEXT)
+                else:
+                    console.print(f"[yellow]未知命令: /{cmd}（输入 /help 查看）[/yellow]")
+                continue
+
+            # 普通命令路由（shlex 解析，支持引号包裹带空格的技术名）
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                console.print("[yellow]⚠ 引号未闭合，无法解析[/yellow]")
+                continue
+            if not parts:
+                continue
+            op = parts[0].lower()
+            if op == "collect":
+                if len(parts) < 2:
+                    console.print("[yellow]用法: collect <技术名> [入门|进阶][/yellow]")
+                    continue
+                level = parts[2] if len(parts) > 2 and parts[2] in ("入门", "进阶") else None
+                if level:
+                    _drive(graph, config, {"command": "collect", "tech": parts[1], "level": level})
+                else:
+                    # 未指定级别 → 走 ask_level 交互点（interrupt，模块 2 水平探测最小种子）
+                    _drive(graph, config, {"command": "ask_level", "tech": parts[1]})
+            elif op == "dig":
+                if len(parts) < 3:
+                    console.print("[yellow]用法: dig <技术名> <具体方向>[/yellow]")
+                    continue
+                _drive(graph, config, {"command": "dig", "tech": parts[1], "args": parts[2:]})
+            elif op == "read":
+                if len(parts) < 2:
+                    console.print("[yellow]用法: read <url>[/yellow]")
+                    continue
+                _handle_read_graph(graph, config, parts[1])
+            elif op == "note":
+                _drive(graph, config, {"command": "note"})
             else:
-                console.print(f"[yellow]未知命令: /{cmd}（输入 /help 查看）[/yellow]")
-            continue
-
-        # 普通命令路由（shlex 解析，支持引号包裹带空格的技术名）
-        try:
-            parts = shlex.split(line)
-        except ValueError:
-            console.print("[yellow]⚠ 引号未闭合，无法解析[/yellow]")
-            continue
-        if not parts:
-            continue
-        op = parts[0].lower()
-        if op == "collect":
-            if len(parts) < 2:
-                console.print("[yellow]用法: collect <技术名> [入门|进阶][/yellow]")
-                continue
-            level = parts[2] if len(parts) > 2 and parts[2] in ("入门", "进阶") else "入门"
-            run_collect(parts[1], level, session=session)
-        elif op == "dig":
-            if len(parts) < 3:
-                console.print("[yellow]用法: dig <技术名> <具体方向>[/yellow]")
-                continue
-            run_dig(parts[1], " ".join(parts[2:]), session=session)
-        elif op == "read":
-            if len(parts) < 2:
-                console.print("[yellow]用法: read <url>[/yellow]")
-                continue
-            run_read(parts[1], session=session)
-        elif op == "note":
-            _do_note(session, run_note)
-        else:
-            console.print(f"[yellow]未知命令: {op}（输入 /help 查看）[/yellow]")
+                console.print(f"[yellow]未知命令: {op}（输入 /help 查看）[/yellow]")
 
 
 if __name__ == "__main__":

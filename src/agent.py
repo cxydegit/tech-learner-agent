@@ -2,7 +2,7 @@
 
 import re
 import json
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import OpenAI
 from rich.console import Console
@@ -240,19 +240,22 @@ class Agent:
         return None
 
 
-def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
-    """运行资料收集任务（确定性管道，全面学习，按级别）。
+def collect_pipeline(tech_name: str, level: str = "入门",
+                     progress: Callable[[str], None] | None = None) -> dict:
+    """确定性管道核心：按级别生成搜索词 → 搜索去重 → 抓取 → LLM 合成 → 保存。
 
-    流程：按级别生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
+    与 run_collect 的区别：只返回数据（urls / report / materials_path），
+    不打印、不写会话 —— 供 LangGraph 节点复用（Stage 3）。
 
     Args:
-        tech_name: 要学习的技术名称
+        tech_name: 技术名称
         level: 学习级别，入门 或 进阶
-        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+        progress: 可选回调，接收进度消息；None 则静默
+
+    Returns:
+        {"urls": list[str], "report": str, "materials_path": str}
     """
     from .prompts import COLLECT_COMPOSE_PROMPT
-
-    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料（{level}级）...", style="bold blue"))
 
     # 1. 按级别生成搜索词（对应 COLLECT_PROMPT 的搜索策略）
     base = tech_name.strip()
@@ -272,7 +275,8 @@ def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
     # 2. 逐条搜索并去重
     raw_results: list[dict] = []
     for q in queries:
-        console.print(f"🔍 [bold cyan]搜索:[/bold cyan] {q}")
+        if progress:
+            progress(f"🔍 搜索: {q}")
         r = search_tool(q)
         raw_results.extend(r.get("results", []))
 
@@ -283,13 +287,13 @@ def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
         if url and url not in seen:
             seen.add(url)
             results.append(r)
-    console.print(f"✅ 共收集到 [bold]{len(results)}[/bold] 条去重资源")
 
     # 3. 抓取排名靠前的文档
     fetched_blocks: list[str] = []
     for r in results[: config.MAX_FETCH_PAGES]:
         url = r["url"]
-        console.print(f"📄 [bold cyan]抓取:[/bold cyan] {url}")
+        if progress:
+            progress(f"📄 抓取: {url}")
         f = fetch_tool(url)
         if f.get("markdown"):
             fetched_blocks.append(
@@ -297,7 +301,8 @@ def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
             )
 
     # 4. 单次 LLM 生成报告（无工具，无循环）
-    console.print("🧠 [bold cyan]LLM 生成学习资料清单...[/bold cyan]")
+    if progress:
+        progress("🧠 LLM 生成学习资料清单...")
     resource_lines = [
         f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
         for r in results[:10]
@@ -314,31 +319,56 @@ def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
     # 5. 保存（代码直接写入，不经工具参数序列化）
     safe = tech_name.lower().replace(" ", "-")
     save_result = save_file_tool(f"materials/{safe}-materials.md", report)
-    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
-    console.print(Panel(Markdown(report[:3000]), title="✅ 资料收集完成", style="green"))
 
-    # 6. 更新会话状态（若在 /learn 会话中）
+    return {
+        "urls": [r["url"] for r in results],
+        "report": report,
+        "materials_path": save_result["path"],
+    }
+
+
+def run_collect(tech_name: str, level: str = "入门", session=None) -> None:
+    """运行资料收集任务（确定性管道，全面学习，按级别）。
+
+    薄包装：调用 collect_pipeline，负责进度打印与会话状态写入。
+
+    Args:
+        tech_name: 要学习的技术名称
+        level: 学习级别，入门 或 进阶
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+    """
+    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料（{level}级）...", style="bold blue"))
+
+    result = collect_pipeline(tech_name, level, progress=lambda m: console.print(m))
+    console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
+    console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料收集完成", style="green"))
+
+    # 更新会话状态（若在 /learn 会话中）
     if session is not None:
         session.tech = tech_name
         session.level = level
-        session.materials_path = save_result["path"]
-        session.add_history("collect", f"收集「{tech_name}」({level}) → {save_result['path']}")
+        session.materials_path = result["materials_path"]
+        session.add_history("collect", f"收集「{tech_name}」({level}) → {result['materials_path']}")
         session.save()
 
 
-def run_dig(tech_name: str, direction: str, session=None) -> None:
-    """运行资料深挖任务（确定性管道，定向深挖）。
+def dig_pipeline(tech_name: str, direction: str,
+                 progress: Callable[[str], None] | None = None) -> dict:
+    """确定性管道核心：按方向生成搜索词 → 搜索去重 → 抓取 → LLM 合成 → 保存。
 
-    流程：按方向生成搜索词 → 逐条搜索 → 抓取 top 文档 → 单次 LLM 合成报告 → 保存。
+    与 run_dig 的区别：只返回数据（urls / report / materials_path），
+    不打印、不写会话 —— 供 LangGraph 节点复用（Stage 3）。
 
     Args:
         tech_name: 要学习的技术名称
         direction: 具体深挖方向
-        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+        progress: 可选回调，接收进度消息；None 则静默
+
+    Returns:
+        {"urls": list[str], "report": str, "materials_path": str}
     """
     from .prompts import DIG_COMPOSE_PROMPT
-
-    console.print(Panel(f"🔍 开始深挖「{tech_name}」的「{direction}」...", style="bold blue"))
 
     # 1. 按方向生成搜索词（对应 DIG_PROMPT 的搜索策略）
     base = tech_name.strip()
@@ -352,7 +382,8 @@ def run_dig(tech_name: str, direction: str, session=None) -> None:
     # 2. 逐条搜索并去重
     raw_results: list[dict] = []
     for q in queries:
-        console.print(f"🔍 [bold cyan]搜索:[/bold cyan] {q}")
+        if progress:
+            progress(f"🔍 搜索: {q}")
         r = search_tool(q)
         raw_results.extend(r.get("results", []))
 
@@ -363,13 +394,13 @@ def run_dig(tech_name: str, direction: str, session=None) -> None:
         if url and url not in seen:
             seen.add(url)
             results.append(r)
-    console.print(f"✅ 共收集到 [bold]{len(results)}[/bold] 条去重资源")
 
     # 3. 抓取排名靠前的文档
     fetched_blocks: list[str] = []
     for r in results[: config.MAX_FETCH_PAGES]:
         url = r["url"]
-        console.print(f"📄 [bold cyan]抓取:[/bold cyan] {url}")
+        if progress:
+            progress(f"📄 抓取: {url}")
         f = fetch_tool(url)
         if f.get("markdown"):
             fetched_blocks.append(
@@ -377,7 +408,8 @@ def run_dig(tech_name: str, direction: str, session=None) -> None:
             )
 
     # 4. 单次 LLM 生成报告（无工具，无循环）
-    console.print("🧠 [bold cyan]LLM 生成深度资料...[/bold cyan]")
+    if progress:
+        progress("🧠 LLM 生成深度资料...")
     resource_lines = [
         f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
         for r in results[:10]
@@ -395,14 +427,36 @@ def run_dig(tech_name: str, direction: str, session=None) -> None:
     safe_tech = tech_name.lower().replace(" ", "-")
     safe_dir = direction.lower().replace(" ", "-")
     save_result = save_file_tool(f"materials/{safe_tech}-{safe_dir}-dig.md", report)
-    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
-    console.print(Panel(Markdown(report[:3000]), title="✅ 资料深挖完成", style="green"))
 
-    # 6. 更新会话状态（若在 /learn 会话中）
+    return {
+        "urls": [r["url"] for r in results],
+        "report": report,
+        "materials_path": save_result["path"],
+    }
+
+
+def run_dig(tech_name: str, direction: str, session=None) -> None:
+    """运行资料深挖任务（确定性管道，定向深挖）。
+
+    薄包装：调用 dig_pipeline，负责进度打印与会话状态写入。
+
+    Args:
+        tech_name: 要学习的技术名称
+        direction: 具体深挖方向
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+    """
+    console.print(Panel(f"🔍 开始深挖「{tech_name}」的「{direction}」...", style="bold blue"))
+
+    result = dig_pipeline(tech_name, direction, progress=lambda m: console.print(m))
+    console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
+    console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料深挖完成", style="green"))
+
+    # 更新会话状态（若在 /learn 会话中）
     if session is not None:
         session.tech = tech_name
-        session.materials_path = save_result["path"]
-        session.add_history("dig", f"深挖「{tech_name}」的「{direction}」 → {save_result['path']}")
+        session.materials_path = result["materials_path"]
+        session.add_history("dig", f"深挖「{tech_name}」的「{direction}」 → {result['materials_path']}")
         session.save()
 
 
@@ -517,20 +571,78 @@ def _reuse_cached_report(cached: dict, url: str, session=None) -> None:
         session.save()
 
 
-def run_read(url: str, session=None) -> None:
-    """运行文档阅读辅助任务（确定性管道）。
+def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> dict:
+    """确定性管道核心：抓取 → 技术文档分类 → LLM 解读 → 保存 reports/。
 
-    流程：RAG 历史召回（命中已有解读则提示复用）→ Firecrawl 抓取
-    → LLM 分类识别技术文档 → LLM 解读 → 保存 reports/ 报告。
+    与 run_read 的区别：只返回数据（report / title / notes / error），
+    不打印、不写会话、不做"缓存复用"交互（复用决策属调用方职责）。
 
     Args:
         url: 文档 URL
-        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+        progress: 可选回调，接收进度消息；None 则静默
+
+    Returns:
+        {"report": str, "title": str, "report_path": str, "notes": list[dict], "error": str}
+        - error 为空表示成功；error 非空表示失败 / 非技术文档（此时 report 为空）
+        - notes 形如 [{"url", "title", "report"}]，供 LangGraph 状态累积
     """
     from datetime import datetime
     from .prompts import READ_SYSTEM_PROMPT
     from .storage import sanitize_filename
 
+    # 1. 抓取文档内容
+    fetched = fetch_tool(url)
+    if not fetched.get("markdown"):
+        err = fetched.get("error") or "抓取文档内容失败，请检查 URL 是否有效。"
+        return {"report": "", "title": "", "report_path": "", "notes": [], "error": f"抓取失败：{err}"}
+    if progress:
+        progress(f"✅ 抓取成功，内容 {len(fetched['markdown'])} 字符"
+                 f"{'（已截断，仅截取片段）' if fetched.get('truncated') else ''}")
+
+    # 1.5 技术文档识别（LLM 分类门）：非技术文档则中止，不进入解读
+    if progress:
+        progress("🔍 识别是否为技术文档...")
+    is_technical, reason = _classify_technical(url, fetched.get("title") or "", fetched["markdown"])
+    if not is_technical:
+        return {
+            "report": "", "title": fetched.get("title") or "", "report_path": "", "notes": [],
+            "error": f"该文档似乎不是技术文档，跳过解读（{reason or '未提供原因'}）",
+        }
+
+    # 2. 生成解读报告（单次 LLM 调用）
+    if progress:
+        progress("🧠 LLM 生成解读报告...")
+    report = _generate_text(
+        READ_SYSTEM_PROMPT,
+        f"请解读以下文档内容，生成结构化解读报告。\n"
+        f"原文地址：{url}\n"
+        f"文档标题：{fetched.get('title') or '未知'}\n\n"
+        f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
+    )
+
+    # 3. 保存报告
+    title = fetched.get("title") or "文档"
+    filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().strftime('%Y%m%d')}-解读.md"
+    save_result = save_file_tool(f"reports/{filename}", report)
+
+    return {
+        "report": report,
+        "title": title,
+        "report_path": save_result["path"],
+        "notes": [{"url": url, "title": title, "report": report}],
+        "error": "",
+    }
+
+
+def run_read(url: str, session=None) -> None:
+    """运行文档阅读辅助任务（确定性管道）。
+
+    薄包装：缓存复用决策在 CLI 层（_confirm_reuse），其余交给 read_pipeline。
+
+    Args:
+        url: 文档 URL
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+    """
     console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
     console.print(f"[dim]{url}[/dim]")
 
@@ -551,50 +663,20 @@ def run_read(url: str, session=None) -> None:
             _reuse_cached_report(cached, url, session=session)
             return
 
-    # 1. 抓取文档内容
-    fetched = fetch_tool(url)
-    if not fetched.get("markdown"):
-        console.print("[red]❌ 抓取文档内容失败，请检查 URL 是否有效。[/red]")
-        if fetched.get("error"):
-            console.print(f"[dim]{fetched['error']}[/dim]")
+    # 1-3. 抓取 → 分类 → 解读 → 保存
+    result = read_pipeline(url, progress=lambda m: console.print(m))
+    if result.get("error"):
+        console.print(f"[red]❌ {result['error']}[/red]")
         return
-    console.print(f"✅ 抓取成功，内容 {len(fetched['markdown'])} 字符"
-                  f"{'（已截断，仅截取片段）' if fetched.get('truncated') else ''}")
-
-    # 1.5 技术文档识别（LLM 分类门）：非技术文档则中止，不进入解读
-    console.print("🔍 [bold cyan]识别是否为技术文档...[/bold cyan]")
-    is_technical, reason = _classify_technical(url, fetched.get("title") or "", fetched["markdown"])
-    if not is_technical:
-        console.print(Panel(
-            f"[yellow]⚠ 该文档似乎不是技术文档，跳过解读[/yellow]\n[dim]原因：{reason or '未提供'}[/dim]",
-            title="⏭ 已跳过",
-            style="yellow",
-        ))
-        return
-
-    # 2. 生成解读报告（单次 LLM 调用）
-    console.print("🧠 [bold cyan]LLM 生成解读报告...[/bold cyan]")
-    report = _generate_text(
-        READ_SYSTEM_PROMPT,
-        f"请解读以下文档内容，生成结构化解读报告。\n"
-        f"原文地址：{url}\n"
-        f"文档标题：{fetched.get('title') or '未知'}\n\n"
-        f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
-    )
-
-    # 3. 保存报告
-    title = fetched.get("title") or "文档"
-    filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().strftime('%Y%m%d')}-解读.md"
-    save_result = save_file_tool(f"reports/{filename}", report)
-    console.print(f"├  保存报告: [bold]{save_result['path']}[/bold]")
-    console.print(Panel(Markdown(report), title="✅ 文档解读完成", style="green"))
+    console.print(f"├  保存报告: [bold]{result['report_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"]), title="✅ 文档解读完成", style="green"))
 
     # 4. 更新会话状态（若在 /learn 会话中）
     if session is not None:
         session.urls.append(url)
         session.visited.add(url)
-        session.notes.append({"url": url, "title": title, "report": report})
-        session.add_history("read", f"解读 {url} → {save_result['path']}")
+        session.notes.extend(result["notes"])
+        session.add_history("read", f"解读 {url} → {result['report_path']}")
         session.save()
 
 
@@ -631,34 +713,33 @@ def _parse_entries(raw: str) -> list[dict]:
     return []
 
 
-def run_note(tech: str, conversation_log: str, session=None) -> None:
-    """运行知识沉淀任务（确定性管道）。
+def note_pipeline(tech: str, conversation_log: str,
+                  progress: Callable[[str], None] | None = None) -> dict:
+    """确定性管道核心：LLM 提取知识点(JSON) → 逐条去重/合并入库 → 更新索引。
 
-    流程：LLM 提取知识点(JSON) → 逐条去重/合并入库 → 更新索引。
+    与 run_note 的区别：只返回数据（results / summary / 计数），
+    不打印、不写会话 —— 供 LangGraph 节点复用（Stage 3）。
 
     Args:
         tech: 技术名称
         conversation_log: 本轮学习的对话记录或文档内容
-        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+        progress: 可选回调，接收进度消息；None 则静默
+
+    Returns:
+        {"results": [persist 结果], "summary": str,
+         "new_count": int, "merged_count": int, "raw": str}
+        - results 为空表示未提取到可入库知识点
     """
     from .prompts import EXTRACT_SYSTEM_PROMPT
     from .storage import persist_note
 
-    console.print(Panel(f"📝 开始整理「{tech}」的学习笔记...", style="bold blue"))
-
     # 1. LLM 提取关键知识点（单次调用，输出 JSON）
     content = conversation_log[:12000]
-    console.print("🧠 [bold cyan]LLM 提取知识点...[/bold cyan]")
     raw = _generate_text(
         EXTRACT_SYSTEM_PROMPT,
         f"技术领域：{tech}\n\n===== 学习内容开始 =====\n{content}\n===== 学习内容结束 =====",
     )
     entries = _parse_entries(raw)
-
-    if not entries:
-        console.print("[yellow]⚠ 未提取到可入库的知识点。[/yellow]")
-        console.print(Panel(Markdown(raw), title="LLM 原始返回", style="dim"))
-        return
 
     # 2. 逐条去重/合并并入库
     new_count = merged_count = 0
@@ -676,16 +757,50 @@ def run_note(tech: str, conversation_log: str, session=None) -> None:
         else:
             merged_count += 1
 
-    console.print(f"✅ 本次沉淀：新增 [bold]{new_count}[/bold] 篇，合并更新 [bold]{merged_count}[/bold] 篇")
-    for r in results:
+    summary = (
+        f"新增 {new_count} 篇，合并更新 {merged_count} 篇"
+        if results else "未提取到可入库的知识点"
+    )
+    return {
+        "results": results,
+        "summary": summary,
+        "new_count": new_count,
+        "merged_count": merged_count,
+        "raw": raw,
+    }
+
+
+def run_note(tech: str, conversation_log: str, session=None) -> None:
+    """运行知识沉淀任务（确定性管道）。
+
+    薄包装：调用 note_pipeline，负责打印与会话状态写入。
+
+    Args:
+        tech: 技术名称
+        conversation_log: 本轮学习的对话记录或文档内容
+        session: 可选 LearnSession；传入时读写会话状态（跨命令共享）
+    """
+    console.print(Panel(f"📝 开始整理「{tech}」的学习笔记...", style="bold blue"))
+    console.print("🧠 [bold cyan]LLM 提取知识点...[/bold cyan]")
+
+    result = note_pipeline(tech, conversation_log, progress=lambda m: console.print(m))
+
+    if not result["results"]:
+        console.print("[yellow]⚠ 未提取到可入库的知识点。[/yellow]")
+        console.print(Panel(Markdown(result["raw"]), title="LLM 原始返回", style="dim"))
+        return
+
+    console.print(f"✅ 本次沉淀：新增 [bold]{result['new_count']}[/bold] 篇，"
+                  f"合并更新 [bold]{result['merged_count']}[/bold] 篇")
+    for r in result["results"]:
         label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
         console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")
 
-    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(results)} 个知识点已写入 `knowledge/`。"
+    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(result['results'])} 个知识点已写入 `knowledge/`。"
                                   f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))
 
     # 3. 更新会话状态（若在 /learn 会话中）
     if session is not None:
-        session.notes.extend(results)
-        session.add_history("note", f"沉淀 {len(results)} 个知识点")
+        session.notes.extend(result["results"])
+        session.add_history("note", f"沉淀 {len(result['results'])} 个知识点")
         session.save()
