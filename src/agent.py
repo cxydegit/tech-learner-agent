@@ -2,6 +2,7 @@
 
 import re
 import json
+from datetime import datetime
 from typing import Callable, Optional
 
 from openai import OpenAI
@@ -17,6 +18,19 @@ console = Console()
 
 # 最大 ReAct 循环次数
 MAX_LOOP_COUNT = 15
+
+
+def _current_time_label() -> str:
+    """当前系统时间标签（YYYY-MM-DD HH:MM），注入 collect/dig/read 管道防止 LLM 编造历史日期。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def _replace_time_line(report: str, label: str, now: str) -> str:
+    """确定性兜底：把报告中的时间行（如 `> 生成时间：xxx`）替换为系统时间。
+
+    即使 LLM 忽略"使用我提供的时间"指令，也能保证 报告内时间 === 当前系统日期。
+    """
+    return re.sub(rf"(?m)^>\s*{label}\s*[:：].*$", f"> {label}：{now}", report)
 
 
 class Agent:
@@ -303,18 +317,21 @@ def collect_pipeline(tech_name: str, level: str = "入门",
     # 4. 单次 LLM 生成报告（无工具，无循环）
     if progress:
         progress("🧠 LLM 生成学习资料清单...")
+    now = _current_time_label()
     resource_lines = [
         f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
         for r in results[:10]
     ]
     user_content = (
+        f"当前系统时间：{now}（报告中的「生成时间」必须使用此时间，不要自行推断或编造日期）\n"
         f"技术名称：{tech_name}\n级别：{level}\n\n"
         f"===== 搜索结果（标题 | 链接 | 摘要）=====\n"
         + "\n".join(resource_lines)
         + f"\n\n===== 抓取的文档内容 =====\n"
         + "\n".join(fetched_blocks)
     )
-    report = _generate_text(COLLECT_COMPOSE_PROMPT, user_content)
+    report = _generate_text(COLLECT_COMPOSE_PROMPT.format(now=now), user_content)
+    report = _replace_time_line(report, "生成时间", now)
 
     # 5. 保存（代码直接写入，不经工具参数序列化）
     safe = tech_name.lower().replace(" ", "-")
@@ -410,18 +427,21 @@ def dig_pipeline(tech_name: str, direction: str,
     # 4. 单次 LLM 生成报告（无工具，无循环）
     if progress:
         progress("🧠 LLM 生成深度资料...")
+    now = _current_time_label()
     resource_lines = [
         f"- {r.get('title', '')} | {r.get('url', '')} | {r.get('content', '')[:200]}"
         for r in results[:10]
     ]
     user_content = (
+        f"当前系统时间：{now}（报告中的「生成时间」必须使用此时间，不要自行推断或编造日期）\n"
         f"技术名称：{tech_name}\n具体方向：{direction}\n\n"
         f"===== 搜索结果（标题 | 链接 | 摘要）=====\n"
         + "\n".join(resource_lines)
         + f"\n\n===== 抓取的文档内容 =====\n"
         + "\n".join(fetched_blocks)
     )
-    report = _generate_text(DIG_COMPOSE_PROMPT, user_content)
+    report = _generate_text(DIG_COMPOSE_PROMPT.format(now=now), user_content)
+    report = _replace_time_line(report, "生成时间", now)
 
     # 5. 保存（代码直接写入，不经工具参数序列化）
     safe_tech = tech_name.lower().replace(" ", "-")
@@ -586,7 +606,6 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
         - error 为空表示成功；error 非空表示失败 / 非技术文档（此时 report 为空）
         - notes 形如 [{"url", "title", "report"}]，供 LangGraph 状态累积
     """
-    from datetime import datetime
     from .prompts import READ_SYSTEM_PROMPT
     from .storage import sanitize_filename
 
@@ -612,13 +631,16 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
     # 2. 生成解读报告（单次 LLM 调用）
     if progress:
         progress("🧠 LLM 生成解读报告...")
+    now = _current_time_label()
     report = _generate_text(
-        READ_SYSTEM_PROMPT,
+        READ_SYSTEM_PROMPT.format(now=now),
+        f"当前系统时间：{now}（报告中的「解读时间」必须使用此时间，不要自行推断或编造日期）\n"
         f"请解读以下文档内容，生成结构化解读报告。\n"
         f"原文地址：{url}\n"
         f"文档标题：{fetched.get('title') or '未知'}\n\n"
         f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
     )
+    report = _replace_time_line(report, "解读时间", now)
 
     # 3. 保存报告
     title = fetched.get("title") or "文档"
