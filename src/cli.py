@@ -12,7 +12,7 @@ from rich.panel import Panel
 
 from .config import config
 from .pipelines.collect import collect_pipeline, dig_pipeline
-from .pipelines.note import note_pipeline
+from .pipelines.note import note_pipeline, parse_merge_decision, persist_points
 from .pipelines.read import read_pipeline
 
 # Windows 原生控制台默认 GBK 编码，无法输出 emoji/部分中文符号。
@@ -102,7 +102,7 @@ def read(url: str):
 @click.option("--file", "-f", "file_path", help="从本地文件读取学习内容")
 @click.option("--text", "-t", "content", help="直接提供学习内容文本")
 def note(tech: str, file_path: str = None, content: str = None):
-    """将学习内容整理为结构化笔记。
+    """将学习内容整理为结构化笔记（差量提取，重复内容不沉淀）。
 
     TECH: 技术名称
     """
@@ -124,22 +124,39 @@ def note(tech: str, file_path: str = None, content: str = None):
         sys.exit(1)
 
     console.print(Panel(f"📝 开始整理「{tech}」的学习笔记...", style="bold blue"))
-    console.print("🧠 [bold cyan]LLM 提取知识点...[/bold cyan]")
 
-    result = note_pipeline(tech, conversation_log, progress=lambda m: console.print(m))
+    # materials_path：该技术的 materials 报告存在则带上（无新内容时用于推荐未覆盖方向）
+    materials_path = _find_materials_path(tech)
 
-    if not result["results"]:
-        console.print("[yellow]⚠ 未提取到可入库的知识点。[/yellow]")
-        console.print(Panel(Markdown(result["raw"]), title="LLM 原始返回", style="dim"))
+    result = note_pipeline(tech, conversation_log, materials_path=materials_path,
+                           progress=lambda m: console.print(m))
+
+    # 无新内容路径：不沉淀，有 materials 则给方向推荐
+    if result["empty_reason"]:
+        console.print(f"[yellow]ℹ {result['empty_reason']}，未沉淀。[/yellow]")
+        if result.get("suggestion"):
+            console.print(Panel(Markdown(result["suggestion"]), title="📌 建议继续学习的方向", style="cyan"))
         return
 
-    console.print(f"✅ 本次沉淀：新增 [bold]{result['new_count']}[/bold] 篇，"
-                  f"合并更新 [bold]{result['merged_count']}[/bold] 篇")
-    for r in result["results"]:
+    # 合并候选：汇总展示 + 一次 input() 统一决定 全合并/逐条/跳过
+    merge_indices: set[int] = set(range(len(result["merge_candidates"])))
+    if result["merge_candidates"]:
+        merge_indices = _prompt_merge_candidates(result["merge_candidates"])
+
+    # 用户确认后入库
+    persisted = persist_points(tech, result["new_points"], result["merge_candidates"], merge_indices)
+
+    if not persisted["results"]:
+        console.print("[yellow]ℹ 未沉淀任何知识点。[/yellow]")
+        return
+
+    console.print(f"✅ 本次沉淀：新增 [bold]{persisted['new_count']}[/bold] 篇，"
+                  f"合并更新 [bold]{persisted['merged_count']}[/bold] 篇")
+    for r in persisted["results"]:
         label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
         console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")
 
-    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(result['results'])} 个知识点已写入 `knowledge/`。"
+    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(persisted['results'])} 个知识点已写入 `knowledge/`。"
                                   f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))
 
 
@@ -163,6 +180,36 @@ def index(force: bool = False):
         console.print("[yellow]部分文件索引失败：[/yellow]")
         for e in result["errors"]:
             console.print(f"  [dim]{e}[/dim]")
+
+
+# ============================================================
+# note 交互辅助
+# ============================================================
+
+def _find_materials_path(tech: str) -> str | None:
+    """查找该技术的 materials 报告路径（collect 生成 `materials/<tech>-materials.md`）。"""
+    safe = tech.lower().replace(" ", "-")
+    p = config.MATERIALS_DIR / f"{safe}-materials.md"
+    return str(p) if p.exists() else None
+
+
+def _prompt_merge_candidates(candidates: list[dict]) -> set[int]:
+    """汇总展示相似候选，一次 input() 让用户统一决定 全合并/逐条/跳过。
+
+    Returns:
+        要合并的候选索引集合（0-based）；空集表示全部跳过。
+    """
+    console.print("[yellow]发现以下新知识点与已有笔记相似：[/yellow]")
+    for i, c in enumerate(candidates, 1):
+        sim = f"（相似度 {c['similarity']:.2f}）" if c.get("similarity") is not None else ""
+        delta = (c.get("content") or "").strip().replace("\n", " ")[:120]
+        console.print(f"  [bold][{i}][/bold] {c['topic']} → 已有「{c['old_topic']}」{sim}")
+        console.print(f"      [dim]新增点：{delta}[/dim]")
+    try:
+        ans = input("如何处理？全合并 [a] / 逐条选择编号（如 1,3）/ 跳过 [s]：").strip()
+    except (EOFError, KeyboardInterrupt):
+        ans = ""
+    return parse_merge_decision(ans, len(candidates))
 
 
 # ============================================================
@@ -321,6 +368,11 @@ def learn(session_id: str = None):
         if graph.get_state(gconfig).values:
             console.print("[dim]—— 上次会话状态 ——[/dim]")
             _print_graph_status(graph, gconfig)
+        elif session_id:
+            # 传入的会话 ID 无任何状态 → 警告，避免静默新建空会话（线程 ID 格式 learn-YYYYMMDD-HHMMSS，
+            # 少掉 learn- 前缀会进到全新空线程，note 会报"还没有技术主题"）
+            console.print(f"[yellow]⚠ 会话ID '{session_id}' 不存在或为空，已新建空会话。[/yellow]")
+            console.print("[dim]若想恢复旧会话，请确认 ID 完整（含 learn- 前缀），如 learn learn-20260810-122828[/dim]")
 
         while True:
             try:

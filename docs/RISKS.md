@@ -77,6 +77,7 @@ function calling 又偶发 400 / 幻觉"宣称已保存"。**共同根因是"让
 | note 去重用语义还是纯字符串？ | **语义为主 + 字符串兜底**（见隐患 6） |
 | RAG 索引怎么保持新鲜？ | persist_note 写后**增量更新**该文件分块 + `index` 命令全量重建（变更检测避免重复计费） |
 | Markdown 文档怎么分块？ | **Markdown 感知切块（chunker v2）**：表格/代码围栏原子化 + 标题章节前缀；`CHUNKER_VERSION` 版本号变更自动全量重切（见隐患 7） |
+| note 合并怎么做？ | **交互层确认 + LLM 差量合并**（不再静默追加；`persist_note` 只做新建/覆盖纯 I/O，去重匹配在 `find_note_match`/`recall_existing_notes`，见隐患 9） |
 
 ---
 
@@ -87,3 +88,10 @@ function calling 又偶发 400 / 幻觉"宣称已保存"。**共同根因是"让
 - **回归防线 I1**：`import src.cli` 不得把 chromadb / langgraph 放入 `sys.modules`（保证接口层轻量、冷启动快）。靠五处 lazy import 维持：`store.py::_find_dedup_match`/`_update_rag_index`、`cli.py::index`/`_try_reuse_cached_report`/`learn`。**后续新增顶层 import 时务必守住这条**——重构时在 `adapters/vector.py`、`graph.py` 的 import 就曾险些把 chromadb/langgraph 带上顶层。
 - **研究层隔离**：`baselines/` 只供 benchmark，任何主流程代码不得 import 它；ReAct 基线的 `_extract_json_object` 保持逐字副本，不与 `domain/extraction.py` 合并。
 - **涉及阶段**：Step 2 之后的所有开发。
+
+## 隐患 9：note 静默追加「补充」章节导致知识重复（Step 3）
+
+- **现象**：旧 `persist_note` 命中相似主题后，把**完整的新模板内容**原样追加成「补充」章节——即使差量提取不重复，合并这步也会把几乎一样的内容再写一遍。实证：`knowledge/rag/2026-08-09-文档分块.md` 的"注意事项"是放之四海皆准的套话、"代码示例"写"无。"——**模板的错，不是模型的错**。
+- **根因**：两件事必须一起改——① `EXTRACT_SYSTEM_PROMPT` 的 6 小节硬模板逼着 LLM 从头到尾重写全套（内容不够就用套话填充）；② 合并是静默追加，没有差量。
+- **决策（Step 3 落地）**：**差量提取**（提取提示词给已有笔记上下文，只输出新增点，可输出 `[]`）+ **合并决策上移交互层**（CLI `input()` 汇总候选一次确认 / `/learn` 图 `note_node` 用 interrupt）+ `persist_note` 改为**纯 I/O**（新建 / `replace_path` 覆盖，保留原日期，**不再追加**）。无新内容（`[]`）时不沉淀，有 materials 则 `suggest_directions` 轻量推荐未覆盖方向。
+- **涉及阶段**：Step 3 之后的所有开发。

@@ -51,6 +51,10 @@ class Config:
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"
     GRAPH_DB_PATH: Path = GRAPH_DB_DIR / "checkpoints.sqlite"
 
+    # Note 模块（Step 3 差量提取）：召回已有笔记作上下文的预算参数
+    NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "3"))  # 召回该 tech 已有笔记 top-k 作差量上下文
+    NOTE_CONTEXT_LIMIT: int = int(os.getenv("NOTE_CONTEXT_LIMIT", "500"))  # 每条已有笔记在提取提示词里的截断字数
+
     # 搜索配置
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
     MAX_FETCH_PAGES: int = int(os.getenv("MAX_FETCH_PAGES", "5"))

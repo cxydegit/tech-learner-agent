@@ -10,7 +10,7 @@ from pathlib import Path
 # 保证 tests/ 下能 import src（pytest 无 src 布局配置时）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.domain.dedup import _topics_overlap, _with_header, sanitize_filename
+from src.domain.dedup import _topics_overlap, _with_header, sanitize_filename, strip_note_header
 
 
 # ---------- sanitize_filename ----------
@@ -65,3 +65,20 @@ def test_with_header_no_tags():
     header = _with_header("依赖注入", None, "正文")
     assert "> 标签：" in header
     assert header.endswith("正文")
+
+
+# ---------- strip_note_header ----------
+
+def test_strip_note_header_removes_front_matter():
+    content = _with_header("依赖注入", ["spring", "di"], "## 是什么\n正文内容")
+    assert content.startswith("# 依赖注入")
+    assert strip_note_header(content) == "## 是什么\n正文内容"
+
+
+def test_strip_note_header_without_title():
+    body = strip_note_header("\n> 日期：2026-08-09\n> 标签：#x\n\n正文")
+    assert body == "正文"
+
+
+def test_strip_note_header_plain_body():
+    assert strip_note_header("## 是什么\n正文") == "## 是什么\n正文"

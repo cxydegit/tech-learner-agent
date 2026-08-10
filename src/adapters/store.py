@@ -6,6 +6,7 @@ save_file_tool / read_file_tool / list_files_tool。
 ⚠️ vector 导入必须保持函数内 lazy（不变量 I1：`import src.cli` 不得拉起 chromadb）。
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -26,14 +27,15 @@ def ensure_knowledge_base() -> None:
         )
 
 
-def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | None:
-    """语义去重：先召回同一领域 top1，相似度达标或主题重叠即视为同一知识点。
+def find_note_match(tech: str, topic: str, existing: list[dict]) -> tuple[dict | None, float | None]:
+    """语义去重：返回命中的已有笔记及其相似度（供 merge_candidates 展示）。
 
-    设计取舍（替代纯字符串）：
-    - 语义召回 top1 是主信号：相似度 >= RAG_DEDUP_THRESHOLD 即合并，
-      能抓住"字面不同但语义相同"的改写（纯字符串 overlap 抓不到）。
-    - 轻量 overlap 作为辅助确认：相似度未达阈值但主题高度重叠时也可合并。
-    - 两者都不中则回退到纯字符串匹配（覆盖 RAG 未索引 / 不可用场景）。
+    设计取舍（替代纯字符串，RISKS.md 隐患6）：
+    - 语义召回 top1 是主信号：相似度 >= RAG_DEDUP_THRESHOLD 即视为同一知识点，
+      返回真实相似度（能抓住"字面不同但语义相同"的改写）。
+    - 轻量 overlap 作为辅助确认：相似度未达阈值但主题高度重叠时也可合并，
+      此时相似度用召回值（可能略低于阈值）。
+    - 两者都不中则回退到纯字符串匹配（覆盖 RAG 未索引 / 不可用场景），相似度为 None。
 
     Args:
         tech: 技术名称（原始大小写，如 "FastAPI"）
@@ -41,8 +43,9 @@ def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | Non
         existing: 该技术领域已有的笔记列表（见 get_existing_notes）
 
     Returns:
-        命中的已有笔记 dict（{"path", "topic", ...}），否则 None
+        (命中的已有笔记 dict, 相似度 float | None)；未命中返回 (None, None)
     """
+    similarity: float | None = None
     try:
         from .vector import semantic_search_knowledge
         # 限定同一技术领域，避免跨领域误合并
@@ -55,15 +58,61 @@ def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | Non
             hit_path = h.get("path") or ""
             if hit_path.startswith("knowledge/"):
                 hit_path = hit_path[len("knowledge/"):]
-            strong = h.get("similarity", 0) >= config.RAG_DEDUP_THRESHOLD
+            sim = h.get("similarity", 0)
+            strong = sim >= config.RAG_DEDUP_THRESHOLD
             overlap = _topics_overlap(topic, hit_topic or hit_path)
             if (strong or overlap) and hit_path:
                 match = next((n for n in existing if n["path"] == hit_path), None)
                 if match:
-                    return match
+                    return match, sim
     except Exception:  # noqa: BLE001 —— RAG 不可用时回退到字符串匹配
         pass
-    return next((n for n in existing if _topics_overlap(n["topic"], topic)), None)
+    return next((n for n in existing if _topics_overlap(n["topic"], topic)), None), similarity
+
+
+def recall_existing_notes(tech: str, query: str, top_k: int = 3) -> list[dict]:
+    """语义召回该技术领域下与学习内容最相关的已有笔记 top-k（差量提取的对比上下文）。
+
+    复用 semantic_search_knowledge 限定 knowledge 源 + tech 目录（lazy import，守 I1）；
+    RAG 未索引 / 不可用时回退到最近 top_k 篇，保证提取提示词至少有一点对比对象。
+
+    Args:
+        tech: 技术名称（原始大小写，如 "FastAPI"）
+        query: 语义检索查询文本（本轮学习内容截断）
+        top_k: 返回条数
+
+    Returns:
+        [{"path", "topic", "date", "content", "similarity"}, ...]
+        无笔记时返回 []；content 来自 get_existing_notes（前 2000 字，供提取提示词自行截断）。
+    """
+    all_notes = get_existing_notes(tech)
+    if not all_notes:
+        return []
+    try:
+        from .vector import semantic_search_knowledge
+        hits = semantic_search_knowledge(query, top_k=top_k, tech=sanitize_filename(tech))
+    except Exception:  # noqa: BLE001 —— RAG 不可用时回退
+        hits = []
+
+    by_path = {n["path"]: n for n in all_notes}
+    recalled: list[dict] = []
+    for h in hits:
+        path = h.get("path") or ""
+        if path.startswith("knowledge/"):
+            path = path[len("knowledge/"):]
+        n = by_path.get(path)
+        if n and n not in recalled:
+            recalled.append({**n, "similarity": h.get("similarity", 0)})
+    if not recalled:
+        # 回退：最近 top_k 篇（RAG 未索引 / 空索引）
+        recalled = [{**n, "similarity": None} for n in all_notes[-top_k:]]
+    return recalled
+
+
+def read_knowledge_note(rel_path: str) -> str:
+    """读取知识库笔记全文（合并候选的 old_content 用，get_existing_notes 只截了前 2000 字）。"""
+    p = config.KNOWLEDGE_DIR / rel_path
+    return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
 def _update_rag_index(filepath: Path) -> None:
@@ -75,17 +124,22 @@ def _update_rag_index(filepath: Path) -> None:
         pass
 
 
-def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None) -> dict:
-    """持久化一条知识笔记，自动去重/合并。
+def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None,
+                 *, replace_path: str | None = None) -> dict:
+    """持久化一条知识笔记：新建 dated 文件，或覆盖合并进已有文件。
 
-    若知识库中已有语义相近的主题，则作为"补充"合并到已有笔记文件；
-    否则创建新的 dated 笔记文件并更新索引。写入后增量更新 RAG 索引。
+    Step 3 起**不再静默追加**：去重/合并决策上移到 note_pipeline + 交互层
+    （pipelines/note.py），此处只做纯 I/O——
+    - replace_path 为 None：创建新 dated 文件并更新 INDEX.md；
+    - replace_path 给出：把 content（交互层已用 LLM 差量合并好的正文）覆盖写入该文件，
+      保留原始日期，标签与既有标签合并去重。
 
     Args:
         tech: 技术名称（如 "spring-boot"）
         topic: 知识点主题（如 "依赖注入"）
-        content: Markdown 格式的笔记正文
+        content: Markdown 笔记正文（合并场景为合并后的完整正文，不含头部）
         tags: 标签列表
+        replace_path: 可选，要覆盖合并的已有笔记相对路径（knowledge/ 下）
 
     Returns:
         {"action": "new"|"merged", "path": str（相对 knowledge/）, "topic": str}
@@ -94,16 +148,17 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     tech_dir = config.KNOWLEDGE_DIR / sanitize_filename(tech)
     tech_dir.mkdir(parents=True, exist_ok=True)
 
-    # 去重：先语义召回 + overlap 确认，回退到纯字符串匹配
-    existing = get_existing_notes(tech)
-    match = _find_dedup_match(tech, topic, existing)
-
-    if match:
-        # 合并：追加"补充"章节到已有文件
-        existing_path = config.KNOWLEDGE_DIR / match["path"]
-        _append_section(existing_path, content)
-        _update_rag_index(existing_path)
-        return {"action": "merged", "path": match["path"], "topic": match["topic"]}
+    if replace_path:
+        filepath = config.KNOWLEDGE_DIR / replace_path
+        if filepath.exists():
+            old = filepath.read_text(encoding="utf-8")
+            old_date, old_tags = _parse_header(old)
+            date_str = old_date or datetime.now().strftime("%Y-%m-%d")
+            tag_str = " ".join(f"#{t}" for t in _merge_tags(old_tags, tags))
+            header = f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n"
+            filepath.write_text(header + content.lstrip(), encoding="utf-8")
+            _update_rag_index(filepath)
+            return {"action": "merged", "path": replace_path, "topic": topic}
 
     # 新建：dated 文件 + 更新索引
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -115,12 +170,31 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     return {"action": "new", "path": filepath.relative_to(config.KNOWLEDGE_DIR).as_posix(), "topic": topic}
 
 
-def _append_section(existing_path: Path, content: str) -> None:
-    """在已有笔记文件后追加"补充"章节。"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    existing = existing_path.read_text(encoding="utf-8")
-    combined = existing.rstrip() + f"\n\n---\n\n## 补充（更新于 {date_str}）\n\n" + content
-    existing_path.write_text(combined, encoding="utf-8")
+def _parse_header(content: str) -> tuple[str | None, list[str]]:
+    """从笔记文件头部解析日期和标签（形如 `> 日期：2026-08-09` / `> 标签：#a #b`）。
+
+    Returns:
+        (日期字符串, 标签列表)；缺省项为 (None, [])
+    """
+    date_str: str | None = None
+    tags: list[str] = []
+    for line in content.splitlines()[:5]:
+        m = re.search(r">\s*日期[：:]\s*(\S+)", line)
+        if m:
+            date_str = m.group(1).strip()
+        t = re.search(r">\s*标签[：:]\s*(.*)", line)
+        if t:
+            tags = [x.lstrip("#") for x in t.group(1).strip().split() if x.lstrip("#")]
+    return date_str, tags
+
+
+def _merge_tags(old: list[str], new: list[str] | None) -> list[str]:
+    """合并新旧标签，去重保序。"""
+    out: list[str] = []
+    for t in list(old) + list(new or []):
+        if t and t not in out:
+            out.append(t)
+    return out
 
 
 def update_index(tech: str, topic: str, filepath: Path) -> None:

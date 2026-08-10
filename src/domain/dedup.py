@@ -49,3 +49,18 @@ def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
     date_str = datetime.now().strftime("%Y-%m-%d")
     tag_str = " ".join(f"#{t}" for t in (tags or []))
     return f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n{content.lstrip()}"
+
+
+def strip_note_header(content: str) -> str:
+    """去掉笔记文件头部（# 标题 + > 日期/> 标签 元信息），只留正文。
+
+    兼容 _with_header 生成的格式：`# 主题\\n\\n> 日期：...\\n> 标签：...\\n\\n正文`。
+    差量合并（merge_notes）喂给 LLM 前用它剥头，避免 LLM 把头部当正文重复输出。
+    """
+    lines = content.splitlines()
+    i = 0
+    if i < len(lines) and lines[i].startswith("#"):
+        i += 1
+    while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith(">")):
+        i += 1
+    return "\n".join(lines[i:]).lstrip()

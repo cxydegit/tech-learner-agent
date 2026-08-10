@@ -28,7 +28,7 @@ from langgraph.types import Command, interrupt
 
 from .config import config
 from .pipelines.collect import collect_pipeline, dig_pipeline
-from .pipelines.note import note_pipeline
+from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
 from .pipelines.read import read_pipeline
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
@@ -45,6 +45,7 @@ class LearnState(TypedDict):
 
     tech: str
     level: str
+    materials_path: str  # 最近一次 collect/dig 的 materials 报告（note 无新内容时推荐方向用）
     urls: Annotated[list[str], operator.add]
     visited: Annotated[list[str], operator.add]
     notes: Annotated[list[dict], operator.add]
@@ -68,6 +69,7 @@ def collect_node(state: LearnState) -> dict:
         "urls": result["urls"],
         "tech": tech,
         "level": level,
+        "materials_path": result["materials_path"],
         "last_output": result["report"],
     }
 
@@ -77,7 +79,12 @@ def dig_node(state: LearnState) -> dict:
     tech = state["tech"]
     direction = " ".join(state.get("args") or [])
     result = dig_pipeline(tech, direction, progress=None)
-    return {"urls": result["urls"], "tech": tech, "last_output": result["report"]}
+    return {
+        "urls": result["urls"],
+        "tech": tech,
+        "materials_path": result["materials_path"],
+        "last_output": result["report"],
+    }
 
 
 def read_node(state: LearnState) -> dict:
@@ -90,15 +97,36 @@ def read_node(state: LearnState) -> dict:
 
 
 def note_node(state: LearnState) -> dict:
-    """把已解读的 report 汇总后沉淀为知识笔记。"""
+    """把已解读的 report 差量沉淀为知识笔记；有合并候选时用 interrupt 让用户确认。"""
     tech = state.get("tech") or ""
     content = _notes_to_content(state.get("notes") or [])
     if not tech:
         return {"last_output": "⚠ 会话还没有技术主题，先 collect <技术名>"}
     if not content.strip():
         return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
-    result = note_pipeline(tech, content, progress=None)
-    return {"notes": result["results"], "last_output": result["summary"]}
+
+    result = note_pipeline(tech, content, materials_path=state.get("materials_path"), progress=None)
+
+    # 无新内容：不沉淀 + 可选方向推荐
+    if result["empty_reason"]:
+        out = f"ℹ {result['empty_reason']}，未沉淀"
+        if result.get("suggestion"):
+            out += f"\n\n📌 建议继续学习的方向：\n{result['suggestion']}"
+        return {"last_output": out}
+
+    # 有合并候选：interrupt 汇总展示，用户统一决定 全合并/逐条/跳过
+    merge_indices: set[int] = set(range(len(result["merge_candidates"])))
+    if result["merge_candidates"]:
+        answer = interrupt(format_merge_candidates(result["merge_candidates"]))
+        merge_indices = parse_merge_decision(answer, len(result["merge_candidates"]))
+
+    # 用户确认后入库
+    persisted = persist_points(tech, result["new_points"], result["merge_candidates"], merge_indices)
+    summary = (
+        f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
+        if persisted["results"] else "未沉淀任何知识点"
+    )
+    return {"notes": persisted["results"], "last_output": summary}
 
 
 def ask_level_node(state: LearnState) -> dict:

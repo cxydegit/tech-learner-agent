@@ -139,14 +139,14 @@ Click 命令薄壳，不做业务，只做「解析参数 → 调管道/图 → 
 确定性管道是业务核心，三段主流程各一个：
 - `collect.py` — `collect_pipeline`（按级别搜索→抓取→单次 LLM 合成资料清单→保存 `materials/`）与 `dig_pipeline`（定向深挖变体），提示词 `COLLECT_COMPOSE_PROMPT`/`DIG_COMPOSE_PROMPT` 就近存放。
 - `read.py` — `read_pipeline`：抓取 → `_classify_technical` 分类门（非技术文档拦截）→ LLM 生成解读报告 → 保存 `reports/`。
-- `note.py` — `note_pipeline`：LLM 提取知识点 JSON → 逐条语义去重/合并入库。
+- `note.py` — `note_pipeline`（差量提取，Step 3）：召回已有笔记 → LLM 只输出**新增**知识点（可输出 `[]`）→ 逐条匹配生成 `merge_candidates` → 返回 `{new_points, merge_candidates, empty_reason, suggestion}`。入库在 `persist_points`（用户确认后调 `persist_note`）。
 
 管道只返回数据（dict），不 print、不交互、无副作用——交互性在 `cli.py` / `graph.py` 层完成。
 
 **`src/domain/`（领域层）**
 纯业务规则，零 I/O、零框架依赖，可独立单测：
 - `chunking.py` — Markdown 感知切块（chunker v2）：长表格 / 长代码围栏原子成块、标题章节前缀、`CHUNKER_VERSION` 版本号（改动分块逻辑必须递增，版本变更自动全量重切索引）。
-- `dedup.py` — 文件名清洗 `sanitize_filename`、主题重叠判断 `_topics_overlap`、笔记头生成 `_with_header`。
+- `dedup.py` — 文件名清洗 `sanitize_filename`、主题重叠判断 `_topics_overlap`、笔记头生成 `_with_header`、剥头部 `strip_note_header`（差量合并喂 LLM 前用）。
 - `extraction.py` — LLM 输出解析：`extract_json_object`（花括号配对 + 字符串状态机）、`parse_entries` / `parse_classify`（兼容代码块包裹与夹杂文本）。
 
 **`src/adapters/`（基础设施层）**
@@ -155,14 +155,14 @@ Click 命令薄壳，不做业务，只做「解析参数 → 调管道/图 → 
 - `search.py` / `fetch.py` — Tavily 搜索 / Firecrawl 网页抓取的薄封装。
 - `embedding.py` — `DashScopeEmbeddingFunction`（自定义 Chroma EmbeddingFunction）+ 批量嵌入（`_BATCH_SIZE=10`，百炼单请求上限）。
 - `vector.py` — Chroma 向量库全部逻辑：客户端/集合管理、`index_paths`/`index_documents` 索引（含变更检测）、`semantic_search`/`semantic_search_knowledge` 检索、`check_read_cache` 读缓存；提供 `python -m src.adapters.vector` CLI 直跑。
-- `store.py` — 知识库文件存储：`persist_note`（语义去重 `_find_dedup_match` + 追加/新建）、`update_index`（INDEX.md）、`get_existing_notes`/`get_knowledge_summary`，以及 `save_file_tool`/`read_file_tool`/`list_files_tool` 文件工具。
+- `store.py` — 知识库文件存储：`persist_note`（**不再静默追加**，仅新建 / 按 `replace_path` 覆盖合并）、`find_note_match`（语义去重，返回相似度）、`recall_existing_notes`（差量上下文召回）、`update_index`（INDEX.md）、`get_existing_notes`/`get_knowledge_summary`，以及 `save_file_tool`/`read_file_tool`/`list_files_tool` 文件工具。
 
 **`src/baselines/react_agent.py`（研究层）**
 Step 2 重构前 `agent.py` 的 ReAct Agent 类逐字冻结副本（含 `REACT_SYSTEM_PROMPT`、`TOOL_REGISTRY`、`_extract_json_object`），只作 Stage 4 benchmark 的对比基线。**主流程任何代码不得 import 它**，保持与生产路径的完全隔离。
 
 ### 关键不变量 I1
 
-`import src.cli` 不得把 `chromadb` / `langgraph` 放入 `sys.modules`（保证接口层轻量、冷启动快）。实现方式：`cli.py` 的 `index` / `_try_reuse_cached_report` / `learn` 与 `store.py` 的 `_find_dedup_match` / `_update_rag_index` 保持 **lazy import**（函数内 import，模块顶层不引入重依赖）。
+`import src.cli` 不得把 `chromadb` / `langgraph` 放入 `sys.modules`（保证接口层轻量、冷启动快）。实现方式：`cli.py` 的 `index` / `_try_reuse_cached_report` / `learn` 与 `store.py` 的 `find_note_match` / `recall_existing_notes` / `_update_rag_index` 保持 **lazy import**（函数内 import，模块顶层不引入重依赖）。
 
 ### 完整调用链
 
