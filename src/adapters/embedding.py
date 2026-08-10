@@ -11,7 +11,7 @@ from typing import Sequence
 from openai import OpenAI
 from chromadb.api.types import Documents, EmbeddingFunction
 
-from .config import config
+from ..config import config
 
 # 百炼 embeddings 单次请求上限为 10，多于此会报 InvalidParameter
 _BATCH_SIZE = 10

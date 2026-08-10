@@ -7,6 +7,10 @@
   （图暂停 → CLI 询问 → ``Command(resume=...)`` 恢复）
 - ``SqliteSaver`` checkpointer 跨会话/跨进程持久化（替换 session.py 的 JSON 落盘）
 
+节点不再 print：进度回调传 None，输出只经 ``last_output`` 返回，由 CLI 层渲染。
+已知取舍：/learn 失去分步进度行（后续可用 ``status: Annotated[list[str], operator.add]``
+状态字段补，本阶段不做）。
+
 用法：
     with open_graph() as graph:
         config = {"configurable": {"thread_id": "..."}}
@@ -21,15 +25,14 @@ from typing import Annotated, TypedDict
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
-from rich.console import Console
 
-from .agent import collect_pipeline, dig_pipeline, note_pipeline, read_pipeline
 from .config import config
+from .pipelines.collect import collect_pipeline, dig_pipeline
+from .pipelines.note import note_pipeline
+from .pipelines.read import read_pipeline
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
-
-console = Console()
 
 VALID_LEVELS = ("入门", "进阶")
 
@@ -45,7 +48,6 @@ class LearnState(TypedDict):
     urls: Annotated[list[str], operator.add]
     visited: Annotated[list[str], operator.add]
     notes: Annotated[list[dict], operator.add]
-    rag_hits: list[dict]
     # CLI 命令路由输入
     command: str  # collect / dig / read / note / ask_level
     args: list[str]
@@ -53,21 +55,15 @@ class LearnState(TypedDict):
 
 
 # ============================================================
-# 节点：薄包装确定性管道（复用 src/agent.py 的纯函数）
+# 节点：薄包装确定性管道（只读状态 → 调管道 → 返回增量）
 # ============================================================
-
-
-def _progress(msg: str) -> None:
-    """节点内进度回调：缩进打印，区别于 REPL 提示符。"""
-    console.print(f"  [dim]{msg}[/dim]")
 
 
 def collect_node(state: LearnState) -> dict:
     """按 tech + level 运行资料收集管道。"""
     tech = state["tech"]
     level = state.get("level") or "入门"
-    console.print(f"🔧 [bold cyan]graph.collect[/bold cyan] {tech}（{level}级）")
-    result = collect_pipeline(tech, level, progress=_progress)
+    result = collect_pipeline(tech, level, progress=None)
     return {
         "urls": result["urls"],
         "tech": tech,
@@ -80,16 +76,14 @@ def dig_node(state: LearnState) -> dict:
     """按 tech + direction 运行资料深挖管道。"""
     tech = state["tech"]
     direction = " ".join(state.get("args") or [])
-    console.print(f"🔧 [bold cyan]graph.dig[/bold cyan] {tech} · {direction}")
-    result = dig_pipeline(tech, direction, progress=_progress)
+    result = dig_pipeline(tech, direction, progress=None)
     return {"urls": result["urls"], "tech": tech, "last_output": result["report"]}
 
 
 def read_node(state: LearnState) -> dict:
     """运行文档解读管道；结果写入 visited / notes。"""
     url = state["args"][0]
-    console.print(f"🔧 [bold cyan]graph.read[/bold cyan] {url}")
-    result = read_pipeline(url, progress=_progress)
+    result = read_pipeline(url, progress=None)
     if result.get("error"):
         return {"last_output": f"❌ {result['error']}"}
     return {"visited": [url], "notes": result["notes"], "last_output": result["report"]}
@@ -103,8 +97,7 @@ def note_node(state: LearnState) -> dict:
         return {"last_output": "⚠ 会话还没有技术主题，先 collect <技术名>"}
     if not content.strip():
         return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
-    console.print(f"🔧 [bold cyan]graph.note[/bold cyan] {tech}")
-    result = note_pipeline(tech, content, progress=_progress)
+    result = note_pipeline(tech, content, progress=None)
     return {"notes": result["results"], "last_output": result["summary"]}
 
 

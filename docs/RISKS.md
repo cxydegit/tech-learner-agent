@@ -77,3 +77,13 @@ function calling 又偶发 400 / 幻觉"宣称已保存"。**共同根因是"让
 | note 去重用语义还是纯字符串？ | **语义为主 + 字符串兜底**（见隐患 6） |
 | RAG 索引怎么保持新鲜？ | persist_note 写后**增量更新**该文件分块 + `index` 命令全量重建（变更检测避免重复计费） |
 | Markdown 文档怎么分块？ | **Markdown 感知切块（chunker v2）**：表格/代码围栏原子化 + 标题章节前缀；`CHUNKER_VERSION` 版本号变更自动全量重切（见隐患 7） |
+
+---
+
+## 隐患 8：单文件臃肿 → 分层重构，如何防回归（Step 2）
+
+- **现象**：`agent.py` 805 行 + `prompts.py` 389 行 + `rag.py` 533 行堆成一个"上帝文件"，pipeline / Agent / 工具 / 提示词全部耦合，改一处牵全身。
+- **决策（Step 2 落地）**：move-and-re-export 分层——`domain/`（纯规则，零 I/O，可独立单测）、`adapters/`（外部 I/O）、`pipelines/`（确定性管道，prompts 就近）、`graph.py`（LangGraph 编排，节点不 print）、`cli.py`（接口/渲染/交互）、`baselines/react_agent.py`（ReAct 基线冻结，主流程不 import）。依赖方向 `cli → graph → pipelines → adapters → domain`，禁止向上 import。
+- **回归防线 I1**：`import src.cli` 不得把 chromadb / langgraph 放入 `sys.modules`（保证接口层轻量、冷启动快）。靠五处 lazy import 维持：`store.py::_find_dedup_match`/`_update_rag_index`、`cli.py::index`/`_try_reuse_cached_report`/`learn`。**后续新增顶层 import 时务必守住这条**——重构时在 `adapters/vector.py`、`graph.py` 的 import 就曾险些把 chromadb/langgraph 带上顶层。
+- **研究层隔离**：`baselines/` 只供 benchmark，任何主流程代码不得 import 它；ReAct 基线的 `_extract_json_object` 保持逐字副本，不与 `domain/extraction.py` 合并。
+- **涉及阶段**：Step 2 之后的所有开发。

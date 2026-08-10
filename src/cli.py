@@ -11,7 +11,9 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from .config import config
-from .agent import run_collect, run_read, run_note, run_dig
+from .pipelines.collect import collect_pipeline, dig_pipeline
+from .pipelines.note import note_pipeline
+from .pipelines.read import read_pipeline
 
 # Windows 原生控制台默认 GBK 编码，无法输出 emoji/部分中文符号。
 # 强制 stdout/stderr 使用 UTF-8，避免 Rich 渲染 emoji 时报 UnicodeEncodeError。
@@ -46,7 +48,13 @@ def collect(tech_name: str, level: str = None):
     TECH_NAME: 技术名称，如 "Spring Boot 3"、"FastAPI"（含空格需加引号）
     LEVEL: 可选，入门 或 进阶，默认入门
     """
-    run_collect(tech_name, level or "入门")
+    level = level or "入门"
+    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料（{level}级）...", style="bold blue"))
+
+    result = collect_pipeline(tech_name, level, progress=lambda m: console.print(m))
+    console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
+    console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料收集完成", style="green"))
 
 
 @cli.command()
@@ -59,7 +67,12 @@ def dig(tech_name: str, direction: tuple):
     DIRECTION: 具体方向，如 "注解原理"、"底层框架"（多词自动拼接）
     """
     direction_text = " ".join(direction)
-    run_dig(tech_name, direction_text)
+    console.print(Panel(f"🔍 开始深挖「{tech_name}」的「{direction_text}」...", style="bold blue"))
+
+    result = dig_pipeline(tech_name, direction_text, progress=lambda m: console.print(m))
+    console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
+    console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料深挖完成", style="green"))
 
 
 @cli.command()
@@ -69,7 +82,19 @@ def read(url: str):
 
     URL: 文档页面链接
     """
-    run_read(url)
+    console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
+    console.print(f"[dim]{url}[/dim]")
+
+    # RAG 历史召回：该 URL 已有解读则提示复用（失败静默，不影响抓取）
+    if _try_reuse_cached_report(url):
+        return
+
+    result = read_pipeline(url, progress=lambda m: console.print(m))
+    if result.get("error"):
+        console.print(f"[red]❌ {result['error']}[/red]")
+        return
+    console.print(f"├  保存报告: [bold]{result['report_path']}[/bold]")
+    console.print(Panel(Markdown(result["report"]), title="✅ 文档解读完成", style="green"))
 
 
 @cli.command()
@@ -98,7 +123,24 @@ def note(tech: str, file_path: str = None, content: str = None):
         console.print("[red]未提供学习内容[/red]")
         sys.exit(1)
 
-    run_note(tech, conversation_log)
+    console.print(Panel(f"📝 开始整理「{tech}」的学习笔记...", style="bold blue"))
+    console.print("🧠 [bold cyan]LLM 提取知识点...[/bold cyan]")
+
+    result = note_pipeline(tech, conversation_log, progress=lambda m: console.print(m))
+
+    if not result["results"]:
+        console.print("[yellow]⚠ 未提取到可入库的知识点。[/yellow]")
+        console.print(Panel(Markdown(result["raw"]), title="LLM 原始返回", style="dim"))
+        return
+
+    console.print(f"✅ 本次沉淀：新增 [bold]{result['new_count']}[/bold] 篇，"
+                  f"合并更新 [bold]{result['merged_count']}[/bold] 篇")
+    for r in result["results"]:
+        label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
+        console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")
+
+    console.print(Panel(Markdown(f"知识沉淀完成，共 {len(result['results'])} 个知识点已写入 `knowledge/`。"
+                                  f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))
 
 
 @cli.command()
@@ -111,7 +153,7 @@ def index(force: bool = False):
     已索引且内容未变化的文件会自动跳过，不会重复计费；分块器升级后用 --force
     或直接跑（版本号变更会自动触发全量重切）。
     """
-    from .rag import index_documents
+    from .adapters.vector import index_documents
 
     console.print("🧠 [bold cyan]构建 RAG 语义索引...[/bold cyan]")
     result = index_documents(force=force)
@@ -141,12 +183,68 @@ _HELP_TEXT = """可用命令：
 """
 
 
-def _drive(graph, config, payload, render: str = "plain") -> dict:
+def _confirm_reuse() -> bool:
+    """询问用户是否复用已有解读报告（默认不复用，避免误跳过新文档）。"""
+    try:
+        ans = input("是否复用已有解读，跳过抓取？[y/N] ").strip().lower()
+        return ans in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+def _try_reuse_cached_report(url: str, *, graph=None, gconfig=None) -> bool:
+    """RAG 历史召回：命中已有解读则询问是否复用；复用成功返回 True。
+
+    三种调用场景合一（原 run_read 内联块 + agent._reuse_cached_report + _handle_read_graph）：
+    - standalone `read`：graph/gconfig 均为 None → 仅展示复用报告，无状态写入
+    - /learn 内 `read`：graph/gconfig 提供 → 命中后 update_state 记录该文档已读
+    """
+    try:
+        from .adapters.vector import check_read_cache
+        cached = check_read_cache(url)
+    except Exception:  # noqa: BLE001 —— RAG 不可用时静默降级
+        cached = None
+    if not cached:
+        return False
+
+    console.print(Panel(
+        f"📌 检测到该 URL 已有解读报告：\n[bold]{cached['path']}[/bold]"
+        f"（相似度 {cached['similarity']:.2f}）",
+        title="⏭ RAG 缓存命中",
+        style="cyan",
+    ))
+    if not _confirm_reuse():
+        return False
+
+    # 优先读取完整报告文件；文件丢失时退回缓存的片段
+    report_path = config.BASE_DIR / cached["path"]
+    if report_path.exists():
+        report = report_path.read_text(encoding="utf-8", errors="replace")
+    else:
+        report = cached.get("content", "")
+
+    console.print(Panel(
+        f"[dim]{cached['path']}[/dim]\n相似度 {cached['similarity']:.2f}",
+        title="📄 复用已有解读",
+        style="cyan",
+    ))
+    console.print(Markdown(report))
+
+    if graph is not None and gconfig is not None:
+        # 直接更新图状态（不跑节点），记录该文档已读
+        graph.update_state(gconfig, {
+            "visited": [url],
+            "notes": [{"url": url, "title": cached["path"], "report": report}],
+        })
+    return True
+
+
+def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
     """驱动一次图执行；遇 interrupt 暂停询问，以 Command(resume) 恢复。
 
     Args:
         graph: build_graph 编译后的状态图
-        config: {"configurable": {"thread_id": ...}}
+        gconfig: {"configurable": {"thread_id": ...}}
         payload: 命令输入（dict）或恢复用的 Command
         render: 结束时 last_output 的渲染方式（plain / markdown）
 
@@ -156,7 +254,7 @@ def _drive(graph, config, payload, render: str = "plain") -> dict:
     from langgraph.types import Command
 
     while True:
-        stream = graph.stream_events(payload, config, version="v3")
+        stream = graph.stream_events(payload, gconfig, version="v3")
         if not stream.interrupted:
             final = stream.output
             last = (final or {}).get("last_output")
@@ -176,11 +274,11 @@ def _drive(graph, config, payload, render: str = "plain") -> dict:
             return stream.output
 
 
-def _print_graph_status(graph, config) -> None:
+def _print_graph_status(graph, gconfig) -> None:
     """/status：从 checkpointer 读取当前会话状态。"""
-    snap = graph.get_state(config)
+    snap = graph.get_state(gconfig)
     values = snap.values or {}
-    console.print(f"[bold]会话线程:[/bold] {config['configurable']['thread_id']}")
+    console.print(f"[bold]会话线程:[/bold] {gconfig['configurable']['thread_id']}")
     console.print(f"[bold]技术主题:[/bold] {values.get('tech') or '（未设置）'}  "
                   f"[bold]级别:[/bold] {values.get('level') or '（未设置）'}")
     console.print(f"[bold]收集到的链接:[/bold] {len(values.get('urls') or [])}")
@@ -192,33 +290,8 @@ def _print_graph_status(graph, config) -> None:
 
 def _handle_read_graph(graph, gconfig, url) -> None:
     """/learn 里的 read：RAG 缓存命中时询问是否复用，否则走图解读。"""
-    from .agent import _confirm_reuse
-
-    try:
-        from .rag import check_read_cache
-        cached = check_read_cache(url)
-    except Exception:  # noqa: BLE001 —— RAG 不可用时静默降级
-        cached = None
-    if cached:
-        console.print(Panel(
-            f"📌 检测到该 URL 已有解读报告：\n[bold]{cached['path']}[/bold]"
-            f"（相似度 {cached['similarity']:.2f}）",
-            title="⏭ RAG 缓存命中",
-            style="cyan",
-        ))
-        if _confirm_reuse():
-            report_path = config.BASE_DIR / cached["path"]
-            if report_path.exists():
-                report = report_path.read_text(encoding="utf-8", errors="replace")
-            else:
-                report = cached.get("content", "")
-            # 直接更新图状态（不跑节点），记录该文档已读
-            graph.update_state(gconfig, {
-                "visited": [url],
-                "notes": [{"url": url, "title": cached["path"], "report": report}],
-            })
-            console.print(Markdown(report))
-            return
+    if _try_reuse_cached_report(url, graph=graph, gconfig=gconfig):
+        return
     _drive(graph, gconfig, {"command": "read", "args": [url]}, render="markdown")
 
 
@@ -242,12 +315,12 @@ def learn(session_id: str = None):
     console.print("[dim]进入学习会话（LangGraph 图驱动）。输入命令开始，/help 查看帮助，/quit 退出。[/dim]")
 
     with open_graph() as graph:
-        config = {"configurable": {"thread_id": thread_id}}
+        gconfig = {"configurable": {"thread_id": thread_id}}
 
         # 恢复旧线程：已有状态则先展示
-        if graph.get_state(config).values:
+        if graph.get_state(gconfig).values:
             console.print("[dim]—— 上次会话状态 ——[/dim]")
-            _print_graph_status(graph, config)
+            _print_graph_status(graph, gconfig)
 
         while True:
             try:
@@ -266,9 +339,9 @@ def learn(session_id: str = None):
                     console.print("[dim]会话已保存（checkpointer），退出。[/dim]")
                     break
                 elif cmd == "status":
-                    _print_graph_status(graph, config)
+                    _print_graph_status(graph, gconfig)
                 elif cmd == "done":
-                    _drive(graph, config, {"command": "note"})
+                    _drive(graph, gconfig, {"command": "note"})
                     console.print("[dim]已沉淀并保存，退出。[/dim]")
                     break
                 elif cmd == "help":
@@ -292,22 +365,22 @@ def learn(session_id: str = None):
                     continue
                 level = parts[2] if len(parts) > 2 and parts[2] in ("入门", "进阶") else None
                 if level:
-                    _drive(graph, config, {"command": "collect", "tech": parts[1], "level": level})
+                    _drive(graph, gconfig, {"command": "collect", "tech": parts[1], "level": level})
                 else:
                     # 未指定级别 → 走 ask_level 交互点（interrupt，模块 2 水平探测最小种子）
-                    _drive(graph, config, {"command": "ask_level", "tech": parts[1]})
+                    _drive(graph, gconfig, {"command": "ask_level", "tech": parts[1]})
             elif op == "dig":
                 if len(parts) < 3:
                     console.print("[yellow]用法: dig <技术名> <具体方向>[/yellow]")
                     continue
-                _drive(graph, config, {"command": "dig", "tech": parts[1], "args": parts[2:]})
+                _drive(graph, gconfig, {"command": "dig", "tech": parts[1], "args": parts[2:]})
             elif op == "read":
                 if len(parts) < 2:
                     console.print("[yellow]用法: read <url>[/yellow]")
                     continue
-                _handle_read_graph(graph, config, parts[1])
+                _handle_read_graph(graph, gconfig, parts[1])
             elif op == "note":
-                _drive(graph, config, {"command": "note"})
+                _drive(graph, gconfig, {"command": "note"})
             else:
                 console.print(f"[yellow]未知命令: {op}（输入 /help 查看）[/yellow]")
 

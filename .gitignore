@@ -5,6 +5,7 @@ env/
 
 # 环境变量（密钥）
 .env
+.env.example
 
 # Python 缓存
 __pycache__/
@@ -29,5 +30,5 @@ knowledge/
 # 学习会话状态（运行时生成）
 .leamsessions/
 
-#用于面试
-docs/interview
+#用于开发、面试
+docs/

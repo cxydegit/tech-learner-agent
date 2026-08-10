@@ -1,10 +1,16 @@
-"""知识库存储管理：笔记读写、索引维护"""
+"""文件存储 + 笔记沉淀基础设施（含读写工具）。
 
-import re
+自 storage.py 迁出（去重/命名纯规则在 domain/dedup.py）+ tools.py 迁出
+save_file_tool / read_file_tool / list_files_tool。
+
+⚠️ vector 导入必须保持函数内 lazy（不变量 I1：`import src.cli` 不得拉起 chromadb）。
+"""
+
 from datetime import datetime
 from pathlib import Path
 
-from .config import config
+from ..config import config
+from ..domain.dedup import _topics_overlap, _with_header, sanitize_filename
 
 
 def ensure_knowledge_base() -> None:
@@ -18,42 +24,6 @@ def ensure_knowledge_base() -> None:
             "## 技术领域\n\n",
             encoding="utf-8",
         )
-
-
-def sanitize_filename(name: str) -> str:
-    """将技术名/主题名转换为安全的文件名。"""
-    return re.sub(r"[^\w\-]", "-", name.strip()).strip("-").lower()
-
-
-def _topics_overlap(a: str, b: str) -> bool:
-    """判断两个知识点标题是否高度相似（用于去重）。
-
-    满足以下任一条件即视为重叠：
-    - 完全相等
-    - 一方是另一方的子串
-    - 去掉停用词后，共享的关键词占比 >= 40%
-    """
-    a, b = a.lower().strip(), b.lower().strip()
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    if a in b or b in a:
-        return True
-
-    def _words(s: str) -> set[str]:
-        # 中文按字词切分，英文按空格切分；去停用词
-        stop = {"的", "了", "和", "与", "在", "用", "是", "对", "个", "the", "a", "an",
-                "and", "of", "in", "to", "for", "on", "with", "by"}
-        w = set(re.findall(r"[a-zA-Z0-9]+", s)) | set(re.findall(r"[一-鿿]", s))
-        return {x for x in w if x not in stop}
-
-    wa, wb = _words(a), _words(b)
-    if not wa or not wb:
-        return False
-    intersect = wa & wb
-    overlap = max(len(intersect) / len(wa), len(intersect) / len(wb))
-    return overlap >= 0.4
 
 
 def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | None:
@@ -74,7 +44,7 @@ def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | Non
         命中的已有笔记 dict（{"path", "topic", ...}），否则 None
     """
     try:
-        from .rag import semantic_search_knowledge
+        from .vector import semantic_search_knowledge
         # 限定同一技术领域，避免跨领域误合并
         hits = semantic_search_knowledge(topic, top_k=1, tech=sanitize_filename(tech))
         if hits:
@@ -99,7 +69,7 @@ def _find_dedup_match(tech: str, topic: str, existing: list[dict]) -> dict | Non
 def _update_rag_index(filepath: Path) -> None:
     """笔记写库后增量更新 RAG 索引（失败静默，不影响主流程）。"""
     try:
-        from .rag import index_paths
+        from .vector import index_paths
         index_paths([filepath])
     except Exception:  # noqa: BLE001 —— 索引失败不应阻断沉淀
         pass
@@ -143,13 +113,6 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     update_index(tech, topic, filepath)
     _update_rag_index(filepath)
     return {"action": "new", "path": filepath.relative_to(config.KNOWLEDGE_DIR).as_posix(), "topic": topic}
-
-
-def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
-    """给笔记正文加上标题和标签头部。"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    tag_str = " ".join(f"#{t}" for t in (tags or []))
-    return f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n{content.lstrip()}"
 
 
 def _append_section(existing_path: Path, content: str) -> None:
@@ -247,3 +210,67 @@ def get_knowledge_summary() -> str:
                 for n in sorted(notes):
                     summary.append(f"  - {n.stem}")
     return "\n".join(summary) if len(summary) > 1 else "知识库为空"
+
+
+# ============================================================
+# 文件读写工具（自 tools.py 迁出，供 ReAct 基线 / 管道保存用）
+# ============================================================
+
+def save_file_tool(path: str, content: str) -> dict:
+    """保存内容到本地文件。
+
+    Args:
+        path: 相对于项目根目录的文件路径
+        content: 文件内容
+
+    Returns:
+        dict: {"path": str, "size": int, "success": bool}
+    """
+    full_path = config.BASE_DIR / path
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(content, encoding="utf-8")
+    return {
+        "path": str(full_path),
+        "size": len(content),
+        "success": True,
+    }
+
+
+def read_file_tool(path: str) -> dict:
+    """读取本地文件内容。
+
+    Args:
+        path: 相对于项目根目录的文件路径
+
+    Returns:
+        dict: {"path": str, "content": str, "success": bool, "error": str}
+    """
+    full_path = config.BASE_DIR / path
+    if not full_path.exists():
+        return {"path": str(full_path), "content": "", "success": False, "error": "文件不存在"}
+    content = full_path.read_text(encoding="utf-8")
+    return {"path": str(full_path), "content": content, "success": True, "error": ""}
+
+
+def list_files_tool(directory: str = ".") -> dict:
+    """列出目录下的文件结构。
+
+    Args:
+        directory: 相对于项目根目录的目录路径
+
+    Returns:
+        dict: {"files": [{path, size, is_dir}, ...], "total": int}
+    """
+    full_dir = config.BASE_DIR / directory
+    if not full_dir.exists():
+        return {"files": [], "total": 0, "error": f"目录不存在: {directory}"}
+
+    files = []
+    for p in sorted(full_dir.rglob("*")):
+        rel_path = str(p.relative_to(config.BASE_DIR))
+        files.append({
+            "path": rel_path,
+            "size": p.stat().st_size if p.is_file() else 0,
+            "is_dir": p.is_dir(),
+        })
+    return {"files": files, "total": len(files)}

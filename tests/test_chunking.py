@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 from src.config import config
-from src.rag import Chunk, chunk_markdown, chunk_text
+from src.domain.chunking import Chunk, chunk_markdown, chunk_text
 
 
 def big_table() -> str:
