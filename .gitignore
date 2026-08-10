@@ -29,6 +29,7 @@ knowledge/
 
 # 学习会话状态（运行时生成）
 .leamsessions/
+.graph
 
 #用于开发、面试
 docs/

@@ -49,6 +49,9 @@ class LearnState(TypedDict):
     urls: Annotated[list[str], operator.add]
     visited: Annotated[list[str], operator.add]
     notes: Annotated[list[dict], operator.add]
+    # note 差量提取的游标：已处理过的 report 条数（普通字段，被 note_node 覆盖更新）。
+    # 作用是让第二次 note 只处理上次 note 之后新 read 的 report，避免重复提取已沉淀内容。
+    noted_count: int
     # CLI 命令路由输入
     command: str  # collect / dig / read / note / ask_level
     args: list[str]
@@ -97,22 +100,33 @@ def read_node(state: LearnState) -> dict:
 
 
 def note_node(state: LearnState) -> dict:
-    """把已解读的 report 差量沉淀为知识笔记；有合并候选时用 interrupt 让用户确认。"""
+    """把「上次 note 之后新解读的 report」差量沉淀为知识笔记；有合并候选时用 interrupt 让用户确认。
+
+    游标 noted_count 记录已处理过的 report 条数，notes 里 `n.get("report")` 为真的条目
+    才计入（persist 结果不含 report 键，天然被排除）。每次 note 只取 reports[noted_count:]，
+    处理完无论是否新增，游标都推进到当前 report 总数，避免下一轮重复提取已沉淀内容。
+    """
     tech = state.get("tech") or ""
-    content = _notes_to_content(state.get("notes") or [])
     if not tech:
         return {"last_output": "⚠ 会话还没有技术主题，先 collect <技术名>"}
-    if not content.strip():
-        return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
 
+    notes = state.get("notes") or []
+    reports = [n for n in notes if n.get("report")]
+    start = state.get("noted_count") or 0
+    if start >= len(reports):
+        if not reports:
+            return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
+        return {"last_output": "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 dig 新方向"}
+
+    content = _notes_to_content(reports[start:])
     result = note_pipeline(tech, content, materials_path=state.get("materials_path"), progress=None)
 
-    # 无新内容：不沉淀 + 可选方向推荐
+    # 无新内容：不沉淀 + 可选方向推荐（游标照常前进，避免反复重试同一批 report）
     if result["empty_reason"]:
         out = f"ℹ {result['empty_reason']}，未沉淀"
         if result.get("suggestion"):
             out += f"\n\n📌 建议继续学习的方向：\n{result['suggestion']}"
-        return {"last_output": out}
+        return {"noted_count": len(reports), "last_output": out}
 
     # 有合并候选：interrupt 汇总展示，用户统一决定 全合并/逐条/跳过
     merge_indices: set[int] = set(range(len(result["merge_candidates"])))
@@ -126,7 +140,7 @@ def note_node(state: LearnState) -> dict:
         f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
         if persisted["results"] else "未沉淀任何知识点"
     )
-    return {"notes": persisted["results"], "last_output": summary}
+    return {"notes": persisted["results"], "noted_count": len(reports), "last_output": summary}
 
 
 def ask_level_node(state: LearnState) -> dict:

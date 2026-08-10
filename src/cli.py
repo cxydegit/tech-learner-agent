@@ -330,7 +330,9 @@ def _print_graph_status(graph, gconfig) -> None:
                   f"[bold]级别:[/bold] {values.get('level') or '（未设置）'}")
     console.print(f"[bold]收集到的链接:[/bold] {len(values.get('urls') or [])}")
     console.print(f"[bold]已解读文档:[/bold] {len(values.get('visited') or [])}")
-    console.print(f"[bold]解读/沉淀记录:[/bold] {len(values.get('notes') or [])}")
+    reports = [n for n in (values.get("notes") or []) if n.get("report")]
+    console.print(f"[bold]已解读 report:[/bold] {len(reports)}  "
+                  f"[bold]note 已处理:[/bold] {values.get('noted_count') or 0}")
     if snap.next:
         console.print(f"[bold]下一步:[/bold] {snap.next}")
 
