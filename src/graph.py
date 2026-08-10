@@ -29,6 +29,7 @@ from langgraph.types import Command, interrupt
 from .config import config
 from .pipelines.collect import collect_pipeline, dig_pipeline
 from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
+from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
@@ -49,6 +50,9 @@ class LearnState(TypedDict):
     urls: Annotated[list[str], operator.add]
     visited: Annotated[list[str], operator.add]
     notes: Annotated[list[dict], operator.add]
+    # qa 多轮对话记录：每轮 /ask 的 {question, answer, sources, no_hit}。
+    # 跨命令累加 + checkpointer 持久化 → 多轮上下文靠它，web 化后即会话记录。
+    qa_history: Annotated[list[dict], operator.add]
     # note 差量提取的游标：已处理过的 report 条数（普通字段，被 note_node 覆盖更新）。
     # 作用是让第二次 note 只处理上次 note 之后新 read 的 report，避免重复提取已沉淀内容。
     noted_count: int
@@ -143,6 +147,38 @@ def note_node(state: LearnState) -> dict:
     return {"notes": persisted["results"], "noted_count": len(reports), "last_output": summary}
 
 
+def qa_node(state: LearnState) -> dict:
+    """跨笔记联想检索 Q&A：问知识库 → LLM 综合回答 + 来源标注。
+
+    不依赖会话 tech 主题：恒以 tech=None 跨全部笔记检索（"闭包"类问题天生跨笔记），
+    全新会话也能直接 /ask。结果 append 进 qa_history（checkpointer 持久化）。
+    """
+    args = state.get("args") or []
+    question = args[0] if args else ""
+    history = (state.get("qa_history") or [])[-config.QA_HISTORY_ROUNDS:]
+    result = qa_pipeline(question, tech=None, history=history)
+    exchange = {
+        "question": question,
+        "answer": result["answer"],
+        "sources": result["sources"],
+        "no_hit": result["no_hit"],
+    }
+    return {"qa_history": [exchange], "last_output": _render_qa(result)}
+
+
+def _render_qa(result: dict) -> str:
+    """把 qa_pipeline 结果渲染成面向用户的 Markdown。
+
+    只渲染 AI 答案（答案已按 QA_PROMPT 要求逐条内联标注来源）；检索零命中时如实告知。
+    no_hit 也可能是「模型明确说笔记里没有记录」——此时 answer 非空且有信息量
+    （如「笔记里没有记录 Redis 分布式锁的实现原理。」），直接展示模型原话，不用通用提示替换。
+    sources 数据仍保留在 qa_history 中（供未来 Web 端做来源卡片），不在此展示原文片段。
+    """
+    if result["no_hit"] and not result.get("answer"):
+        return "未在笔记库中找到相关内容。"
+    return result.get("answer") or "（无回答）"
+
+
 def ask_level_node(state: LearnState) -> dict:
     """水平探测交互点：图暂停，等 CLI 用 Command(resume=...) 恢复。
 
@@ -196,6 +232,7 @@ def build_graph(checkpointer):
     builder.add_node("dig", dig_node)
     builder.add_node("read", read_node)
     builder.add_node("note", note_node)
+    builder.add_node("qa", qa_node)
     builder.add_node("ask_level", ask_level_node)
 
     builder.add_conditional_edges(START, _route_command, {
@@ -203,12 +240,13 @@ def build_graph(checkpointer):
         "dig": "dig",
         "read": "read",
         "note": "note",
+        "qa": "qa",
         "ask_level": "ask_level",
     })
     # 按 level 分支：询问后进 collect；非法输入回 ask_level 再问
     builder.add_conditional_edges("ask_level", _route_by_level)
 
-    for n in ("collect", "dig", "read", "note"):
+    for n in ("collect", "dig", "read", "note", "qa"):
         builder.add_edge(n, END)
 
     return builder.compile(checkpointer=checkpointer)

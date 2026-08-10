@@ -221,6 +221,7 @@ _HELP_TEXT = """可用命令：
   dig <技术名> <具体方向>        深挖指定技术的具体方向
   read <url>                      解读技术文档
   note                            将本次会话内容沉淀为知识笔记
+  /ask <问题>                    联想检索笔记库并综合回答（不依赖技术主题）
   /status                         查看会话状态
   /done                           沉淀并结束会话
   /quit                           退出（状态已持久化）
@@ -344,6 +345,23 @@ def _handle_read_graph(graph, gconfig, url) -> None:
     _drive(graph, gconfig, {"command": "read", "args": [url]}, render="markdown")
 
 
+def _maybe_guide_collect(graph, gconfig, final) -> None:
+    """/ask 无命中引导：笔记库暂无相关内容 → 询问是否先 collect 某技术（回车跳过）。
+
+    复用 _handle_read_graph 的交互模式（CLI 层 input() + 再驱动命令），不需要 interrupt。
+    """
+    hist = (final or {}).get("qa_history") or []
+    if not hist or not hist[-1].get("no_hit"):
+        return
+    try:
+        tech = input("笔记库暂无相关内容，要针对哪个技术先 collect？（回车跳过）> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        tech = ""
+    if tech:
+        # 与 /learn 里 `collect <技术名>`（不指定级别）一致：ask_level 交互 → collect
+        _drive(graph, gconfig, {"command": "ask_level", "tech": tech})
+
+
 @cli.command()
 @click.argument("session_id", required=False)
 def learn(session_id: str = None):
@@ -394,6 +412,16 @@ def learn(session_id: str = None):
                     break
                 elif cmd == "status":
                     _print_graph_status(graph, gconfig)
+                elif cmd == "ask":
+                    # 联想检索笔记库并综合回答：不依赖会话技术主题，可直接执行
+                    _, _, question = line[1:].strip().partition(" ")
+                    question = question.strip()
+                    if not question:
+                        console.print("[yellow]用法: /ask <问题>（联想检索笔记库并综合回答）[/yellow]")
+                        continue
+                    final = _drive(graph, gconfig, {"command": "qa", "args": [question]},
+                                   render="markdown")
+                    _maybe_guide_collect(graph, gconfig, final)
                 elif cmd == "done":
                     _drive(graph, gconfig, {"command": "note"})
                     console.print("[dim]已沉淀并保存，退出。[/dim]")

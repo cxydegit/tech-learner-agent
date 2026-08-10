@@ -55,6 +55,13 @@ class Config:
     NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "3"))  # 召回该 tech 已有笔记 top-k 作差量上下文
     NOTE_CONTEXT_LIMIT: int = int(os.getenv("NOTE_CONTEXT_LIMIT", "500"))  # 每条已有笔记在提取提示词里的截断字数
 
+    # QA 模块（Step 4 联想检索）：检索与提示词预算参数
+    QA_TOP_K: int = int(os.getenv("QA_TOP_K", "8"))  # 召回笔记片段条数
+    QA_MAX_GROUPS: int = int(os.getenv("QA_MAX_GROUPS", "5"))  # 最多按来源笔记分组数
+    QA_SNIPPETS_PER_NOTE: int = int(os.getenv("QA_SNIPPETS_PER_NOTE", "3"))  # 每组最多片段数
+    QA_SNIPPET_CHARS: int = int(os.getenv("QA_SNIPPET_CHARS", "500"))  # 每条片段截断字数
+    QA_HISTORY_ROUNDS: int = int(os.getenv("QA_HISTORY_ROUNDS", "3"))  # 多轮上下文取最近 N 轮
+
     # 搜索配置
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
     MAX_FETCH_PAGES: int = int(os.getenv("MAX_FETCH_PAGES", "5"))
