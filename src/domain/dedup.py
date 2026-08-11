@@ -59,7 +59,8 @@ def strip_note_header(content: str) -> str:
     """
     lines = content.splitlines()
     i = 0
-    if i < len(lines) and lines[i].startswith("#"):
+    # 只认 `# 主题` 这种单 # 文件头（_with_header 产出格式）；`## 二级标题` 是正文，不剥
+    if i < len(lines) and lines[i].startswith("# "):
         i += 1
     while i < len(lines) and (not lines[i].strip() or lines[i].lstrip().startswith(">")):
         i += 1
