@@ -1,6 +1,6 @@
 """LLM 基础设施：一次性非循环生成 + 系统时间标签注入（确定性兜底）。
 
-自 agent.py 迁出：generate_text（原 _generate_text）。另含 collect/dig/read
+自 agent.py 迁出：generate_text（原 _generate_text）。另含 collect/read
 管道共用的 current_time_label / replace_time_line（Step 1 修复时间编造的产物）。
 """
 
@@ -13,7 +13,7 @@ from ..config import config
 
 
 def current_time_label() -> str:
-    """当前系统时间标签（YYYY-MM-DD HH:MM），注入 collect/dig/read 管道防止 LLM 编造历史日期。"""
+    """当前系统时间标签（YYYY-MM-DD HH:MM），注入 collect/read 管道防止 LLM 编造历史日期。"""
     return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 

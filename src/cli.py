@@ -11,7 +11,8 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 
 from .config import config
-from .pipelines.collect import collect_pipeline, dig_pipeline
+from .domain.card_input import parse_card_input
+from .pipelines.collect import collect_pipeline
 from .pipelines.note import note_pipeline, parse_merge_decision, persist_points
 from .pipelines.read import read_pipeline
 
@@ -40,48 +41,44 @@ def cli():
 
 
 @cli.command()
-@click.argument("tech_name")
-@click.argument("level", required=False, type=click.Choice(["入门", "进阶"], case_sensitive=False))
-def collect(tech_name: str, level: str = None):
-    """收集指定技术的学习资料（全面学习，按级别）。
+@click.argument("tech_name", required=False)
+@click.argument("focus", nargs=-1, required=False)
+def collect(tech_name: str, focus: tuple = ()):
+    """收集指定技术的学习资料。
 
     TECH_NAME: 技术名称，如 "Spring Boot 3"、"FastAPI"（含空格需加引号）
-    LEVEL: 可选，入门 或 进阶，默认入门
+    FOCUS: 可选，关注点（自由文本，多词自动拼接），如 collect FastAPI 异步编程
     """
-    level = level or "入门"
-    console.print(Panel(f"📚 开始收集「{tech_name}」的学习资料（{level}级）...", style="bold blue"))
+    parsed = parse_card_input("collect", [tech_name, *focus])
+    if parsed.get("error"):
+        console.print(f"[yellow]{parsed['error']}[/yellow]")
+        return
+    tech = parsed["tech"]
+    focus_text = parsed.get("focus")
+    title = f"📚 开始收集「{tech}」的学习资料"
+    if focus_text:
+        title += f"（关注：{focus_text}）"
+    title += "..."
+    console.print(Panel(title, style="bold blue"))
 
-    result = collect_pipeline(tech_name, level, progress=lambda m: console.print(m))
+    result = collect_pipeline(tech, focus_text, progress=lambda m: console.print(m))
     console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
     console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
     console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料收集完成", style="green"))
 
 
 @cli.command()
-@click.argument("tech_name")
-@click.argument("direction", nargs=-1, required=True)
-def dig(tech_name: str, direction: tuple):
-    """深挖指定技术的具体方向。
-
-    TECH_NAME: 技术名称，如 "Spring Boot"（含空格需加引号）
-    DIRECTION: 具体方向，如 "注解原理"、"底层框架"（多词自动拼接）
-    """
-    direction_text = " ".join(direction)
-    console.print(Panel(f"🔍 开始深挖「{tech_name}」的「{direction_text}」...", style="bold blue"))
-
-    result = dig_pipeline(tech_name, direction_text, progress=lambda m: console.print(m))
-    console.print(f"✅ 共收集到 [bold]{len(result['urls'])}[/bold] 条去重资源")
-    console.print(f"├  保存报告: [bold]{result['materials_path']}[/bold]")
-    console.print(Panel(Markdown(result["report"][:3000]), title="✅ 资料深挖完成", style="green"))
-
-
-@cli.command()
-@click.argument("url")
-def read(url: str):
+@click.argument("url", required=False)
+def read(url: str = None):
     """解读指定的技术文档。
 
     URL: 文档页面链接
     """
+    parsed = parse_card_input("read", [url] if url else [])
+    if parsed.get("error"):
+        console.print(f"[yellow]{parsed['error']}[/yellow]")
+        return
+    url = parsed["args"][0]
     console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
     console.print(f"[dim]{url}[/dim]")
 
@@ -187,10 +184,11 @@ def index(force: bool = False):
 # ============================================================
 
 def _find_materials_path(tech: str) -> str | None:
-    """查找该技术的 materials 报告路径（collect 生成 `materials/<tech>-materials.md`）。"""
+    """查找该技术最近一份 materials 报告（collect 生成 `materials/<tech>-materials-<时间>.md`，按 mtime 取最新）。"""
     safe = tech.lower().replace(" ", "-")
-    p = config.MATERIALS_DIR / f"{safe}-materials.md"
-    return str(p) if p.exists() else None
+    matches = sorted(config.MATERIALS_DIR.glob(f"{safe}-materials*.md"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    return str(matches[0]) if matches else None
 
 
 def _prompt_merge_candidates(candidates: list[dict]) -> set[int]:
@@ -217,8 +215,7 @@ def _prompt_merge_candidates(candidates: list[dict]) -> set[int]:
 # ============================================================
 
 _HELP_TEXT = """可用命令：
-  collect <技术名> [入门|进阶]   收集学习资料（不指定级别时交互式询问）
-  dig <技术名> <具体方向>        深挖指定技术的具体方向
+  collect <技术名> [关注点]      收集学习资料（关注点可选，多词直接拼）
   read <url>                      解读技术文档
   note                            将本次会话内容沉淀为知识笔记
   /ask <问题>                    联想检索笔记库并综合回答（不依赖技术主题）
@@ -227,7 +224,7 @@ _HELP_TEXT = """可用命令：
   /quit                           退出（状态已持久化）
   /help                           查看帮助
 
-提示：技术名含空格时用引号包裹，如 collect "Spring Boot"、dig "Claude Code" 底层框架
+提示：技术名含空格时用引号包裹，如 collect "Spring Boot"、collect FastAPI 异步编程
 """
 
 
@@ -327,8 +324,7 @@ def _print_graph_status(graph, gconfig) -> None:
     snap = graph.get_state(gconfig)
     values = snap.values or {}
     console.print(f"[bold]会话线程:[/bold] {gconfig['configurable']['thread_id']}")
-    console.print(f"[bold]技术主题:[/bold] {values.get('tech') or '（未设置）'}  "
-                  f"[bold]级别:[/bold] {values.get('level') or '（未设置）'}")
+    console.print(f"[bold]技术主题:[/bold] {values.get('tech') or '（未设置）'}")
     console.print(f"[bold]收集到的链接:[/bold] {len(values.get('urls') or [])}")
     console.print(f"[bold]已解读文档:[/bold] {len(values.get('visited') or [])}")
     reports = [n for n in (values.get("notes") or []) if n.get("report")]
@@ -358,8 +354,8 @@ def _maybe_guide_collect(graph, gconfig, final) -> None:
     except (EOFError, KeyboardInterrupt):
         tech = ""
     if tech:
-        # 与 /learn 里 `collect <技术名>`（不指定级别）一致：ask_level 交互 → collect
-        _drive(graph, gconfig, {"command": "ask_level", "tech": tech})
+        # 与 /learn 里 `collect <技术名>` 一致：直接驱动 collect
+        _drive(graph, gconfig, {"command": "collect", "tech": tech})
 
 
 @cli.command()
@@ -415,12 +411,11 @@ def learn(session_id: str = None):
                 elif cmd == "ask":
                     # 联想检索笔记库并综合回答：不依赖会话技术主题，可直接执行
                     _, _, question = line[1:].strip().partition(" ")
-                    question = question.strip()
-                    if not question:
+                    parsed = parse_card_input("ask", [question])
+                    if parsed.get("error"):
                         console.print("[yellow]用法: /ask <问题>（联想检索笔记库并综合回答）[/yellow]")
                         continue
-                    final = _drive(graph, gconfig, {"command": "qa", "args": [question]},
-                                   render="markdown")
+                    final = _drive(graph, gconfig, parsed, render="markdown")
                     _maybe_guide_collect(graph, gconfig, final)
                 elif cmd == "done":
                     _drive(graph, gconfig, {"command": "note"})
@@ -442,25 +437,17 @@ def learn(session_id: str = None):
                 continue
             op = parts[0].lower()
             if op == "collect":
-                if len(parts) < 2:
-                    console.print("[yellow]用法: collect <技术名> [入门|进阶][/yellow]")
+                parsed = parse_card_input("collect", parts[1:])
+                if parsed.get("error"):
+                    console.print(f"[yellow]{parsed['error']}[/yellow]")
                     continue
-                level = parts[2] if len(parts) > 2 and parts[2] in ("入门", "进阶") else None
-                if level:
-                    _drive(graph, gconfig, {"command": "collect", "tech": parts[1], "level": level})
-                else:
-                    # 未指定级别 → 走 ask_level 交互点（interrupt，模块 2 水平探测最小种子）
-                    _drive(graph, gconfig, {"command": "ask_level", "tech": parts[1]})
-            elif op == "dig":
-                if len(parts) < 3:
-                    console.print("[yellow]用法: dig <技术名> <具体方向>[/yellow]")
-                    continue
-                _drive(graph, gconfig, {"command": "dig", "tech": parts[1], "args": parts[2:]})
+                _drive(graph, gconfig, parsed)
             elif op == "read":
-                if len(parts) < 2:
-                    console.print("[yellow]用法: read <url>[/yellow]")
+                parsed = parse_card_input("read", parts[1:])
+                if parsed.get("error"):
+                    console.print(f"[yellow]{parsed['error']}[/yellow]")
                     continue
-                _handle_read_graph(graph, gconfig, parts[1])
+                _handle_read_graph(graph, gconfig, parsed["args"][0])
             elif op == "note":
                 _drive(graph, gconfig, {"command": "note"})
             else:

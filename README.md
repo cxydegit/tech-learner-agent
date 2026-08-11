@@ -36,11 +36,9 @@ cp .env.example .env
 ### 3. 开始使用
 
 ```bash
-# 收集学习资料（全面，可按级别）
+# 收集学习资料（可选关注点，多词直接拼）
 python -m src.cli collect "Spring Boot 3"
-
-# 定向深挖某个方向
-python -m src.cli dig "Spring Boot" 底层原理
+python -m src.cli collect FastAPI 异步编程
 
 # 解读技术文档
 python -m src.cli read "https://docs.spring.io/spring-boot/documentation/"
@@ -62,8 +60,7 @@ python -m src.cli learn
 
 | 命令 | 功能 | 输出 |
 |------|------|------|
-| `collect <技术名> [入门\|进阶]` | 搜索并筛选学习资料（按级别） | `materials/<技术>-materials.md` |
-| `dig <技术名> <方向>` | 定向深挖具体方向 | `materials/<技术>-<方向>-dig.md` |
+| `collect <技术名> [关注点]` | 搜索并筛选学习资料（有关注点则聚焦生成） | `materials/<技术>-materials-<时间>.md` |
 | `read <URL>` | 解读技术文档（含 RAG 缓存复用） | `reports/<标题>-解读.md` |
 | `note <技术名> [-f 文件\|-t 文本]` | 提取知识点到知识库（语义去重） | `knowledge/<技术>/<日期>-<主题>.md` |
 | `index [--force]` | 建立 / 增量更新 RAG 索引 | `.chroma/` 向量库 |
@@ -130,14 +127,14 @@ cli → graph → pipelines → adapters → domain
 全局唯一配置入口，`Config` 单例 + `config` 实例。集中管理环境变量（API Keys、模型名）、路径（`materials/` `reports/` `knowledge/` `.chroma/` `.graph/`）、RAG 阈值（分块大小、去重/读缓存相似度阈值、批量上限）。`config.validate()` 在 CLI 启动时校验必要变量，`config.ensure_dirs()` 确保输出目录存在。
 
 **`src/cli.py`（接口层）**
-Click 命令薄壳，不做业务，只做「解析参数 → 调管道/图 → 渲染结果」。独立命令 `collect` / `dig` / `read` / `note` / `index` 直接调用对应管道；`learn` 进入 LangGraph 图驱动的 REPL（`/help` `/status` `/done` `/quit`）。交互确认（如 RAG 缓存复用 `_confirm_reuse`）和 `_drive` 图驱动循环也在这里——**交互性只活在接口层，管道保持纯**。
+Click 命令薄壳，不做业务，只做「解析参数 → 调管道/图 → 渲染结果」。独立命令 `collect` / `read` / `note` / `index` 直接调用对应管道；`learn` 进入 LangGraph 图驱动的 REPL（`/help` `/status` `/done` `/quit`）。卡片级校验统一走 `domain/card_input.parse_card_input`（"请输入技术名/链接/问题"）。交互确认（如 RAG 缓存复用 `_confirm_reuse`）和 `_drive` 图驱动循环也在这里——**交互性只活在接口层，管道保持纯**。
 
 **`src/graph.py`（编排层）**
-编译 LangGraph 状态机 `LearnState`（`tech`/`level`/`urls`/`visited`/`notes`/`last_output` 等字段），节点是管道的薄包装（`collect_node`/`dig_node`/`read_node`/`note_node`），`ask_level_node` 用 interrupt 实现级别交互探测。路由函数 `_route_command`/`_route_by_level` 把用户命令分发到对应节点。`open_graph()` 用 SqliteSaver 把状态持久化到 `.graph/checkpoints.sqlite`，支持跨会话恢复。
+编译 LangGraph 状态机 `LearnState`（`tech`/`focus`/`urls`/`visited`/`notes`/`last_output` 等字段），节点是管道的薄包装（`collect_node`/`read_node`/`note_node`/`qa_node`），`note_node` 的合并确认用 interrupt 实现人机交互。路由函数 `_route_command` 把用户命令分发到对应节点。`open_graph()` 用 SqliteSaver 把状态持久化到 `.graph/checkpoints.sqlite`，支持跨会话恢复。
 
 **`src/pipelines/`（应用层）**
 确定性管道是业务核心，三段主流程各一个：
-- `collect.py` — `collect_pipeline`（按级别搜索→抓取→单次 LLM 合成资料清单→保存 `materials/`）与 `dig_pipeline`（定向深挖变体），提示词 `COLLECT_COMPOSE_PROMPT`/`DIG_COMPOSE_PROMPT` 就近存放。
+- `collect.py` — `collect_pipeline`（搜索→抓取→单次 LLM 合成资料清单→保存 `materials/`）；按 focus 切换两套提示词 `COLLECT_PROMPT_DEFAULT`（无关注点固定模板）/ `COLLECT_PROMPT_FOCUS`（有关注点非固定模板）就近存放。
 - `read.py` — `read_pipeline`：抓取 → `_classify_technical` 分类门（非技术文档拦截）→ LLM 生成解读报告 → 保存 `reports/`。
 - `note.py` — `note_pipeline`（差量提取，Step 3）：召回已有笔记 → LLM 只输出**新增**知识点（可输出 `[]`）→ 逐条匹配生成 `merge_candidates` → 返回 `{new_points, merge_candidates, empty_reason, suggestion}`。入库在 `persist_points`（用户确认后调 `persist_note`）。
 
@@ -148,11 +145,14 @@ Click 命令薄壳，不做业务，只做「解析参数 → 调管道/图 → 
 - `chunking.py` — Markdown 感知切块（chunker v2）：长表格 / 长代码围栏原子成块、标题章节前缀、`CHUNKER_VERSION` 版本号（改动分块逻辑必须递增，版本变更自动全量重切索引）。
 - `dedup.py` — 文件名清洗 `sanitize_filename`、主题重叠判断 `_topics_overlap`、笔记头生成 `_with_header`、剥头部 `strip_note_header`（差量合并喂 LLM 前用）。
 - `extraction.py` — LLM 输出解析：`extract_json_object`（花括号配对 + 字符串状态机）、`parse_entries` / `parse_classify`（兼容代码块包裹与夹杂文本）。
+- `quality.py` — 搜索结果质量预筛 `screen_results`（域名白名单 / GitHub 星数 / URL 特征评分，剔除内容农场与低分，纯规则零 I/O）。
+- `card_input.py` — 卡片级校验 `parse_card_input`（collect/read/ask 统一入口契约，focus/args 分工，零 I/O）。
 
 **`src/adapters/`（基础设施层）**
 封装所有外部 I/O，供 pipelines / cli / baselines 调用：
 - `llm.py` — `generate_text`（DashScope OpenAI 兼容调用）+ `current_time_label` / `replace_time_line`（报告生成时间注入，确定性兜底防 LLM 编造历史日期）。
 - `search.py` / `fetch.py` — Tavily 搜索 / Firecrawl 网页抓取的薄封装。
+- `github.py` — GitHub 仓库 star 数查询 `fetch_star_count`（标准库 urllib 单次 GET，可选 `GITHUB_TOKEN`，失败优雅降级为 None，供质量预筛用）。
 - `embedding.py` — `DashScopeEmbeddingFunction`（自定义 Chroma EmbeddingFunction）+ 批量嵌入（`_BATCH_SIZE=10`，百炼单请求上限）。
 - `vector.py` — Chroma 向量库全部逻辑：客户端/集合管理、`index_paths`/`index_documents` 索引（含变更检测）、`semantic_search`/`semantic_search_knowledge` 检索、`check_read_cache` 读缓存；提供 `python -m src.adapters.vector` CLI 直跑。
 - `store.py` — 知识库文件存储：`persist_note`（**不再静默追加**，仅新建 / 按 `replace_path` 覆盖合并）、`find_note_match`（语义去重，返回相似度）、`recall_existing_notes`（差量上下文召回）、`update_index`（INDEX.md）、`get_existing_notes`/`get_knowledge_summary`，以及 `save_file_tool`/`read_file_tool`/`list_files_tool` 文件工具。

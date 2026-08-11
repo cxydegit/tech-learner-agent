@@ -1,10 +1,9 @@
 """LangGraph 有状态编排（Stage 3）：/learn 会话的状态图 + 人机交互点。
 
-架构定位：确定性管道（collect/dig/read/note）是图的"叶子节点"，图负责编排——
+架构定位：确定性管道（collect/read/note）是图的"叶子节点"，图负责编排——
 有状态、可中断、跨会话：
 - ``StateGraph(LearnState)``：按 ``command`` 条件路由到对应管道节点
-- ``ask_level`` 节点用 ``interrupt()`` 实现模块 2 水平探测的交互点
-  （图暂停 → CLI 询问 → ``Command(resume=...)`` 恢复）
+- ``note_node`` 的合并确认用 ``interrupt()`` 暂停图，等 CLI 用 ``Command(resume=...)`` 恢复
 - ``SqliteSaver`` checkpointer 跨会话/跨进程持久化（替换 session.py 的 JSON 落盘）
 
 节点不再 print：进度回调传 None，输出只经 ``last_output`` 返回，由 CLI 层渲染。
@@ -27,15 +26,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from .config import config
-from .pipelines.collect import collect_pipeline, dig_pipeline
+from .pipelines.collect import collect_pipeline
 from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
-
-VALID_LEVELS = ("入门", "进阶")
 
 
 class LearnState(TypedDict):
@@ -45,8 +42,10 @@ class LearnState(TypedDict):
     """
 
     tech: str
-    level: str
-    materials_path: str  # 最近一次 collect/dig 的 materials 报告（note 无新内容时推荐方向用）
+    # collect 的自由文本关注点（用户提示词）：无 → 固定模板；有 → 非固定模板。
+    # CLI 由 domain/card_input.parse_card_input 产出；未来 Web 卡片输入同样落到此字段。
+    focus: str
+    materials_path: str  # 最近一次 collect 的 materials 报告（note 无新内容时推荐方向用）
     urls: Annotated[list[str], operator.add]
     visited: Annotated[list[str], operator.add]
     notes: Annotated[list[dict], operator.add]
@@ -57,7 +56,7 @@ class LearnState(TypedDict):
     # 作用是让第二次 note 只处理上次 note 之后新 read 的 report，避免重复提取已沉淀内容。
     noted_count: int
     # CLI 命令路由输入
-    command: str  # collect / dig / read / note / ask_level
+    command: str  # collect / read / note / qa
     args: list[str]
     last_output: str  # 节点输出，CLI 展示用
 
@@ -68,24 +67,10 @@ class LearnState(TypedDict):
 
 
 def collect_node(state: LearnState) -> dict:
-    """按 tech + level 运行资料收集管道。"""
+    """按 tech + focus（可选）运行资料收集管道。"""
     tech = state["tech"]
-    level = state.get("level") or "入门"
-    result = collect_pipeline(tech, level, progress=None)
-    return {
-        "urls": result["urls"],
-        "tech": tech,
-        "level": level,
-        "materials_path": result["materials_path"],
-        "last_output": result["report"],
-    }
-
-
-def dig_node(state: LearnState) -> dict:
-    """按 tech + direction 运行资料深挖管道。"""
-    tech = state["tech"]
-    direction = " ".join(state.get("args") or [])
-    result = dig_pipeline(tech, direction, progress=None)
+    focus = state.get("focus")
+    result = collect_pipeline(tech, focus, progress=None)
     return {
         "urls": result["urls"],
         "tech": tech,
@@ -120,7 +105,7 @@ def note_node(state: LearnState) -> dict:
     if start >= len(reports):
         if not reports:
             return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
-        return {"last_output": "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 dig 新方向"}
+        return {"last_output": "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 collect 新方向"}
 
     content = _notes_to_content(reports[start:])
     result = note_pipeline(tech, content, materials_path=state.get("materials_path"), progress=None)
@@ -179,16 +164,6 @@ def _render_qa(result: dict) -> str:
     return result.get("answer") or "（无回答）"
 
 
-def ask_level_node(state: LearnState) -> dict:
-    """水平探测交互点：图暂停，等 CLI 用 Command(resume=...) 恢复。
-
-    ``interrupt()`` 的返回值即用户回答，写入 ``level`` 供后续 collect 使用。
-    这是模块 2 完整自适应问卷（连续多次 interrupt）的最小种子。
-    """
-    answer = interrupt("请选择学习级别：入门 / 进阶")
-    return {"level": str(answer).strip()}
-
-
 def _notes_to_content(notes: list[dict]) -> str:
     """把已解读的 report 汇总成 note 管道的输入文本。"""
     parts = []
@@ -204,13 +179,8 @@ def _notes_to_content(notes: list[dict]) -> str:
 
 
 def _route_command(state: LearnState) -> str:
-    """START 条件边：按 command 路由到对应节点。"""
+    """START 条件边：按 command 路由到对应节点。当图被意外触发且未指明命令时，默认执行 note 节点。"""
     return state.get("command", "note")
-
-
-def _route_by_level(state: LearnState) -> str:
-    """ask_level 之后按 level 分支：合法级别进 collect，否则回问。"""
-    return "collect" if state.get("level") in VALID_LEVELS else "ask_level"
 
 
 # ============================================================
@@ -229,24 +199,18 @@ def build_graph(checkpointer):
     """
     builder = StateGraph(LearnState)
     builder.add_node("collect", collect_node)
-    builder.add_node("dig", dig_node)
     builder.add_node("read", read_node)
     builder.add_node("note", note_node)
     builder.add_node("qa", qa_node)
-    builder.add_node("ask_level", ask_level_node)
 
     builder.add_conditional_edges(START, _route_command, {
         "collect": "collect",
-        "dig": "dig",
         "read": "read",
         "note": "note",
         "qa": "qa",
-        "ask_level": "ask_level",
     })
-    # 按 level 分支：询问后进 collect；非法输入回 ask_level 再问
-    builder.add_conditional_edges("ask_level", _route_by_level)
 
-    for n in ("collect", "dig", "read", "note", "qa"):
+    for n in ("collect", "read", "note", "qa"):
         builder.add_edge(n, END)
 
     return builder.compile(checkpointer=checkpointer)

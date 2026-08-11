@@ -17,6 +17,7 @@ class Config:
     OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "")
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
     FIRECRAWL_API_KEY: str = os.getenv("FIRECRAWL_API_KEY", "")
+    GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")  # 可选；设了才查 GitHub star 数（质量预筛），没设自动跳过
 
     # LLM 配置
     LLM_MODEL: str = os.getenv("MODEL_NAME", "")
@@ -61,6 +62,26 @@ class Config:
     QA_SNIPPETS_PER_NOTE: int = int(os.getenv("QA_SNIPPETS_PER_NOTE", "3"))  # 每组最多片段数
     QA_SNIPPET_CHARS: int = int(os.getenv("QA_SNIPPET_CHARS", "500"))  # 每条片段截断字数
     QA_HISTORY_ROUNDS: int = int(os.getenv("QA_HISTORY_ROUNDS", "3"))  # 多轮上下文取最近 N 轮
+
+    # Step 5 Part B 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
+    QUALITY_DOMAIN_BONUS_OFFICIAL: int = int(os.getenv("QUALITY_DOMAIN_BONUS_OFFICIAL", "20"))
+    QUALITY_DOMAIN_BONUS_PLATFORM: int = int(os.getenv("QUALITY_DOMAIN_BONUS_PLATFORM", "10"))
+    QUALITY_URL_BONUS_OFFICIAL_DOCS: int = int(os.getenv("QUALITY_URL_BONUS_OFFICIAL_DOCS", "10"))
+    QUALITY_URL_PENALTY_BLOG: int = int(os.getenv("QUALITY_URL_PENALTY_BLOG", "-5"))
+    QUALITY_URL_PENALTY_SOURCE: int = int(os.getenv("QUALITY_URL_PENALTY_SOURCE", "-5"))
+    QUALITY_MIN_SCORE: int = int(os.getenv("QUALITY_MIN_SCORE", "0"))
+    # GitHub 星数四档加分：[(最小星数, 加分)] 降序判定（≥10000 +30 / ≥1000 +20 / ≥100 +10 / ≥0 +5）
+    QUALITY_STAR_TIERS: tuple = ((10000, 30), (1000, 20), (100, 10), (0, 5))
+    # 域名白名单：官方/权威 +20；高质平台/社区 +10；github.com 不走域名加分、走星数加分
+    QUALITY_OFFICIAL_DOMAINS: tuple = (
+        "python.org", "nodejs.org", "react.dev", "spring.io", "fastapi.tiangolo.com",
+        "kubernetes.io", "docker.com", "developer.mozilla.org", "golang.org",
+        "rust-lang.org", "microsoft.com", "oracle.com", "docs.djangoproject.com",
+    )
+    QUALITY_PLATFORM_DOMAINS: tuple = (
+        "github.com", "stackoverflow.com", "stackexchange.com", "juejin.cn", "zhihu.com",
+    )
+    QUALITY_CONTENT_FARMS: tuple = ()  # 内容农场名单，默认空（不误伤），按实际搜索结果补充
 
     # 搜索配置
     MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "10"))
