@@ -89,6 +89,9 @@ class Config:
 
     # 抓取内容长度限制（字符数）
     MAX_FETCH_CHARS: int = int(os.getenv("MAX_FETCH_CHARS", "16000"))
+    # 抓取并发与超时（Stage 4 benchmark 发现：5 次顺序抓取是 collect 耗时主因，改并发 + 超时）
+    FETCH_MAX_WORKERS: int = int(os.getenv("FETCH_MAX_WORKERS", "5"))  # 并发抓取线程数上限
+    FETCH_TIMEOUT_SECONDS: float = float(os.getenv("FETCH_TIMEOUT_SECONDS", "45"))  # 单次抓取超时上限（秒）
 
     @classmethod
     def validate(cls) -> list[str]:

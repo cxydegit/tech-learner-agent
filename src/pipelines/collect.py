@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime
 from typing import Callable
 
-from ..adapters.fetch import fetch_tool
+from ..adapters.fetch import fetch_many
 from ..adapters.github import fetch_star_count
 from ..adapters.llm import current_time_label, generate_text, replace_time_line
 from ..adapters.search import search_tool
@@ -151,17 +151,17 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
         url_penalty_source=config.QUALITY_URL_PENALTY_SOURCE,
     )
 
-    # 3. 抓取通过预筛、排名靠前的文档
+    # 3. 并发抓取通过预筛、排名靠前的文档（顺序归并保持确定性；单个超时/失败记空，不拖垮整批）
     fetched_blocks: list[str] = []
-    for r in kept[: config.MAX_FETCH_PAGES]:
-        url = r["url"]
+    targets = kept[: config.MAX_FETCH_PAGES]
+    if targets:
         if progress:
-            progress(f"📄 抓取: {url}")
-        f = fetch_tool(url)
-        if f.get("markdown"):
-            fetched_blocks.append(
-                f"### {f.get('title') or url}\n来源：{url}\n\n{f['markdown'][:4000]}"
-            )
+            progress(f"🛰️ 并发抓取 {len(targets)} 个页面（超时 {config.FETCH_TIMEOUT_SECONDS:.0f}s）...")
+        for r, f in zip(targets, fetch_many([r["url"] for r in targets])):
+            if f.get("markdown"):
+                fetched_blocks.append(
+                    f"### {f.get('title') or r['url']}\n来源：{r['url']}\n\n{f['markdown'][:4000]}"
+                )
 
     # 4. 单次 LLM 生成报告（无工具，无循环）；focus 作为用户提示词进 user 消息
     if progress:
