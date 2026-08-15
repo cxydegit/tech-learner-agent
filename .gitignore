@@ -33,3 +33,6 @@ knowledge/
 
 #用于开发、面试
 docs/
+
+#测试、验证工具
+scripts/

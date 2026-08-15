@@ -413,7 +413,8 @@ def write_markdown(out_path: Path, agg_map: dict, totals: dict, run_command: str
     lines.append("- graph 侧走生产 `src/graph.py` 的 LangGraph 图（InMemorySaver），`collect_node` → `collect_pipeline`。")
     lines.append("- 工具调用数：graph 侧为 搜索(3) + 抓取(≤5) + 保存(1) 的固定组合；agent 侧由模型自主决定。GitHub star 查询不计入。")
     lines.append("- 两侧共用同一 LLM 入口，token 成本为 `usage` 累计（含循环历史累积）。")
-    lines.append("- 成功率是二项分布，N 小时置信区间宽；「graph≈100% vs agent 明显更低」的量级差异 N≥5 即可看出方向。")
+    lines.append("- 成功率是二项分布，N 小置信区间宽；本任务集刻意选「不依赖大段内容」的简单任务（RISKS 隐患 2 指引），")
+    lines.append("  两侧成功率可能都接近 100%——「可靠性差距」需换含大段工具参数的任务集才能量化。")
     lines.append("")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -19,7 +19,9 @@
 import operator
 import warnings
 from contextlib import contextmanager
-from typing import Annotated, TypedDict
+from contextvars import ContextVar
+from datetime import datetime
+from typing import Annotated, Callable, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -33,6 +35,60 @@ from .pipelines.read import read_pipeline
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
+
+# Web 流式进度注入：管道 progress= 回调由 Web 的 worker 线程通过 ContextVar 注入，
+# CLI 不调用保持默认 None。节点读 _progress_cv.get() 而非硬编码 None。
+# contextvars 按线程隔离：Web 每次 run/resume 各自 set/reset，互不串扰。
+_progress_cv: ContextVar[Callable[[str], None] | None] = ContextVar("web_progress", default=None)
+
+
+@contextmanager
+def web_progress(progress: Callable[[str], None] | None):
+    """在上下文里给图节点注入流式进度回调（Web 用；CLI 不调用，进度保持静默）。"""
+    token = _progress_cv.set(progress)
+    try:
+        yield
+    finally:
+        _progress_cv.reset(token)
+
+
+def _user_message(state: "LearnState", *, decision: str | None = None) -> str:
+    """从图状态重建本轮的用户输入显示文本（写进 conversation，历史会话重载用）。
+
+    qa 节点对应卡片命令名 ask（graph 路由 key 是 qa），显示为 `ask <问题>` 与前端卡片一致。
+    note 节点在中断恢复后可带上用户的合并决策（all / 编号 / skip）。
+    """
+    cmd = state.get("command") or ""
+    if cmd == "collect":
+        text = f"collect {state.get('tech') or ''}".rstrip()
+        if state.get("focus"):
+            text += f" {state['focus']}"
+        return text
+    if cmd == "read":
+        return f"read {state['args'][0] if state.get('args') else ''}".rstrip()
+    if cmd == "qa":
+        return f"ask {state['args'][0] if state.get('args') else ''}".rstrip()
+    if cmd == "note":
+        text = "note"
+        if decision:
+            text += f"（合并决策：{decision.strip()}）"
+        return text
+    return cmd or "note"
+
+
+def _conversation(state: "LearnState", assistant_content: str, node_type: str,
+                  *, decision: str | None = None) -> list[dict]:
+    """构造一对话轮次的「用户输入 + AI 回复」两条记录。
+
+    conversation 是 operator.add reducer，节点返回的两条会被 append 累加；
+    Web/CLI 共用同一状态，CLI 不读 conversation，行为零变化。ts 同轮取同一时间戳，
+    前端按列表顺序渲染即可。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    return [
+        {"role": "user", "type": "command", "content": _user_message(state, decision=decision), "ts": now},
+        {"role": "assistant", "type": node_type, "content": assistant_content, "ts": now},
+    ]
 
 
 class LearnState(TypedDict):
@@ -59,6 +115,10 @@ class LearnState(TypedDict):
     command: str  # collect / read / note / qa
     args: list[str]
     last_output: str  # 节点输出，CLI 展示用
+    # Web 对话流：{role: user|assistant, type, content, ts} 累加记录，跨命令持久化。
+    # Web 按轮渲染「用户输入 + AI 回复」，历史会话重载直接读它（§4-①）。
+    # CLI 不读此字段，纯增量不破坏现有渲染。
+    conversation: Annotated[list[dict], operator.add]
 
 
 # ============================================================
@@ -70,22 +130,27 @@ def collect_node(state: LearnState) -> dict:
     """按 tech + focus（可选）运行资料收集管道。"""
     tech = state["tech"]
     focus = state.get("focus")
-    result = collect_pipeline(tech, focus, progress=None)
+    result = collect_pipeline(tech, focus, progress=_progress_cv.get())
+    report = result["report"]
     return {
         "urls": result["urls"],
         "tech": tech,
         "materials_path": result["materials_path"],
-        "last_output": result["report"],
+        "last_output": report,
+        "conversation": _conversation(state, report, "collect"),
     }
 
 
 def read_node(state: LearnState) -> dict:
     """运行文档解读管道；结果写入 visited / notes。"""
     url = state["args"][0]
-    result = read_pipeline(url, progress=None)
+    result = read_pipeline(url, progress=_progress_cv.get())
     if result.get("error"):
-        return {"last_output": f"❌ {result['error']}"}
-    return {"visited": [url], "notes": result["notes"], "last_output": result["report"]}
+        out = f"❌ {result['error']}"
+        return {"last_output": out, "conversation": _conversation(state, out, "read")}
+    report = result["report"]
+    return {"visited": [url], "notes": result["notes"], "last_output": report,
+            "conversation": _conversation(state, report, "read")}
 
 
 def note_node(state: LearnState) -> dict:
@@ -97,31 +162,39 @@ def note_node(state: LearnState) -> dict:
     """
     tech = state.get("tech") or ""
     if not tech:
-        return {"last_output": "⚠ 会话还没有技术主题，先 collect <技术名>"}
+        out = "⚠ 会话还没有技术主题，先 collect <技术名>"
+        return {"last_output": out, "conversation": _conversation(state, out, "note")}
 
     notes = state.get("notes") or []
     reports = [n for n in notes if n.get("report")]
     start = state.get("noted_count") or 0
     if start >= len(reports):
         if not reports:
-            return {"last_output": "⚠ 没有可沉淀的内容，先 read 一些文档"}
-        return {"last_output": "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 collect 新方向"}
+            out = "⚠ 没有可沉淀的内容，先 read 一些文档"
+        else:
+            out = "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 collect 新方向"
+        # 不返回 noted_count：游标保持原值，避免无 report 时误重置
+        return {"last_output": out, "conversation": _conversation(state, out, "note")}
 
     content = _notes_to_content(reports[start:])
-    result = note_pipeline(tech, content, materials_path=state.get("materials_path"), progress=None)
+    result = note_pipeline(tech, content, materials_path=state.get("materials_path"),
+                           progress=_progress_cv.get())
 
     # 无新内容：不沉淀 + 可选方向推荐（游标照常前进，避免反复重试同一批 report）
     if result["empty_reason"]:
         out = f"ℹ {result['empty_reason']}，未沉淀"
         if result.get("suggestion"):
             out += f"\n\n📌 建议继续学习的方向：\n{result['suggestion']}"
-        return {"noted_count": len(reports), "last_output": out}
+        return {"noted_count": len(reports), "last_output": out,
+                "conversation": _conversation(state, out, "note")}
 
     # 有合并候选：interrupt 汇总展示，用户统一决定 全合并/逐条/跳过
+    # decision 记录进 conversation 的用户消息（历史会话重载可见合并决策）。
     merge_indices: set[int] = set(range(len(result["merge_candidates"])))
+    decision: str | None = None
     if result["merge_candidates"]:
-        answer = interrupt(format_merge_candidates(result["merge_candidates"]))
-        merge_indices = parse_merge_decision(answer, len(result["merge_candidates"]))
+        decision = interrupt(format_merge_candidates(result["merge_candidates"]))
+        merge_indices = parse_merge_decision(decision, len(result["merge_candidates"]))
 
     # 用户确认后入库
     persisted = persist_points(tech, result["new_points"], result["merge_candidates"], merge_indices)
@@ -129,7 +202,8 @@ def note_node(state: LearnState) -> dict:
         f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
         if persisted["results"] else "未沉淀任何知识点"
     )
-    return {"notes": persisted["results"], "noted_count": len(reports), "last_output": summary}
+    return {"notes": persisted["results"], "noted_count": len(reports), "last_output": summary,
+            "conversation": _conversation(state, summary, "note", decision=decision)}
 
 
 def qa_node(state: LearnState) -> dict:
@@ -148,7 +222,9 @@ def qa_node(state: LearnState) -> dict:
         "sources": result["sources"],
         "no_hit": result["no_hit"],
     }
-    return {"qa_history": [exchange], "last_output": _render_qa(result)}
+    out = _render_qa(result)
+    return {"qa_history": [exchange], "last_output": out,
+            "conversation": _conversation(state, out, "qa")}
 
 
 def _render_qa(result: dict) -> str:

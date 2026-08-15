@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>学习陪练 · Tech Learner Agent</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- 左侧：会话列表 -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="logo"><span class="logo-mark">◇</span>学习之旅</div>
+      <button class="btn-new" id="btnNewSession" type="button">＋ 新建会话</button>
+    </div>
+    <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
+    <div class="sidebar-foot">
+      <div class="foot-note">学习陪练 · 交互原型<br/>接入后端前的静态演示</div>
+    </div>
+  </aside>
+
+  <!-- 中间：对话流 + 输入区 -->
+  <main class="main">
+    <header class="chat-head">
+      <div class="chat-head-title">
+        <span class="chat-title" id="chatTitle">FastAPI 异步编程</span>
+        <span class="chat-meta" id="chatMeta"></span>
+      </div>
+      <button class="btn-ghost" id="btnToggleReader" type="button">📂 阅读器</button>
+    </header>
+    <section class="chat-body" id="chatBody" aria-live="polite"></section>
+    <div class="input-wrap">
+      <div id="inputZone"></div>
+      <div class="input-hint" id="inputHint">选一张卡片，开始你的学习</div>
+    </div>
+  </main>
+
+  <!-- 右侧：阅读器 -->
+  <aside class="reader" id="reader">
+    <header class="reader-head hidden" id="readerHead">
+      <span class="doc-badge" id="docBadge">资料</span>
+      <span class="doc-title" id="docTitle"></span>
+      <button class="btn-close" id="btnCloseReader" type="button" aria-label="关闭阅读器">✕</button>
+    </header>
+    <div class="reader-body" id="readerBody"></div>
+  </aside>
+
+</div>
+
+<script src="js/mock.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

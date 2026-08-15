@@ -93,6 +93,10 @@ class Config:
     FETCH_MAX_WORKERS: int = int(os.getenv("FETCH_MAX_WORKERS", "5"))  # 并发抓取线程数上限
     FETCH_TIMEOUT_SECONDS: float = float(os.getenv("FETCH_TIMEOUT_SECONDS", "45"))  # 单次抓取超时上限（秒）
 
+    # Web 服务（WEB_PLAN.md §4-⑥）：默认只绑 127.0.0.1（个人工具不进局域网、不暴露公网）
+    WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1")
+    WEB_PORT: int = int(os.getenv("WEB_PORT", "8000"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """验证必要配置，返回缺失项列表"""
