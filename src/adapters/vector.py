@@ -7,6 +7,8 @@
 - ``index_documents()`` / ``index_paths()``：全量 / 增量建立索引（含变更检测，避免重复计费）
 - ``semantic_search()``：通用语义检索（可用 where 过滤 source / tech）
 - ``semantic_search_knowledge()``：笔记语义去重召回（限定 knowledge 源、可选限定技术领域）
+- ``keyword_search_knowledge()``：词法 BM25 召回（P1，补纯 dense 漏精确词匹配）
+- ``hybrid_search_knowledge()``：dense + BM25 → RRF 融合召回（P1，Q&A 默认走这里）
 - ``check_read_cache()``：read 历史召回（命中已有解读则提示复用）
 
 ⚠️ 本模块 import 时会加载 chromadb，必须保持 lazy 导入（见 CLI / store 的调用点），
@@ -23,6 +25,7 @@ import chromadb
 
 from ..config import config
 from ..domain.chunking import _content_digest, chunk_markdown
+from ..domain.hybrid import build_bm25, rrf_fuse
 from .embedding import DashScopeEmbeddingFunction
 
 _COLLECTION_NAME = "knowledge_base"
@@ -239,6 +242,66 @@ def semantic_search_knowledge(query: str, top_k: int = 1, tech: str | None = Non
     """
     where = _where_and({"source": "knowledge", **({"tech": tech} if tech else {})})
     return _search(query, top_k, where)
+
+
+# ============================================================
+# 词法 BM25 检索 + 混合检索（P1）
+# ============================================================
+
+def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None) -> list[dict]:
+    """词法 BM25 检索：补纯 dense 漏「精确词匹配」的弱点（搜 RedisJSON/FT.SEARCH 等专有名词）。
+
+    collection 全量取 knowledge chunk（可选限定 tech）→ 内存 BM25 打分 top-k。
+    当前知识库规模小，全量内存打分可行；库变大后再考虑持久化 BM25 索引。
+
+    返回结构与 semantic_search_knowledge 一致；``similarity`` 为归一化 BM25 分（top=1.0）。
+    """
+    where = _where_and({"source": "knowledge", **({"tech": tech} if tech else {})})
+    try:
+        res = get_collection().get(where=where, include=["documents", "metadatas"])
+    except Exception:  # noqa: BLE001 —— Chroma 异常时优雅降级为空
+        return []
+    ids = res.get("ids", [])
+    metas = res.get("metadatas", []) or []
+    docs = res.get("documents", []) or []
+    if not ids or not (query or "").strip():
+        return []
+
+    scores = build_bm25(docs).score(query)
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    max_score = scores[order[0]] if order and scores[order[0]] > 0 else 0.0
+    hits: list[dict] = []
+    for i in order[:top_k]:
+        m = metas[i] if i < len(metas) else {}
+        hits.append({
+            "id": ids[i],
+            "path": m.get("path", ""),
+            "source": m.get("source", ""),
+            "tech": m.get("tech", ""),
+            "topic": m.get("topic", ""),
+            "url": m.get("url", ""),
+            "similarity": scores[i] / max_score if max_score > 0 else 0.0,
+            "document": docs[i] if i < len(docs) else "",
+        })
+    return hits
+
+
+def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None) -> list[dict]:
+    """混合检索（P1）：dense + BM25 → RRF 融合。
+
+    每路取 ``top_k*3`` 候选再融合后截断到 top_k（候选充足融合才有意义）；
+    dense 空回退 keyword、keyword 全零回退 dense（两路内部已各自吞掉 Chroma 异常）。
+    返回条目的 ``similarity`` 为归一化 RRF 分（top=1.0），``dense_similarity`` 保留
+    原始余弦给 P2 相关度阈值等下游。
+    """
+    cand = max(top_k * 3, 8)
+    dense = semantic_search_knowledge(query, cand, tech)
+    sparse = keyword_search_knowledge(query, cand, tech)
+    if not dense:
+        return sparse[:top_k]
+    if not sparse:
+        return dense[:top_k]
+    return rrf_fuse(dense, sparse, config.QA_RRF_K)[:top_k]
 
 
 # ============================================================

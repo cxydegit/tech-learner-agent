@@ -186,7 +186,9 @@ def note_pipeline(tech: str, conversation_log: str,
         if not topic or not body:
             continue
         tags = e.get("tags") or [tech]
-        match, similarity = find_note_match(tech, topic, existing_all)
+        # 传入新点正文 + 标签：find_note_match 的确认层据此做「具体标签/内容判别性概念」
+        # 验明正身，避免高相似但无关的误合并（RAG_OPTIMIZATION P0 去重优化）。
+        match, similarity = find_note_match(tech, topic, existing_all, content=body, tags=tags)
         if match:
             merge_candidates.append({
                 "old_path": match["path"],

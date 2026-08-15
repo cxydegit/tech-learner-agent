@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import config
-from ..domain.dedup import _topics_overlap, _with_header, sanitize_filename
+from ..domain.dedup import _parse_tags, _topics_overlap, _with_header, sanitize_filename
 
 
 def ensure_knowledge_base() -> None:
@@ -27,44 +27,46 @@ def ensure_knowledge_base() -> None:
         )
 
 
-def find_note_match(tech: str, topic: str, existing: list[dict]) -> tuple[dict | None, float | None]:
+def find_note_match(tech: str, topic: str, existing: list[dict],
+                    *, content: str | None = None, tags: list[str] | None = None) -> tuple[dict | None, float | None]:
     """语义去重：返回命中的已有笔记及其相似度（供 merge_candidates 展示）。
 
-    设计取舍（替代纯字符串，RISKS.md 隐患6）：
-    - 语义召回 top1 是主信号：相似度 >= RAG_DEDUP_THRESHOLD 即视为同一知识点，
-      返回真实相似度（能抓住"字面不同但语义相同"的改写）。
-    - 轻量 overlap 作为辅助确认：相似度未达阈值但主题高度重叠时也可合并，
-      此时相似度用召回值（可能略低于阈值）。
-    - 两者都不中则回退到纯字符串匹配（覆盖 RAG 未索引 / 不可用场景），相似度为 None。
+    设计（RAG_OPTIMIZATION P0 去重优化）：把「候选召回」和「合并决策」解耦——
+    - 候选召回：语义检索 top2（限定同一技术领域，不调高阈值、不牺牲召回）；
+    - 合并决策：对每个候选用 domain.dedup._same_knowledge_point 验明正身（标题 / 具体
+      标签 / 内容判别性概念任一确认），返回第一个通过确认的候选。避免「高相似但无关」
+      的误合并（如 Redis 主题对多篇笔记都 0.62~0.66 相似，旧逻辑 0.55 阈值全并）。
+    - 未通过确认 → 返回 (None, None)：该新知识点作为独立笔记入库（宁可可修的重复，
+      也不静默错并到无关旧笔记）。
 
     Args:
         tech: 技术名称（原始大小写，如 "FastAPI"）
         topic: 新知识点标题
-        existing: 该技术领域已有的笔记列表（见 get_existing_notes）
+        existing: 该技术领域已有的笔记列表（见 get_existing_notes，含 tags/content）
+        content: 可选，新知识点正文（启用内容判别性概念信号）
+        tags: 可选，新知识点标签（启用具体标签信号）
 
     Returns:
-        (命中的已有笔记 dict, 相似度 float | None)；未命中返回 (None, None)
+        (命中的已有笔记 dict, 相似度 float | None)；未命中或未通过确认返回 (None, None)
     """
     similarity: float | None = None
     try:
         from .vector import semantic_search_knowledge
-        # 限定同一技术领域，避免跨领域误合并
-        hits = semantic_search_knowledge(topic, top_k=1, tech=sanitize_filename(tech))
-        if hits:
-            h = hits[0]
-            hit_topic = h.get("topic") or ""
+        from ..domain.dedup import _same_knowledge_point
+        hits = semantic_search_knowledge(topic, top_k=2, tech=sanitize_filename(tech))
+        for h in hits:
             # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
             # 而 existing 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
             hit_path = h.get("path") or ""
             if hit_path.startswith("knowledge/"):
                 hit_path = hit_path[len("knowledge/"):]
             sim = h.get("similarity", 0)
-            strong = sim >= config.RAG_DEDUP_THRESHOLD
-            overlap = _topics_overlap(topic, hit_topic or hit_path)
-            if (strong or overlap) and hit_path:
-                match = next((n for n in existing if n["path"] == hit_path), None)
-                if match:
-                    return match, sim
+            existing_note = next((n for n in existing if n["path"] == hit_path), None)
+            if not existing_note:
+                continue
+            if _same_knowledge_point(topic, tags, content, existing_note, tech,
+                                     content_threshold=config.RAG_DEDUP_CONTENT_THRESHOLD) == "same":
+                return existing_note, sim
     except Exception:  # noqa: BLE001 —— RAG 不可用时回退到字符串匹配
         pass
     return next((n for n in existing if _topics_overlap(n["topic"], topic)), None), similarity
@@ -173,19 +175,17 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
 def _parse_header(content: str) -> tuple[str | None, list[str]]:
     """从笔记文件头部解析日期和标签（形如 `> 日期：2026-08-09` / `> 标签：#a #b`）。
 
+    标签解析复用 domain.dedup._parse_tags（同一纯规则，供去重确认层使用）。
+
     Returns:
         (日期字符串, 标签列表)；缺省项为 (None, [])
     """
     date_str: str | None = None
-    tags: list[str] = []
     for line in content.splitlines()[:5]:
         m = re.search(r">\s*日期[：:]\s*(\S+)", line)
         if m:
             date_str = m.group(1).strip()
-        t = re.search(r">\s*标签[：:]\s*(.*)", line)
-        if t:
-            tags = [x.lstrip("#") for x in t.group(1).strip().split() if x.lstrip("#")]
-    return date_str, tags
+    return date_str, _parse_tags(content)
 
 
 def _merge_tags(old: list[str], new: list[str] | None) -> list[str]:
@@ -262,11 +262,13 @@ def get_existing_notes(tech: str) -> list[dict]:
             date_str = "unknown"
             topic = name
 
+        text = f.read_text(encoding="utf-8")
         notes.append({
             "path": f.relative_to(config.KNOWLEDGE_DIR).as_posix(),  # 统一 POSIX 分隔符，与 RAG 索引一致
             "topic": topic,
             "date": date_str,
-            "content": f.read_text(encoding="utf-8")[:2000],  # 只取前 2000 字符用于去重
+            "content": text[:2000],  # 只取前 2000 字符用于去重/内容确认（判别性概念多在文首）
+            "tags": _parse_tags(text),  # 供去重确认层（_same_knowledge_point）做具体标签重叠
         })
     return notes
 

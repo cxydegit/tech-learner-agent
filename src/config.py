@@ -44,6 +44,10 @@ class Config:
     RAG_DEDUP_THRESHOLD: float = float(os.getenv("RAG_DEDUP_THRESHOLD", "0.55"))
     # read 历史召回阈值：命中已有解读则提示复用（URL 路径片段作查询词，语义噪声大，阈值取高）
     RAG_READ_THRESHOLD: float = float(os.getenv("RAG_READ_THRESHOLD", "0.62"))
+    # 去重「内容确认」信号阈值：新笔记判别性概念出现在旧笔记正文的占比下限
+    # （domain/dedup._content_concept_overlap）。内容信号只在标题/具体标签都未确认时才启用，
+    # 用于救回「措辞不同但同一件事」的同义改写（高相似但无关的误合并对策，见 RAG_OPTIMIZATION）。
+    RAG_DEDUP_CONTENT_THRESHOLD: float = float(os.getenv("RAG_DEDUP_CONTENT_THRESHOLD", "0.3"))
     # 文档分块参数（字符数）
     RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
     RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
@@ -62,6 +66,10 @@ class Config:
     QA_SNIPPETS_PER_NOTE: int = int(os.getenv("QA_SNIPPETS_PER_NOTE", "3"))  # 每组最多片段数
     QA_SNIPPET_CHARS: int = int(os.getenv("QA_SNIPPET_CHARS", "500"))  # 每条片段截断字数
     QA_HISTORY_ROUNDS: int = int(os.getenv("QA_HISTORY_ROUNDS", "3"))  # 多轮上下文取最近 N 轮
+
+    # P1 混合检索（BM25 + RRF）：/ask 召回改走 hybrid_search_knowledge，可关回纯 dense
+    QA_USE_HYBRID: bool = os.getenv("QA_USE_HYBRID", "true").lower() == "true"
+    QA_RRF_K: int = int(os.getenv("QA_RRF_K", "60"))  # RRF 融合常数（名次倒数分母）
 
     # Step 5 Part B 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
     QUALITY_DOMAIN_BONUS_OFFICIAL: int = int(os.getenv("QUALITY_DOMAIN_BONUS_OFFICIAL", "20"))

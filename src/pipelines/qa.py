@@ -49,9 +49,17 @@ QA_PROMPT = """你是一个知识问答助手，回答用户关于 TA 的学习�
 def _search_notes(question: str, top_k: int, tech: str | None):
     """lazy import vector 层，守住 I1（`import src.cli` 不加载 chromadb）。
 
+    P1 起默认走混合检索（dense + BM25 → RRF，config.QA_USE_HYBRID），
+    hybrid 内部已各自吞掉空索引 / Chroma 异常，这里再套一层兜底回退纯 dense。
+
     测试通过 monkeypatch 本函数返回种子命中集，做零网络管道单测。
     """
-    from ..adapters.vector import semantic_search_knowledge
+    from ..adapters.vector import hybrid_search_knowledge, semantic_search_knowledge
+    if config.QA_USE_HYBRID:
+        try:
+            return hybrid_search_knowledge(question, top_k, tech)
+        except Exception:  # noqa: BLE001 —— 混合检索异常时回退纯 dense
+            pass
     return semantic_search_knowledge(question, top_k, tech)
 
 
