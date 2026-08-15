@@ -10,6 +10,7 @@
 - ``keyword_search_knowledge()``：词法 BM25 召回（P1，补纯 dense 漏精确词匹配）
 - ``hybrid_search_knowledge()``：dense + BM25 → RRF 融合召回（P1，Q&A 默认走这里）
 - ``check_read_cache()``：read 历史召回（命中已有解读则提示复用）
+- ``reconcile_orphans()``：索引对账（P3，孤儿分块清理；index_paths 末尾自动跑，/ask 节流跑）
 
 ⚠️ 本模块 import 时会加载 chromadb，必须保持 lazy 导入（见 CLI / store 的调用点），
 否则 `import src.cli` 会被拉起 chromadb（不变量 I1）。
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,8 @@ _COLLECTION_NAME = "knowledge_base"
 _embedding_function = DashScopeEmbeddingFunction()
 _client: Any = None
 _collection: Any = None
+# /ask 惰性对账节流：距上次对账 < RAG_RECONCILE_INTERVAL 秒则跳过（避免每次提问都扫全库）
+_last_reconcile_at: float = 0.0
 
 
 # ============================================================
@@ -108,7 +112,8 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
         force: 忽略变更检测，强制重新切块嵌入（分块器升级 / 参数调整后需要）
 
     Returns:
-        {"indexed": int, "skipped": int, "errors": list[str]}
+        {"indexed": int, "skipped": int, "orphans": int, "errors": list[str]}
+        ``orphans`` 为本轮对账清理的孤儿分块数（P3；磁盘已删除文件的残留分块）。
     """
     collection = get_collection()
     indexed = skipped = 0
@@ -150,7 +155,10 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
         except Exception as e:  # noqa: BLE001 —— 单文件失败不应中断全量索引
             errors.append(f"{rel}: {e}")
 
-    return {"indexed": indexed, "skipped": skipped, "errors": errors}
+    # P3 对账：以「磁盘现状」为准清理孤儿分块。手动 index / 每次写笔记都会经过这里，
+    # 删除/改名后的残留分块随下一次自然写入自愈，无需定期跑 index。
+    result = {"indexed": indexed, "skipped": skipped, "orphans": _reconcile_orphans(), "errors": errors}
+    return result
 
 
 def index_documents(paths: list[Path] | None = None, force: bool = False) -> dict:
@@ -161,10 +169,65 @@ def index_documents(paths: list[Path] | None = None, force: bool = False) -> dic
         force: 忽略变更检测，强制重新切块嵌入
 
     Returns:
-        {"indexed": int, "skipped": int, "errors": list[str]}
+        {"indexed": int, "skipped": int, "orphans": int, "errors": list[str]}
     """
     files = paths if paths is not None else _discover_files()
     return index_paths(files, force=force)
+
+
+# ============================================================
+# 索引对账（P3：孤儿分块清理）
+# ============================================================
+
+def _reconcile_orphans() -> int:
+    """对账：删除磁盘上已不存在文件的残留分块（孤儿分块清理）。
+
+    磁盘文件删除 / 改名后，Chroma 仍残留旧分块，/ask 会召回并引用已不存在的笔记。
+    本函数以「磁盘现状」为准：取 collection 全部 path（只读 metadatas，不拉文档/向量），
+    与 _discover_files() 对比，删除 path 不在磁盘的分块。小库下开销毫秒级。
+
+    受 config.RAG_RECONCILE 控制（默认开）；Chroma 异常 / 索引未建时静默返回 0。
+
+    Returns:
+        删除的孤儿分块数
+    """
+    if not config.RAG_RECONCILE:
+        return 0
+    try:
+        res = get_collection().get(include=["metadatas"])
+    except Exception:  # noqa: BLE001 —— 索引未建 / Chroma 异常时静默降级
+        return 0
+    ids = res.get("ids", [])
+    metas = res.get("metadatas", []) or []
+    if not ids:
+        return 0
+    disk_paths = {p.relative_to(config.BASE_DIR).as_posix() for p in _discover_files()}
+    orphan_ids = [doc_id for doc_id, m in zip(ids, metas) if m.get("path") not in disk_paths]
+    if not orphan_ids:
+        return 0
+    try:
+        get_collection().delete(ids=orphan_ids)
+    except Exception:  # noqa: BLE001 —— 删除失败不致命，下次对账再试
+        return 0
+    return len(orphan_ids)
+
+
+def reconcile_orphans(force: bool = False) -> int:
+    """带节流的对账入口（/ask 惰性调用）：RAG_RECONCILE_INTERVAL 秒内只跑一次。
+
+    index_paths 末尾的对账不走节流（写入路径自愈）；此处节流避免每次提问都扫全库。
+    force=True 跳过节流强制对账（备用，当前无调用点）。
+
+    Returns:
+        本次实际删除的孤儿分块数（节流跳过 / 未启用时为 0）
+    """
+    global _last_reconcile_at
+    now = time.time()
+    if not force and now - _last_reconcile_at < config.RAG_RECONCILE_INTERVAL:
+        return 0
+    n = _reconcile_orphans()
+    _last_reconcile_at = now
+    return n
 
 
 # ============================================================

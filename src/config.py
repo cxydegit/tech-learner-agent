@@ -51,6 +51,12 @@ class Config:
     # 文档分块参数（字符数）
     RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
     RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
+    # P3 索引对账（孤儿分块清理）：磁盘文件删除 / 改名后自动清理 Chroma 残留分块。
+    # index_paths 末尾与 /ask 惰性入口都受此开关控制。
+    RAG_RECONCILE: bool = os.getenv("RAG_RECONCILE", "true").lower() == "true"
+    # /ask 惰性对账节流间隔（秒）：只在此间隔内的首次 /ask 做一次元数据对账（毫秒级），
+    # 避免每次提问都扫全库；index_paths 末尾的对账不走节流（写入路径自愈）。
+    RAG_RECONCILE_INTERVAL: int = int(os.getenv("RAG_RECONCILE_INTERVAL", "300"))
 
     # LangGraph checkpointer 持久化（SqliteSaver，跨会话/跨进程恢复）
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"

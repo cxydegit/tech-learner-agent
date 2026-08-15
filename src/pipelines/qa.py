@@ -52,9 +52,16 @@ def _search_notes(question: str, top_k: int, tech: str | None):
     P1 起默认走混合检索（dense + BM25 → RRF，config.QA_USE_HYBRID），
     hybrid 内部已各自吞掉空索引 / Chroma 异常，这里再套一层兜底回退纯 dense。
 
+    P3 起检索前先做一次惰性对账（节流，见 config.RAG_RECONCILE_INTERVAL）：
+    清理磁盘已删除笔记的残留分块，避免本轮召回并引用已不存在的笔记。
+
     测试通过 monkeypatch 本函数返回种子命中集，做零网络管道单测。
     """
-    from ..adapters.vector import hybrid_search_knowledge, semantic_search_knowledge
+    from ..adapters.vector import hybrid_search_knowledge, reconcile_orphans, semantic_search_knowledge
+    try:
+        reconcile_orphans()  # P3：/ask 前清孤儿分块；节流 + 内部吞异常，失败不影响检索
+    except Exception:  # noqa: BLE001 —— 对账失败不应阻断提问
+        pass
     if config.QA_USE_HYBRID:
         try:
             return hybrid_search_knowledge(question, top_k, tech)

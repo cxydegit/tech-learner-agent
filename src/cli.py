@@ -173,6 +173,9 @@ def index(force: bool = False):
     result = index_documents(force=force)
     console.print(f"✅ 索引完成：新增 [bold]{result['indexed']}[/bold] 个文件，"
                   f"跳过 [bold]{result['skipped']}[/bold] 个未变化文件")
+    orphans = result.get("orphans", 0)
+    if orphans:
+        console.print(f"🧹 清理 [bold]{orphans}[/bold] 个磁盘已删除文件的残留分块")
     if result["errors"]:
         console.print("[yellow]部分文件索引失败：[/yellow]")
         for e in result["errors"]:
