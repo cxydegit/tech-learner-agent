@@ -40,14 +40,11 @@ class Config:
     # Chroma 本地持久化目录（运行时生成，已加入 .gitignore）
     CHROMA_DIR: Path = BASE_DIR / ".chroma"
     RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "5"))
-    # 语义去重阈值：余弦相似度，召回 top1 且轻量 overlap 确认后才合并
-    RAG_DEDUP_THRESHOLD: float = float(os.getenv("RAG_DEDUP_THRESHOLD", "0.55"))
+    # 去重候选送 LLM 判定的相似度下限：语义召回 top2 里低于此的不送判定（省 LLM 调用）。
+    # 实测同义改写对源笔记相似度 ≥0.50，0.4 以下几乎不可能是同一篇。
+    RAG_DEDUP_JUDGE_SIM_MIN: float = float(os.getenv("RAG_DEDUP_JUDGE_SIM_MIN", "0.4"))
     # read 历史召回阈值：命中已有解读则提示复用（URL 路径片段作查询词，语义噪声大，阈值取高）
     RAG_READ_THRESHOLD: float = float(os.getenv("RAG_READ_THRESHOLD", "0.62"))
-    # 去重「内容确认」信号阈值：新笔记判别性概念出现在旧笔记正文的占比下限
-    # （domain/dedup._content_concept_overlap）。内容信号只在标题/具体标签都未确认时才启用，
-    # 用于救回「措辞不同但同一件事」的同义改写（高相似但无关的误合并对策，见 RAG_OPTIMIZATION）。
-    RAG_DEDUP_CONTENT_THRESHOLD: float = float(os.getenv("RAG_DEDUP_CONTENT_THRESHOLD", "0.3"))
     # 文档分块参数（字符数）
     RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
     RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))

@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import config
-from ..domain.dedup import _parse_tags, _topics_overlap, _with_header, sanitize_filename
+from ..domain.dedup import _parse_tags, _title_fast_match, _with_header, sanitize_filename
 
 
 def ensure_knowledge_base() -> None:
@@ -28,48 +28,69 @@ def ensure_knowledge_base() -> None:
 
 
 def find_note_match(tech: str, topic: str, existing: list[dict],
-                    *, content: str | None = None, tags: list[str] | None = None) -> tuple[dict | None, float | None]:
-    """语义去重：返回命中的已有笔记及其相似度（供 merge_candidates 展示）。
+                    *, content: str | None = None, tags: list[str] | None = None
+                    ) -> tuple[dict | None, float | None, str | None]:
+    """语义去重：召回候选 → 标题 fast-path → LLM 判定，返回第一个判定 same 的候选。
 
-    设计（RAG_OPTIMIZATION P0 去重优化）：把「候选召回」和「合并决策」解耦——
-    - 候选召回：语义检索 top2（限定同一技术领域，不调高阈值、不牺牲召回）；
-    - 合并决策：对每个候选用 domain.dedup._same_knowledge_point 验明正身（标题 / 具体
-      标签 / 内容判别性概念任一确认），返回第一个通过确认的候选。避免「高相似但无关」
-      的误合并（如 Redis 主题对多篇笔记都 0.62~0.66 相似，旧逻辑 0.55 阈值全并）。
-    - 未通过确认 → 返回 (None, None)：该新知识点作为独立笔记入库（宁可可修的重复，
-      也不静默错并到无关旧笔记）。
+    设计（RAG_OPTIMIZATION P0 压力测试后重构）：候选召回与合并决策解耦——
+    - 候选召回：语义检索 top2（限定同一技术领域）；相似度低于
+      RAG_DEDUP_JUDGE_SIM_MIN 的不送判定（实测同义改写对源笔记 ≥0.50，0.4 以下
+      几乎不可能是同一篇，省 LLM 调用）；
+    - 标题 fast-path：domain.dedup._title_fast_match（去停用词后词元完全相等）→
+      直接确认，不花 LLM 调用；
+    - LLM 判定：其余候选交给 adapters/llm.judge_same_knowledge_point（替代旧的
+      标签/内容 overlap 确认层——合成压力测试证明确定性信号无法识别真正措辞不同
+      的同义改写，见 RAG_OPTIMIZATION）；
+    - 判定失败 / LLM 不可用 → 不合并（宁可可修的重复，也不静默错并）。
+
+    返回**第一个**判定 same 的候选（top1 优先；fast-path 优先于 LLM 判定），
+    判定理由随候选返回，供 merge_candidates 展示（用户确认时看到为什么建议合并）。
 
     Args:
         tech: 技术名称（原始大小写，如 "FastAPI"）
         topic: 新知识点标题
         existing: 该技术领域已有的笔记列表（见 get_existing_notes，含 tags/content）
-        content: 可选，新知识点正文（启用内容判别性概念信号）
-        tags: 可选，新知识点标签（启用具体标签信号）
+        content: 可选，新知识点正文（LLM 判定上下文）
+        tags: 可选，新知识点标签（LLM 判定上下文）
 
     Returns:
-        (命中的已有笔记 dict, 相似度 float | None)；未命中或未通过确认返回 (None, None)
+        (命中的已有笔记 dict, 相似度 float | None, 判定理由 str | None)；
+        未命中返回 (None, None, None)
     """
-    similarity: float | None = None
     try:
         from .vector import semantic_search_knowledge
-        from ..domain.dedup import _same_knowledge_point
         hits = semantic_search_knowledge(topic, top_k=2, tech=sanitize_filename(tech))
-        for h in hits:
-            # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
-            # 而 existing 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
-            hit_path = h.get("path") or ""
-            if hit_path.startswith("knowledge/"):
-                hit_path = hit_path[len("knowledge/"):]
-            sim = h.get("similarity", 0)
-            existing_note = next((n for n in existing if n["path"] == hit_path), None)
-            if not existing_note:
-                continue
-            if _same_knowledge_point(topic, tags, content, existing_note, tech,
-                                     content_threshold=config.RAG_DEDUP_CONTENT_THRESHOLD) == "same":
-                return existing_note, sim
-    except Exception:  # noqa: BLE001 —— RAG 不可用时回退到字符串匹配
-        pass
-    return next((n for n in existing if _topics_overlap(n["topic"], topic)), None), similarity
+    except Exception:  # noqa: BLE001 —— RAG 不可用时 hits 为空，走标题 fast-path 全量扫描兜底
+        hits = []
+    sim_floor = config.RAG_DEDUP_JUDGE_SIM_MIN
+    for h in hits:
+        sim = h.get("similarity", 0)
+        if sim < sim_floor:
+            continue
+        # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
+        # 而 existing 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
+        hit_path = h.get("path") or ""
+        if hit_path.startswith("knowledge/"):
+            hit_path = hit_path[len("knowledge/"):]
+        existing_note = next((n for n in existing if n["path"] == hit_path), None)
+        if not existing_note:
+            continue
+        # ① 标题 fast-path：标题基本同一句 → 直接确认，不花 LLM 调用
+        if _title_fast_match(topic, existing_note["topic"]):
+            return existing_note, sim, "标题等同"
+        # ② LLM 判定（异常静默降级为不合并，安全侧）
+        try:
+            from .llm import judge_same_knowledge_point
+            verdict, reason = judge_same_knowledge_point(topic, tags, content, existing_note)
+            if verdict == "same":
+                return existing_note, sim, reason or "LLM 判定为同一知识点"
+        except Exception:  # noqa: BLE001
+            pass
+    # RAG 不可用时的兜底：标题 fast-path 全量扫描（零 embedding）
+    for n in existing:
+        if _title_fast_match(topic, n["topic"]):
+            return n, None, "标题等同（RAG 不可用回退）"
+    return None, None, None
 
 
 def recall_existing_notes(tech: str, query: str, top_k: int = 3) -> list[dict]:
@@ -268,7 +289,7 @@ def get_existing_notes(tech: str) -> list[dict]:
             "topic": topic,
             "date": date_str,
             "content": text[:2000],  # 只取前 2000 字符用于去重/内容确认（判别性概念多在文首）
-            "tags": _parse_tags(text),  # 供去重确认层（_same_knowledge_point）做具体标签重叠
+            "tags": _parse_tags(text),  # 供 LLM 去重判定（judge_same_knowledge_point）作上下文
         })
     return notes
 

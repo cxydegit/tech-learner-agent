@@ -11,10 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.domain.dedup import (
-    _content_concept_overlap,
     _parse_tags,
-    _same_knowledge_point,
-    _tag_overlap,
+    _title_fast_match,
     _topics_overlap,
     _with_header,
     sanitize_filename,
@@ -93,20 +91,7 @@ def test_strip_note_header_plain_body():
     assert strip_note_header("## 是什么\n正文") == "## 是什么\n正文"
 
 
-# ---------- 去重确认层（RAG_OPTIMIZATION P0） ----------
-
-# 模拟真实知识笔记正文（概率数据类型 / 数据结构设计反模式），供内容信号测试
-_PROB_DATA_BODY = (
-    "牺牲精度换取空间的统计利器：概率类型用于海量数据统计场景，允许一定误差但内存占用极低。\n"
-    "- **Bloom filter（布隆过滤器）**：用于判断元素是否存在。特点：可能存在假阳性，但绝无假阴性，"
-    "适合防止缓存穿透。\n"
-    "- **HyperLogLog**：用于基数统计。特点：统计唯一用户数（UV）时，标准误差约 1%，无需存储所有元素。"
-)
-_ANTIPATTERN_BODY = (
-    "避免 Strings 滥用：将复杂对象序列化为 JSON 字符串存入 String 类型，频繁修改字段要全量"
-    "反序列化再序列化，性能开销大；需要部分更新的对象场景，优先使用 Hashes 或 JSON 类型。"
-)
-
+# ---------- 去重标题 fast-path（RAG_OPTIMIZATION P0 压力测试后重构） ----------
 
 def test_parse_tags_from_header():
     assert _parse_tags("# 主题\n\n> 日期：2026-08-09\n> 标签：#Redis #数据结构 #选型\n\n正文") == [
@@ -114,63 +99,39 @@ def test_parse_tags_from_header():
     assert _parse_tags("# 主题\n\n> 日期：2026-08-09\n\n正文") == []
 
 
-def test_tag_overlap_specific_not_tech():
-    """排除 tech 名标签：共享具体标签确认，只共享 #Redis 不确认。"""
-    assert _tag_overlap(["Redis", "数据结构", "统计"], ["Redis", "数据结构", "进阶"], "redis")
-    assert not _tag_overlap(["Redis", "统计"], ["Redis", "数据结构", "进阶"], "redis")
-    assert not _tag_overlap(["Redis"], ["Redis", "数据结构"], "redis")
-    # 真实 rag--检索增强生成 笔记标签：#RAG #LLM #基础概念 #Fine-tuning #架构选型
-    assert _tag_overlap(["RAG", "LLM"], ["RAG", "LLM", "基础概念", "Fine-tuning", "架构选型"], "rag")
+def test_title_fast_match_equal():
+    assert _title_fast_match("Redis 持久化", "Redis 持久化")
 
 
-def test_tag_overlap_ignores_meta_tags():
-    """元标签（部署/踩坑/最佳实践…）不参与确认：只共享 #部署 不确认。
+def test_title_fast_match_meta_suffix_synonym():
+    """meta 后缀词（机制/原理/对比/区别）不参与：同一句子的不同说法 → 命中。"""
+    assert _title_fast_match("Redis 持久化机制", "Redis 持久化原理")
+    assert _title_fast_match("RDB 与 AOF 对比", "RDB 与 AOF 区别")
 
-    实证：windows 笔记 #Redis #踩坑 #部署 #Windows 若让「Docker 部署 Redis 集群」
-    误并入，就是因为共享了元标签 #部署。
+
+def test_title_fast_match_number_words():
+    """数词/量词不参与：「五种核心角色」vs「五大核心角色」仍是同一知识点 → 命中。"""
+    assert _title_fast_match("Redis 五种核心角色", "Redis 五大核心角色")
+
+
+def test_title_fast_match_no_false_merge():
+    """错合并实证（合成压力测试）：只共享几个字不算同一句 → 不命中。
+
+    旧 `_topics_overlap` 单字切分 + 0.4 阈值让「NoSQL内存数据库五种核心角色」
+    误撞「redis 的五大核心角色」；fast-path 双字词切分 + 停数词后集合不相等。
     """
-    assert not _tag_overlap(["Redis", "Docker", "部署"], ["Redis", "踩坑", "部署", "Windows"], "redis")
-    assert not _tag_overlap(["Redis", "持久化"], ["Redis", "最佳实践", "避坑"], "redis")
+    assert not _title_fast_match("NoSQL内存数据库五种核心角色", "redis 的五大核心角色")
+    assert not _title_fast_match("Redis 缓存", "Redis 缓存雪崩")  # 子主题不命中，交 LLM
+    assert not _title_fast_match("Redis 缓存穿透", "Redis 缓存雪崩")  # 同域不同知识点
+    assert not _title_fast_match("Redis 持久化", "Redis 数据结构")
 
 
-def test_content_concept_overlap_same_topic():
-    """同知识点的措辞不同改写：判别性概念高度出现在旧笔记正文 → 确认。"""
-    new = ("牺牲精度换取空间的统计利器：布隆过滤器用于判断元素是否存在，可能存在假阳性但绝无假阴性，"
-           "适合防止缓存穿透；HyperLogLog 用于基数统计，统计唯一用户数时标准误差约 1%。")
-    assert _content_concept_overlap(new, _PROB_DATA_BODY)
+def test_title_fast_match_case_insensitive():
+    assert _title_fast_match("Redis 持久化", "redis 持久化")
 
 
-def test_content_concept_overlap_unrelated():
-    """无关内容：判别性概念几乎不出现 → 不确认。"""
-    assert not _content_concept_overlap("今天天气不错，我出门散步，顺便买了杯咖啡。", _PROB_DATA_BODY)
-
-
-def test_same_knowledge_point_by_title():
-    """标题确认：Redis 数据结构选型 → 基础数据类型选型决策。"""
-    existing = {"topic": "基础数据类型选型决策", "tags": ["Redis", "数据结构", "选型"], "content": ""}
-    assert _same_knowledge_point("Redis 数据结构选型", ["Redis", "数据结构"], "", existing, "redis") == "same"
-
-
-def test_same_knowledge_point_by_tag():
-    """标题对不上但具体标签确认：布隆/HyperLogLog → 概率数据类型。"""
-    existing = {"topic": "概率数据类型", "tags": ["Redis", "数据结构", "进阶"], "content": _PROB_DATA_BODY}
-    # 标题 overlap 0.33 < 0.4 不确认，靠 #数据结构 标签确认
-    assert _same_knowledge_point("布隆过滤器和 HyperLogLog 统计", ["Redis", "数据结构"],
-                                 "", existing, "redis") == "same"
-
-
-def test_same_knowledge_point_by_content():
-    """标题与标签都失败、措辞完全不同的同义改写：内容判别性概念救回。"""
-    existing = {"topic": "概率数据类型", "tags": ["Redis", "数据结构", "进阶"], "content": _PROB_DATA_BODY}
-    new_content = ("牺牲精度换取空间的统计利器：布隆过滤器判断元素是否存在（允许假阳性），"
-                   "HyperLogLog 统计唯一用户数，误差约 1%，两者内存占用都极低。")
-    # 标题 overlap 0.33 < 0.4、标签只共享 tech 名 → 靠内容确认
-    assert _same_knowledge_point("用少量内存统计海量数据", ["Redis", "统计"],
-                                 new_content, existing, "redis") == "same"
-
-
-def test_same_knowledge_point_none_confirm():
-    """高相似但无关（误合并根源）：标题/标签/内容都不确认 → no，不合并。"""
-    existing = {"topic": "数据结构设计反模式", "tags": ["Redis", "最佳实践", "避坑"], "content": _ANTIPATTERN_BODY}
-    assert _same_knowledge_point("Redis 数据持久化的实现", ["Redis", "持久化"],
-                                 "RDB 与 AOF 两种持久化方式的区别。", existing, "redis") == "no"
+def test_title_fast_match_empty():
+    """空标题 / 全部停用词（无词元）不匹配。"""
+    assert not _title_fast_match("", "Redis 持久化")
+    assert not _title_fast_match("Redis 持久化", "")
+    assert not _title_fast_match("的 了 与 机制", "机制 原理")

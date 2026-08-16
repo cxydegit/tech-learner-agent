@@ -85,13 +85,13 @@ def parse_entries(raw: str) -> list[dict]:
     return []
 
 
-def parse_classify(raw: str) -> dict:
-    """从 LLM 响应中稳健地解析文档分类结果。
+def parse_json_object(raw: str) -> dict:
+    """从 LLM 响应中稳健地解析单个 JSON 对象。
 
     兼容：去掉 ```json 代码块包裹、抽取第一个 JSON 对象。
 
     Returns:
-        {"is_technical": bool, "reason": str}，解析失败返回空 dict
+        dict，解析失败返回 {}
     """
     text = raw.strip()
     if text.startswith("```"):
@@ -108,3 +108,12 @@ def parse_classify(raw: str) -> dict:
     # 兜底：用花括号配对抽取第一个 JSON 对象
     obj = extract_json_object(text)
     return obj if isinstance(obj, dict) else {}
+
+
+def parse_classify(raw: str) -> dict:
+    """从 LLM 响应中稳健地解析文档分类结果。
+
+    Returns:
+        {"is_technical": bool, "reason": str}，解析失败返回空 dict
+    """
+    return parse_json_object(raw)

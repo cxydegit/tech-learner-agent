@@ -146,7 +146,7 @@ def note_pipeline(tech: str, conversation_log: str,
     Returns:
         {
           "new_points": [{topic, tags, content}],       # 与已有笔记无重叠，待新建
-          "merge_candidates": [{old_path, old_topic, old_content, similarity,
+          "merge_candidates": [{old_path, old_topic, old_content, similarity, reason,
                                 topic, tags, content}],  # 与已有笔记相似，待用户确认合并
           "empty_reason": str | None,                   # 非空表示无新内容，未沉淀
           "suggestion": str | None,                     # empty 且有 materials 时的方向推荐
@@ -186,15 +186,16 @@ def note_pipeline(tech: str, conversation_log: str,
         if not topic or not body:
             continue
         tags = e.get("tags") or [tech]
-        # 传入新点正文 + 标签：find_note_match 的确认层据此做「具体标签/内容判别性概念」
-        # 验明正身，避免高相似但无关的误合并（RAG_OPTIMIZATION P0 去重优化）。
-        match, similarity = find_note_match(tech, topic, existing_all, content=body, tags=tags)
+        # 候选召回 → 标题 fast-path → LLM 判定（find_note_match），返回第一个判定
+        # same 的候选及理由；reason 供确认时展示（RAG_OPTIMIZATION P0 压力测试后重构）。
+        match, similarity, reason = find_note_match(tech, topic, existing_all, content=body, tags=tags)
         if match:
             merge_candidates.append({
                 "old_path": match["path"],
                 "old_topic": match["topic"],
                 "old_content": read_knowledge_note(match["path"]),
                 "similarity": similarity,
+                "reason": reason,
                 "topic": topic,
                 "tags": tags,
                 "content": body,
@@ -296,8 +297,9 @@ def format_merge_candidates(candidates: list[dict]) -> str:
     lines = [f"发现 {len(candidates)} 条新知识点与已有笔记相似，如何处理？"]
     for i, c in enumerate(candidates, 1):
         sim = f"（相似度 {c['similarity']:.2f}）" if c.get("similarity") is not None else ""
+        reason = f"，理由：{c['reason']}" if c.get("reason") else ""
         delta = (c.get("content") or "").strip().replace("\n", " ")[:120]
-        lines.append(f"[{i}] {c['topic']} → 已有「{c['old_topic']}」{sim}")
+        lines.append(f"[{i}] {c['topic']} → 已有「{c['old_topic']}」{sim}{reason}")
         lines.append(f"    新增点：{delta}")
     lines.append("回复：all 全合并 / 编号逗号分隔逐条（如 1,3）/ skip 全部跳过")
     return "\n".join(lines)
