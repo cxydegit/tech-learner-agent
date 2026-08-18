@@ -185,6 +185,18 @@ button { font-family: inherit; cursor: pointer; }
 }
 .doc-chip:hover { background: var(--accent-soft); border-color: var(--accent); }
 
+/* ask 来源笔记卡片 */
+.source-cards { margin-top: 14px; }
+.sc-label { font-size: 11px; color: var(--ink-3); letter-spacing: 1px; margin-bottom: 6px; }
+.sc-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.sc-item {
+  display: inline-flex; align-items: center; gap: 8px;
+  border: 1px solid #D5E0DE; background: #F5F8F7; color: var(--accent-deep);
+  border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; transition: all .15s ease;
+}
+.sc-item:hover { background: var(--accent-soft); border-color: var(--accent); }
+.sc-sim { font-size: 11px; color: var(--ink-3); background: rgba(74,122,120,.08); border-radius: 999px; padding: 0 6px; }
+
 /* 打字指示 */
 .typing { display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }
 .typing i { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); animation: blink 1.2s infinite; }
@@ -304,6 +316,91 @@ button { font-family: inherit; cursor: pointer; }
 .reader-doc { font-family: var(--sans); }
 .reader-doc h1 { font-family: var(--serif); font-size: 21px; letter-spacing: 1px; margin: 0 0 6px; }
 .reader-doc .rd-src { font-size: 12px; color: var(--ink-3); padding-bottom: 14px; border-bottom: 1px solid var(--line-soft); margin-bottom: 16px; }
+
+/* ============ 会话项删除按钮 ============ */
+.session-item { position: relative; }
+.si-del {
+  position: absolute; top: 8px; right: 8px;
+  border: 0; background: transparent; color: var(--ink-3);
+  font-size: 11px; line-height: 1; padding: 3px 5px; border-radius: 6px;
+  opacity: 0; transition: all .12s ease;
+}
+.session-item:hover .si-del { opacity: 1; }
+.si-del:hover { color: #C25E4E; background: rgba(194,94,78,.08); }
+
+/* ============ 运行状态区（SSE 进度 / 错误） ============ */
+.run-status {
+  max-width: 760px; margin: 22px auto 0;
+  background: var(--panel); border: 1px solid var(--line-soft);
+  border-radius: var(--r); padding: 14px 18px;
+}
+.run-title {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--accent); letter-spacing: 1px; margin-bottom: 8px;
+}
+.run-title::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); animation: pulse 1s infinite;
+}
+@keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+.progress-line { font-size: 12px; color: var(--ink-3); line-height: 1.9; font-family: var(--mono); }
+.run-error {
+  max-width: 760px; margin: 12px auto 0;
+  font-size: 12.5px; color: #C25E4E; background: #FBEFEC;
+  border: 1px solid #EED5CE; border-radius: var(--r); padding: 10px 14px;
+}
+
+/* ============ note 合并确认（interrupt 两段式） ============ */
+.interrupt-title { font-size: 12.5px; font-weight: 600; color: var(--accent-deep); margin-bottom: 8px; }
+.interrupt-payload {
+  white-space: pre-wrap; font-size: 12.5px; color: var(--ink-2);
+  background: var(--card); border: 1px solid var(--line-soft);
+  border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; line-height: 1.8;
+}
+.interrupt-actions { display: flex; gap: 10px; }
+.interrupt-actions .btn-primary { margin: 0; }
+.interrupt-custom {
+  margin-top: 12px; display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--ink-2); flex-wrap: wrap;
+}
+.interrupt-custom input {
+  border: 0; border-bottom: 1px solid var(--line); background: transparent;
+  padding: 4px 2px; width: 100px; font-family: inherit; color: var(--ink);
+}
+.interrupt-custom input:focus { outline: none; border-bottom-color: var(--accent); box-shadow: 0 1px 0 0 var(--accent); }
+.interrupt-custom .btn-primary { margin: 0; }
+
+/* ============ 侧栏资料库入口（P3） ============ */
+.lib-nav { padding: 6px 16px 12px; border-top: 1px solid var(--line-soft); flex-shrink: 0; }
+.lib-label { font-size: 11px; color: var(--ink-3); letter-spacing: 2px; margin: 10px 0 6px; }
+.lib-item {
+  display: block; padding: 7px 10px; border-radius: 8px;
+  font-size: 13px; color: var(--ink-2); text-decoration: none; transition: all .12s ease;
+}
+.lib-item:hover { background: rgba(255,255,255,.7); color: var(--accent-deep); }
+
+/* ============ 资料库浏览视图（P3） ============ */
+.app.view-docs .input-wrap { display: none; }
+.docs-tabs { max-width: 760px; margin: 0 auto 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+.docs-tab {
+  border: 1px solid var(--line); background: var(--card); color: var(--ink-2);
+  border-radius: 999px; padding: 6px 14px; font-size: 12.5px; text-decoration: none; transition: all .15s ease;
+}
+.docs-tab:hover { border-color: var(--accent); color: var(--accent); }
+.docs-tab.active { background: var(--accent); border-color: var(--accent); color: #FDFEFD; }
+.docs-view { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+.docs-item {
+  display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+  border: 1px solid var(--line-soft); background: var(--card);
+  border-radius: var(--r); cursor: pointer; transition: all .15s ease;
+}
+.docs-item:hover { border-color: var(--accent); background: var(--accent-soft); }
+.docs-item .docs-badge {
+  flex-shrink: 0; font-size: 11px; padding: 2px 9px; border-radius: 999px; letter-spacing: 1px;
+  background: var(--panel); border: 1px solid var(--line-soft); color: var(--ink-2);
+}
+.docs-item .docs-name { flex: 1; font-size: 13.5px; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.docs-item .docs-time { font-size: 11px; color: var(--ink-3); flex-shrink: 0; }
 
 /* ============ 响应式 & 动效偏好 ============ */
 @media (max-width: 900px) {

@@ -74,14 +74,20 @@ def _worker(thread_id: str, payload: Any) -> None:
             saver.setup()
             graph = build_graph(saver)
             cfg = {"configurable": {"thread_id": thread_id}}
-            with web_progress(progress):
+            # ⚠️ stream_events(v3) 是异步后台执行：返回时节点可能仍在 ThreadPoolExecutor 线程跑。
+            # 必须在 with 内立即访问 .interrupted/.output（会阻塞等待后台完成），
+            # 否则 web_progress 的 finally 会在节点执行前注销注册表，进度全部丢失。
+            with web_progress(thread_id, progress):
                 stream = graph.stream_events(payload, cfg, version="v3")
-            if stream.interrupted:
+                interrupted = stream.interrupted
+                interrupts = stream.interrupts
+                output = stream.output
+            if interrupted:
                 # note 合并确认：把 interrupt 负载（merge 候选展示文本）推给前端等 resume
-                value = stream.interrupts[0].value if stream.interrupts else ""
+                value = interrupts[0].value if interrupts else ""
                 job.queue.put({"type": "interrupt", "kind": "merge_candidates", "payload": value})
             else:
-                job.queue.put({"type": "final", "output": stream.output})
+                job.queue.put({"type": "final", "output": output})
     except Exception as exc:  # noqa: BLE001 —— 线程内兜底，事件里透传错误给前端
         job.queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
     finally:

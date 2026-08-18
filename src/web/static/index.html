@@ -16,8 +16,14 @@
       <button class="btn-new" id="btnNewSession" type="button">＋ 新建会话</button>
     </div>
     <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
+    <nav class="lib-nav" id="libNav" aria-label="资料库">
+      <div class="lib-label">资料库</div>
+      <a class="lib-item" href="#/docs/materials">📁 学习资料</a>
+      <a class="lib-item" href="#/docs/reports">📄 解读报告</a>
+      <a class="lib-item" href="#/docs/knowledge">📝 知识笔记</a>
+    </nav>
     <div class="sidebar-foot">
-      <div class="foot-note">学习陪练 · 交互原型<br/>接入后端前的静态演示</div>
+      <div class="foot-note">学习陪练<br/>本地学习会话 · 数据持久化</div>
     </div>
   </aside>
 
@@ -49,8 +55,6 @@
 
 </div>
 
-<script src="js/mock.js"></script>
-<script src="js/markdown.js"></script>
-<script src="js/app.js"></script>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>

@@ -9,6 +9,7 @@ Step 4 新功能：用户问「我之前有哪些笔记提到过 X？」，系�
 """
 
 import re
+from typing import Callable
 
 from ..adapters.llm import generate_text
 from ..config import config
@@ -201,7 +202,8 @@ def _says_not_covered(answer: str) -> bool:
 # ============================================================
 
 def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
-                history: list[dict] | None = None) -> dict:
+                history: list[dict] | None = None,
+                progress: Callable[[str], None] | None = None) -> dict:
     """跨笔记联想检索 Q&A 管道（无副作用、不打印）。
 
     Args:
@@ -210,6 +212,7 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
               不受当前会话 topic 限制；参数留给未来 Web 端做范围选择）
         top_k: 召回条数；默认用 config.QA_TOP_K
         history: 最近几轮 {question, answer} 对话记录（qa_history 取末 N 轮）
+        progress: 可选回调，接收进度消息；None 则静默
 
     Returns:
         {
@@ -224,6 +227,8 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
         return {"answer": "", "sources": [], "hits": [], "no_hit": True}
 
     # 1. 召回（try/except：RAG 未索引 / Chroma 异常时优雅降级为空 hits）
+    if progress:
+        progress("🔎 联想检索笔记库...")
     try:
         hits = _search_notes(question, top_k or config.QA_TOP_K, tech)
     except Exception:  # noqa: BLE001
@@ -238,6 +243,8 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
         return {"answer": "", "sources": [], "hits": hits, "no_hit": True}
 
     # 4. 单次 LLM 综合回答
+    if progress:
+        progress("🧠 LLM 综合回答...")
     sources = [
         {"path": g["path"], "topic": g["topic"], "similarity": g["best_similarity"],
          "snippet": g["snippets"][0]}

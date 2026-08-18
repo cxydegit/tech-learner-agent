@@ -17,9 +17,9 @@
 """
 
 import operator
+import threading
 import warnings
 from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime
 from typing import Annotated, Callable, TypedDict
 
@@ -36,20 +36,37 @@ from .pipelines.read import read_pipeline
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
 
-# Web 流式进度注入：管道 progress= 回调由 Web 的 worker 线程通过 ContextVar 注入，
-# CLI 不调用保持默认 None。节点读 _progress_cv.get() 而非硬编码 None。
-# contextvars 按线程隔离：Web 每次 run/resume 各自 set/reset，互不串扰。
-_progress_cv: ContextVar[Callable[[str], None] | None] = ContextVar("web_progress", default=None)
+# Web 流式进度注入：按 thread_id 的全局注册表，节点从 config 的 thread_id 反查进度回调。
+# ⚠️ 不用 ContextVar：实测 langgraph stream_events(v3) 在 ThreadPoolExecutor 线程执行节点，
+# 新线程不继承调用线程的 contextvars，节点里读不到 → progress 静默。注册表全局可读，任何线程都能取到。
+# CLI 不注册 → _get_progress() 返回 None，进度保持静默（行为不变）。
+_progress_registry: dict[str, Callable[[str], None]] = {}
+_progress_lock = threading.Lock()
 
 
 @contextmanager
-def web_progress(progress: Callable[[str], None] | None):
-    """在上下文里给图节点注入流式进度回调（Web 用；CLI 不调用，进度保持静默）。"""
-    token = _progress_cv.set(progress)
+def web_progress(thread_id: str, progress: Callable[[str], None] | None):
+    """把 Web 的流式进度回调按 thread_id 注册进节点（Web 用；CLI 不调用保持静默）。"""
+    with _progress_lock:
+        _progress_registry[thread_id] = progress
     try:
         yield
     finally:
-        _progress_cv.reset(token)
+        with _progress_lock:
+            _progress_registry.pop(thread_id, None)
+
+
+def _get_progress() -> Callable[[str], None] | None:
+    """节点内读取当前 run 的进度回调（从 config 的 thread_id 反查注册表）。"""
+    try:
+        from langgraph.config import get_config
+        tid = (get_config().get("configurable") or {}).get("thread_id")
+        if tid:
+            with _progress_lock:
+                return _progress_registry.get(tid)
+    except Exception:  # noqa: BLE001 —— CLI / 非图上下文取不到即返回 None
+        pass
+    return None
 
 
 def _user_message(state: "LearnState", *, decision: str | None = None) -> str:
@@ -76,18 +93,37 @@ def _user_message(state: "LearnState", *, decision: str | None = None) -> str:
     return cmd or "note"
 
 
+def _rel_doc(path: str | None) -> str | None:
+    """把产出文档的绝对路径转成相对 BASE_DIR 的 posix 路径（供 Web 阅读器白名单读取）。"""
+    if not path:
+        return None
+    try:
+        from pathlib import Path
+        rel = Path(path).resolve().relative_to(config.BASE_DIR.resolve())
+        return rel.as_posix()
+    except Exception:  # noqa: BLE001 —— 非 BASE_DIR 下的路径返回 None（前端不显示阅读全文）
+        return None
+
+
 def _conversation(state: "LearnState", assistant_content: str, node_type: str,
-                  *, decision: str | None = None) -> list[dict]:
+                  *, decision: str | None = None, doc: str | None = None,
+                  sources: list[dict] | None = None) -> list[dict]:
     """构造一对话轮次的「用户输入 + AI 回复」两条记录。
 
     conversation 是 operator.add reducer，节点返回的两条会被 append 累加；
     Web/CLI 共用同一状态，CLI 不读 conversation，行为零变化。ts 同轮取同一时间戳，
-    前端按列表顺序渲染即可。
+    前端按列表顺序渲染即可。doc 为 collect/read 产出的文档相对路径（Web「阅读全文」chip 用）；
+    sources 为 qa 的来源笔记（Web「查看来源笔记」卡片用）。
     """
     now = datetime.now().isoformat(timespec="seconds")
+    assistant: dict = {"role": "assistant", "type": node_type, "content": assistant_content, "ts": now}
+    if doc:
+        assistant["doc"] = doc
+    if sources:
+        assistant["sources"] = sources
     return [
         {"role": "user", "type": "command", "content": _user_message(state, decision=decision), "ts": now},
-        {"role": "assistant", "type": node_type, "content": assistant_content, "ts": now},
+        assistant,
     ]
 
 
@@ -115,6 +151,8 @@ class LearnState(TypedDict):
     command: str  # collect / read / note / qa
     args: list[str]
     last_output: str  # 节点输出，CLI 展示用
+    # 会话标题：首次 collect 时固化为技术名，之后不再随动作改变（Web 会话列表用）
+    title: str
     # Web 对话流：{role: user|assistant, type, content, ts} 累加记录，跨命令持久化。
     # Web 按轮渲染「用户输入 + AI 回复」，历史会话重载直接读它（§4-①）。
     # CLI 不读此字段，纯增量不破坏现有渲染。
@@ -130,27 +168,28 @@ def collect_node(state: LearnState) -> dict:
     """按 tech + focus（可选）运行资料收集管道。"""
     tech = state["tech"]
     focus = state.get("focus")
-    result = collect_pipeline(tech, focus, progress=_progress_cv.get())
+    result = collect_pipeline(tech, focus, progress=_get_progress())
     report = result["report"]
     return {
         "urls": result["urls"],
         "tech": tech,
         "materials_path": result["materials_path"],
         "last_output": report,
-        "conversation": _conversation(state, report, "collect"),
+        "title": state.get("title") or tech,  # 首次 collect 固化标题，之后不变
+        "conversation": _conversation(state, report, "collect", doc=_rel_doc(result["materials_path"])),
     }
 
 
 def read_node(state: LearnState) -> dict:
     """运行文档解读管道；结果写入 visited / notes。"""
     url = state["args"][0]
-    result = read_pipeline(url, progress=_progress_cv.get())
+    result = read_pipeline(url, progress=_get_progress())
     if result.get("error"):
         out = f"❌ {result['error']}"
         return {"last_output": out, "conversation": _conversation(state, out, "read")}
     report = result["report"]
     return {"visited": [url], "notes": result["notes"], "last_output": report,
-            "conversation": _conversation(state, report, "read")}
+            "conversation": _conversation(state, report, "read", doc=_rel_doc(result["report_path"]))}
 
 
 def note_node(state: LearnState) -> dict:
@@ -178,7 +217,7 @@ def note_node(state: LearnState) -> dict:
 
     content = _notes_to_content(reports[start:])
     result = note_pipeline(tech, content, materials_path=state.get("materials_path"),
-                           progress=_progress_cv.get())
+                           progress=_get_progress())
 
     # 无新内容：不沉淀 + 可选方向推荐（游标照常前进，避免反复重试同一批 report）
     if result["empty_reason"]:
@@ -215,7 +254,7 @@ def qa_node(state: LearnState) -> dict:
     args = state.get("args") or []
     question = args[0] if args else ""
     history = (state.get("qa_history") or [])[-config.QA_HISTORY_ROUNDS:]
-    result = qa_pipeline(question, tech=None, history=history)
+    result = qa_pipeline(question, tech=None, history=history, progress=_get_progress())
     exchange = {
         "question": question,
         "answer": result["answer"],
@@ -223,8 +262,11 @@ def qa_node(state: LearnState) -> dict:
         "no_hit": result["no_hit"],
     }
     out = _render_qa(result)
+    # sources 精简版写进 conversation（含 path/topic/similarity，供前端来源卡片），去 snippet 控体积
+    src = [{"path": s.get("path"), "topic": s.get("topic"), "similarity": s.get("similarity")}
+           for s in result["sources"]]
     return {"qa_history": [exchange], "last_output": out,
-            "conversation": _conversation(state, out, "qa")}
+            "conversation": _conversation(state, out, "qa", sources=src)}
 
 
 def _render_qa(result: dict) -> str:

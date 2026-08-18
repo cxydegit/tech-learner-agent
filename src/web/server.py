@@ -22,7 +22,6 @@ I1：本模块顶层不 import langgraph / chromadb（见各子模块 lazy impor
 import asyncio
 import json
 import queue
-from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -83,7 +82,8 @@ def create_app() -> FastAPI:
 
     @app.post("/api/sessions")
     def create_session():
-        thread_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # 初始化空 checkpoint，让详情/列表立即可读（否则 GET 详情 404）
+        thread_id = sessions_mod.create_session()
         return {"thread_id": thread_id}
 
     @app.get("/api/sessions/{thread_id}")

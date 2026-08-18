@@ -64,15 +64,6 @@ def _checkpoint_ts(tup) -> str | None:
     return None
 
 
-def _default_title(tech: str, created_ts: str | None) -> str:
-    """会话默认标题：`tech + 时间`（WEB_PLAN.md §4-③）。"""
-    base = tech.strip() or "新会话"
-    if created_ts:
-        ts = created_ts[:16].replace("T", " ")
-        return f"{base} · {ts}"
-    return base
-
-
 def _preview(conversation: list[dict], limit: int = 60) -> str:
     """会话预览：最后一条 AI 回复首行截断（无 assistant 时回退最后一条消息）。"""
     for msg in reversed(conversation or []):
@@ -95,7 +86,8 @@ def _summarize(thread_id: str, values: dict, tup) -> dict:
     updated_at = (conversation[-1].get("ts") if conversation else _checkpoint_ts(tup))
     return {
         "thread_id": thread_id,
-        "title": _default_title(tech, created_at),
+        # 标题 = 持久化 title（首次 collect 固化）→ tech → 新会话；不带时间（时间在列表元信息展示）
+        "title": (values.get("title") or "").strip() or tech or "新会话",
         "tech": tech,
         "created_at": created_at,
         "updated_at": updated_at,
@@ -103,6 +95,22 @@ def _summarize(thread_id: str, values: dict, tup) -> dict:
         "qa_count": len(qa_history),
         "note_count": read_count,
     }
+
+
+def create_session() -> str:
+    """新建会话：生成 thread_id 并初始化空 checkpoint。
+
+    POST /api/sessions 只返回 id 会让 GET 详情 404（无线程）——这里用
+    graph.update_state 写入一个空快照，让详情/列表立即可读。
+    """
+    from ..graph import build_graph
+    thread_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    config.GRAPH_DB_DIR.mkdir(parents=True, exist_ok=True)
+    with _open_saver() as saver:
+        saver.setup()
+        graph = build_graph(saver)
+        graph.update_state({"configurable": {"thread_id": thread_id}}, {})
+    return thread_id
 
 
 def list_sessions() -> list[dict]:

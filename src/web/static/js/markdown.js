@@ -3,7 +3,7 @@
    支持：标题 / 列表 / 表格 / 代码围栏 / 引用 / 粗体斜体 / 行内代码 / 链接 / 分割线
    ============================================================ */
 
-function escapeHtml(s) {
+export function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -21,13 +21,45 @@ function mdInline(t) {
   return out;
 }
 
-function mdToHtml(src) {
+export function mdToHtml(src) {
   if (!src) return "";
   const lines = String(src).replace(/\r\n/g, "\n").split("\n");
   const html = [];
   let i = 0;
 
   const isTableSep = (ln) => /^\s*\|?[\s:|-]+\|?\s*$/.test(ln) && ln.includes("-");
+
+  /* 解析列表块：合并空行分隔的连续项 + 缩进续行并入当前项。
+     关键：LLM 常在列表项间留空行，若不合并会被拆成多个独立 <ol>/<ul>，
+     浏览器对每个新 <ol> 从 1 重新编号 → 每个点都显示 1. 开头。 */
+  function collectList(ordered) {
+    const re = ordered ? /^\d+[.)]\s+/ : /^[-*]\s+/; // 行首无缩进的列表项
+    const items = [];
+    let cur = [];
+    const flush = () => { if (cur.length) { items.push(cur.join("<br/>")); cur = []; } };
+    let j = i;
+    while (j < lines.length) {
+      const L = lines[j];
+      if (re.test(L)) {
+        flush();
+        cur.push(mdInline(L.replace(re, "").trim()));
+        j++;
+      } else if (L.trim() === "") {
+        // 空行：下一行仍是列表项则合并进同一列表，否则列表结束
+        const peek = lines[j + 1];
+        if (peek && re.test(peek)) { j++; continue; }
+        break;
+      } else if (/^\s+\S/.test(L) && !/^(#{1,6})\s/.test(L.trim())) {
+        // 缩进续行（子项/说明）并入当前项：去掉子项符号标记（* / - / +）
+        cur.push(mdInline(L.trim().replace(/^[-*+]\s+/, "")));
+        j++;
+      } else {
+        break;
+      }
+    }
+    flush();
+    return { items, next: j };
+  }
 
   while (i < lines.length) {
     const line = lines[i];
@@ -64,19 +96,19 @@ function mdToHtml(src) {
       continue;
     }
 
-    // 无序列表
+    // 无序列表（合并空行分隔的连续项）
     if (/^[-*]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i])) { items.push(lines[i].replace(/^[-*]\s+/, "")); i++; }
-      html.push(`<ul>${items.map((it) => `<li>${mdInline(it)}</li>`).join("")}</ul>`);
+      const { items, next } = collectList(false);
+      if (items.length) html.push(`<ul>${items.map((it) => `<li>${it}</li>`).join("")}</ul>`);
+      i = next;
       continue;
     }
 
-    // 有序列表
+    // 有序列表（合并空行分隔的连续项，避免每个 <ol> 从 1 重新编号）
     if (/^\d+[.)]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\d+[.)]\s+/.test(lines[i])) { items.push(lines[i].replace(/^\d+[.)]\s+/, "")); i++; }
-      html.push(`<ol>${items.map((it) => `<li>${mdInline(it)}</li>`).join("")}</ol>`);
+      const { items, next } = collectList(true);
+      if (items.length) html.push(`<ol>${items.map((it) => `<li>${it}</li>`).join("")}</ol>`);
+      i = next;
       continue;
     }
 
