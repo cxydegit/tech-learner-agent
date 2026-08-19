@@ -21,14 +21,19 @@ _EVENT_QUEUE_TIMEOUT = 15.0
 
 
 class Job:
-    """一个 thread_id 的图执行任务（queue + 活跃 worker 线程）。"""
+    """一个 thread_id 的图执行任务（queue + 活跃 worker 线程）。
 
-    __slots__ = ("queue", "thread", "lock")
+    command 记录本次任务类型（collect/read/qa/note），供切回会话时按命令类型恢复 SSE；
+    resume（Command 对象）统一视为 note 合并确认的继续。
+    """
+
+    __slots__ = ("queue", "thread", "lock", "command")
 
     def __init__(self) -> None:
         self.queue: queue.Queue[dict] = queue.Queue()
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
+        self.command: str | None = None
 
     @property
     def active(self) -> bool:
@@ -102,9 +107,22 @@ def _start(thread_id: str, payload: Any) -> str | None:
         if job.active:
             return "该会话已有任务在运行，请等待完成"
         job.drain()
+        job.command = payload.get("command") if isinstance(payload, dict) else "note"
         job.thread = threading.Thread(target=_worker, args=(thread_id, payload), daemon=True)
         job.thread.start()
     return None
+
+
+def job_info(thread_id: str) -> dict:
+    """查询某会话的任务状态：{active, command}；无任务记录返回 False/None。
+
+    供 get_session 端点使用，前端切回会话时据此重连 SSE（command=="note" 按 note 流处理）。
+    """
+    with _jobs_lock:
+        job = _jobs.get(thread_id)
+    if job is None:
+        return {"active": False, "command": None}
+    return {"active": job.active, "command": job.command}
 
 
 def start_run(thread_id: str, payload: dict) -> str | None:

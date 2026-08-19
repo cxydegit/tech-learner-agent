@@ -415,3 +415,21 @@ button { font-family: inherit; cursor: pointer; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
 }
+
+/* ============ note 一键沉淀（青绿 #7FA58A，与淡雅简约协调） ============ */
+/* read 完成提醒区：绿色横线分隔消息流 */
+.note-reminder {
+  border-top: 1px solid #7FA58A;
+  padding-top: 14px;
+}
+.nr-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.nr-text { font-size: 13px; color: var(--ink-2); letter-spacing: .5px; }
+.nr-btn {
+  flex-shrink: 0;
+  border: 1px solid #7FA58A; background: transparent; color: var(--accent-deep);
+  border-radius: 999px; padding: 6px 16px; font-size: 12.5px;
+  transition: all .15s ease;
+}
+.nr-btn:hover { background: #7FA58A; color: #FDFEFD; }
+
+/* note 沉淀入口 = read 完成提醒区（无输入区常驻按钮，见 chat.js renderChat） */

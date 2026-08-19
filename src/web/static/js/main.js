@@ -44,4 +44,14 @@ async function init() {
   onRouteChange(({ view, id }) => route(view, id));
 }
 
+/* 关闭 / 刷新页面时，有任务在跑或有待确认沉淀 → 弹系统确认框（文案浏览器会忽略但保留提示） */
+window.addEventListener("beforeunload", (e) => {
+  const { running, noteRunning, notePending } = getState();
+  const noteBusy = noteRunning || Object.keys(notePending || {}).length > 0;
+  if (running || noteBusy) {
+    e.preventDefault();
+    e.returnValue = "有任务正在执行/沉淀进行中";
+  }
+});
+
 document.addEventListener("DOMContentLoaded", init);

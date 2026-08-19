@@ -13,6 +13,8 @@ const state = {
   activeId: null,
   active: null,
   running: false,
+  noteRunning: false,        // 当前 note 流进行中（一键沉淀）
+  notePending: {},           // thread_id → merge 候选文本，跨会话/跨刷新保持，等待用户决策
   currentDoc: null,
   docsCache: {},
   view: "chat",          // chat(对话流) / docs(资料库浏览)

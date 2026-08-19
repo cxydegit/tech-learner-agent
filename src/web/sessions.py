@@ -31,6 +31,22 @@ def _get_state_values(tup) -> dict:
     return {}
 
 
+def _pending_note_interrupt(tup) -> dict | None:
+    """从 CheckpointTuple.pending_writes 读 note 合并确认的 interrupt 负载。
+
+    langgraph 的 interrupt() 以 __interrupt__ channel 写 pending write（value=[Interrupt(...)]）。
+    本应用唯一 interrupt 即 note 合并确认。命中返回 {candidates_text}，否则 None。
+    """
+    for _tid, channel, value in (tup.pending_writes or []):
+        if channel == "__interrupt__" and value:
+            try:
+                text = value[0].value if hasattr(value[0], "value") else str(value[0])
+            except Exception:  # noqa: BLE001 —— 兜底取值，失败用 str 表示
+                text = str(value[0])
+            return {"candidates_text": text}
+    return None
+
+
 def _parse_thread_ts(thread_id: str) -> str | None:
     """从线程 ID（learn-YYYYMMDD-HHMMSS）解析创建时间，转 ISO 便于前端展示/排序。"""
     m = _THREAD_ID_TS_RE.search(thread_id or "")
@@ -128,7 +144,11 @@ def list_sessions() -> list[dict]:
 
 
 def get_session(thread_id: str) -> dict | None:
-    """会话详情：conversation 消息流 + 状态摘要；线程不存在返回 None。"""
+    """会话详情：conversation 消息流 + 状态摘要；线程不存在返回 None。
+
+    若会话正处于 note 合并确认（interrupt 暂停），附加 pending_note={candidates_text}，
+    前端据此恢复决策面板——SSE 断开 / 切走会话再切回都不丢。
+    """
     if not config.GRAPH_DB_PATH.exists():
         return None
     with _open_saver() as saver:
@@ -136,7 +156,7 @@ def get_session(thread_id: str) -> dict | None:
     if tup is None:
         return None
     values = _get_state_values(tup)
-    return {
+    result = {
         "thread_id": thread_id,
         "conversation": values.get("conversation") or [],
         "state": {
@@ -150,6 +170,10 @@ def get_session(thread_id: str) -> dict | None:
             "qa_history": values.get("qa_history") or [],
         },
     }
+    pending = _pending_note_interrupt(tup)
+    if pending:
+        result["pending_note"] = pending
+    return result
 
 
 def delete_session(thread_id: str) -> bool:

@@ -91,6 +91,10 @@ def create_app() -> FastAPI:
         s = sessions_mod.get_session(thread_id)
         if s is None:
             raise HTTPException(status_code=404, detail="会话不存在")
+        # 附加任务状态：前端切回会话时据此重连 SSE（note 任务按 note 流恢复）
+        info = runner_mod.job_info(thread_id)
+        s["job_active"] = info["active"]
+        s["job_command"] = info["command"]
         return s
 
     @app.delete("/api/sessions/{thread_id}")

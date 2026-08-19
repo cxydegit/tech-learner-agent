@@ -185,7 +185,8 @@ def note_pipeline(tech: str, conversation_log: str,
         body = (e.get("content") or "").strip()
         if not topic or not body:
             continue
-        tags = e.get("tags") or [tech]
+        # 无技术主题（未 collect）时不兜底空标签；LLM 没给 tags 就留空，避免 `#` 空标签
+        tags = e.get("tags") or ([tech] if tech else [])
         # 候选召回 → 标题 fast-path → LLM 判定（find_note_match），返回第一个判定
         # same 的候选及理由；reason 供确认时展示（RAG_OPTIMIZATION P0 压力测试后重构）。
         match, similarity, reason = find_note_match(tech, topic, existing_all, content=body, tags=tags)

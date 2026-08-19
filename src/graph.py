@@ -3,7 +3,8 @@
 架构定位：确定性管道（collect/read/note）是图的"叶子节点"，图负责编排——
 有状态、可中断、跨会话：
 - ``StateGraph(LearnState)``：按 ``command`` 条件路由到对应管道节点
-- ``note_node`` 的合并确认用 ``interrupt()`` 暂停图，等 CLI 用 ``Command(resume=...)`` 恢复
+- note 两段式（``note_extract`` → ``note_confirm``）：提取只跑一次，合并确认的 ``interrupt()``
+  在 ``note_confirm`` 暂停图，等 CLI 用 ``Command(resume=...)`` 恢复 —— resume 只重跑确认节点，不重跑昂贵提取
 - ``SqliteSaver`` checkpointer 跨会话/跨进程持久化（替换 session.py 的 JSON 落盘）
 
 节点不再 print：进度回调传 None，输出只经 ``last_output`` 返回，由 CLI 层渲染。
@@ -147,6 +148,9 @@ class LearnState(TypedDict):
     # note 差量提取的游标：已处理过的 report 条数（普通字段，被 note_node 覆盖更新）。
     # 作用是让第二次 note 只处理上次 note 之后新 read 的 report，避免重复提取已沉淀内容。
     noted_count: int
+    # note 两段式的中间产物：note_extract 跑完昂贵 LLM 提取后暂存管道结果，note_confirm 据此
+    # 做确认（interrupt）+ 入库。存状态是为了让 resume 只重跑 confirm、不重跑提取（普通字段覆盖写）。
+    note_result: dict | None
     # CLI 命令路由输入
     command: str  # collect / read / note / qa
     args: list[str]
@@ -192,18 +196,19 @@ def read_node(state: LearnState) -> dict:
             "conversation": _conversation(state, report, "read", doc=_rel_doc(result["report_path"]))}
 
 
-def note_node(state: LearnState) -> dict:
-    """把「上次 note 之后新解读的 report」差量沉淀为知识笔记；有合并候选时用 interrupt 让用户确认。
+def note_extract_node(state: LearnState) -> dict:
+    """差量提取阶段：召回 → LLM 提取 → 匹配，把可沉淀内容暂存进 note_result。
+
+    与 note_confirm_node 拆分的关键：note_pipeline 是昂贵 LLM 调用，只应在首轮执行一次。
+    若 interrupt 与提取放同一节点，resume 会重跑整节点 → LLM 重复提取、候选可能漂移、
+    且慢（Web 表现为反复"执行中"）。拆分后 resume 只重跑 note_confirm（快），提取不重跑。
 
     游标 noted_count 记录已处理过的 report 条数，notes 里 `n.get("report")` 为真的条目
     才计入（persist 结果不含 report 键，天然被排除）。每次 note 只取 reports[noted_count:]，
     处理完无论是否新增，游标都推进到当前 report 总数，避免下一轮重复提取已沉淀内容。
-    """
-    tech = state.get("tech") or ""
-    if not tech:
-        out = "⚠ 会话还没有技术主题，先 collect <技术名>"
-        return {"last_output": out, "conversation": _conversation(state, out, "note")}
 
+    **不要求先 collect**：只要还有未沉淀的解读 report，即可沉淀（tech 为空时笔记落入知识库根目录）。
+    """
     notes = state.get("notes") or []
     reports = [n for n in notes if n.get("report")]
     start = state.get("noted_count") or 0
@@ -212,23 +217,37 @@ def note_node(state: LearnState) -> dict:
             out = "⚠ 没有可沉淀的内容，先 read 一些文档"
         else:
             out = "ℹ 已 read 的内容都已沉淀过，先 read 新文档或 collect 新方向"
-        # 不返回 noted_count：游标保持原值，避免无 report 时误重置
-        return {"last_output": out, "conversation": _conversation(state, out, "note")}
+        # 不返回 noted_count：游标保持原值，避免无 report 时误重置；同时清掉过期 note_result
+        return {"note_result": None, "last_output": out, "conversation": _conversation(state, out, "note")}
 
     content = _notes_to_content(reports[start:])
-    result = note_pipeline(tech, content, materials_path=state.get("materials_path"),
-                           progress=_get_progress())
+    result = note_pipeline((state.get("tech") or "").strip(), content,
+                           materials_path=state.get("materials_path"), progress=_get_progress())
 
     # 无新内容：不沉淀 + 可选方向推荐（游标照常前进，避免反复重试同一批 report）
     if result["empty_reason"]:
         out = f"ℹ {result['empty_reason']}，未沉淀"
         if result.get("suggestion"):
             out += f"\n\n📌 建议继续学习的方向：\n{result['suggestion']}"
-        return {"noted_count": len(reports), "last_output": out,
+        return {"note_result": None, "noted_count": len(reports), "last_output": out,
                 "conversation": _conversation(state, out, "note")}
 
+    # 有可沉淀内容：交给 note_confirm 做确认 + 入库（interrupt 只发生在确认节点）
+    return {"note_result": result}
+
+
+def note_confirm_node(state: LearnState) -> dict:
+    """确认 + 入库阶段：有合并候选则 interrupt 征求用户决定，随后差量合并入库。
+
+    本节点是图唯一的 interrupt 点。resume 时 langgraph 只重跑本节点，读取已算好的
+    note_result（状态持久化），`interrupt()` 直接返回用户决策 → 解析 → 入库，不触发 LLM 重复提取。
+    decision 记录进 conversation 的用户消息（历史会话重载可见合并决策）。
+    """
+    tech = (state.get("tech") or "").strip()
+    result = state["note_result"]  # note_extract 已算出（普通字段覆盖写，必存在）
+    reports = [n for n in (state.get("notes") or []) if n.get("report")]
+
     # 有合并候选：interrupt 汇总展示，用户统一决定 全合并/逐条/跳过
-    # decision 记录进 conversation 的用户消息（历史会话重载可见合并决策）。
     merge_indices: set[int] = set(range(len(result["merge_candidates"])))
     decision: str | None = None
     if result["merge_candidates"]:
@@ -297,8 +316,13 @@ def _notes_to_content(notes: list[dict]) -> str:
 
 
 def _route_command(state: LearnState) -> str:
-    """START 条件边：按 command 路由到对应节点。当图被意外触发且未指明命令时，默认执行 note 节点。"""
+    """START 条件边：按 command 路由到对应节点。当图被意外触发且未指明命令时，默认执行 note 提取。"""
     return state.get("command", "note")
+
+
+def _route_note(state: LearnState) -> str:
+    """note_extract 后路由：有可沉淀内容（note_result 已算出）→ note_confirm 确认入库；否则收尾。"""
+    return "confirm" if state.get("note_result") else "end"
 
 
 # ============================================================
@@ -318,17 +342,23 @@ def build_graph(checkpointer):
     builder = StateGraph(LearnState)
     builder.add_node("collect", collect_node)
     builder.add_node("read", read_node)
-    builder.add_node("note", note_node)
+    builder.add_node("note_extract", note_extract_node)
+    builder.add_node("note_confirm", note_confirm_node)
     builder.add_node("qa", qa_node)
 
     builder.add_conditional_edges(START, _route_command, {
         "collect": "collect",
         "read": "read",
-        "note": "note",
+        "note": "note_extract",
         "qa": "qa",
     })
 
-    for n in ("collect", "read", "note", "qa"):
+    # note 两段式：提取（昂贵 LLM，只跑一次）→ 确认入库（interrupt 点，resume 只重跑它）
+    builder.add_conditional_edges("note_extract", _route_note,
+                                  {"confirm": "note_confirm", "end": END})
+    builder.add_edge("note_confirm", END)
+
+    for n in ("collect", "read", "qa"):
         builder.add_edge(n, END)
 
     return builder.compile(checkpointer=checkpointer)

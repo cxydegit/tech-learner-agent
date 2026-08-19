@@ -89,7 +89,7 @@ export function renderChat() {
   title.textContent = s.title || "新会话";
   meta.textContent = s.tech ? `主题：${s.tech}` : "";
 
-  const { active } = getState();
+  const { active, activeId, noteRunning, notePending } = getState();
   const conversation = (active && active.conversation) || [];
 
   if (!conversation.length) {
@@ -131,9 +131,20 @@ export function renderChat() {
       html += `</div></div>`;
     }
   }
+  // read 完成提醒：最后一条是「成功 read」且无 note 在跑 / 无待确认沉淀时，提示一键沉淀
+  const lastMsg = conversation[conversation.length - 1];
+  const readDone = lastMsg && lastMsg.role === "assistant" && lastMsg.type === "read"
+    && !String(lastMsg.content || "").startsWith("❌");
+  if (readDone && !noteRunning && !notePending[activeId]) {
+    html += `<div class="note-reminder"><div class="nr-row">` +
+      `<span class="nr-text">本次解读完成，是否沉淀为知识笔记？</span>` +
+      `<button class="nr-btn" data-note type="button">📝 一键沉淀</button></div></div>`;
+  }
   html += `</div>`;
   body.innerHTML = html;
 
+  $$(".note-reminder .nr-btn").forEach((btn) =>
+    btn.addEventListener("click", triggerNote));
   $$(".doc-chip").forEach((btn) =>
     btn.addEventListener("click", () => openDoc(btn.getAttribute("data-doc"))));
   $$(".source-cards .sc-item").forEach((btn) =>
@@ -160,7 +171,8 @@ function scrollChatBottom() {
 
 export async function selectSession(id) {
   closeReader(); // 切换会话收起阅读器，避免残留上一会话文档
-  setState({ activeId: id, active: null, currentDoc: null });
+  // 切走当前会话：后台任务靠 getSession 的 job_active/pending_note 恢复，不阻塞新会话
+  setState({ activeId: id, active: null, currentDoc: null, running: false });
   closeStream && closeStream();
   closeStream = null;
   renderAll();
@@ -168,6 +180,21 @@ export async function selectSession(id) {
   try {
     const detail = await getSession(id);
     setState({ active: detail });
+    // 有待确认的 note 合并 → 恢复决策面板（核心需求 4：切会话 / 刷新不丢）
+    if (detail.pending_note) {
+      setState({ notePending: { ...getState().notePending, [id]: detail.pending_note.candidates_text } });
+      renderChat();
+      showInterrupt(detail.pending_note.candidates_text);
+      return;
+    }
+    // 后台任务还在跑 → 渲染已有会话流 + 禁用输入，按命令类型重连 SSE
+    if (detail.job_active) {
+      setState({ running: true });
+      renderChat();
+      renderInputZone();
+      attachStream(id, detail.job_command === "note" ? "note" : "task");
+      return;
+    }
     renderChat();
   } catch (err) {
     showError(err.message);
@@ -188,7 +215,11 @@ export async function newSession() {
 }
 
 export async function removeSession(id) {
-  const { activeId } = getState();
+  const { activeId, notePending } = getState();
+  // 删除会话时清理其待确认沉淀，避免残留状态影响 isBusy / beforeunload
+  const next = { ...notePending };
+  delete next[id];
+  setState({ notePending: next });
   try {
     await deleteSession(id);
     const sessions = await listSessions();
@@ -214,7 +245,7 @@ export async function removeSession(id) {
 export function renderInputZone() {
   const zone = $("#inputZone");
   if (!zone) return;
-  const { running } = getState();
+  const { activeId } = getState();
   let html = `<div class="zone-a"><div class="cards-a">`;
   for (const c of CARDS) {
     const active = expandedCmd === c.cmd ? " active-card" : "";
@@ -237,7 +268,7 @@ export function renderInputZone() {
     el.addEventListener("click", () => {
       const cmd = el.getAttribute("data-cmd");
       const card = cardByCmd(cmd);
-      if (!card || card.disabled || running) return;
+      if (!card || card.disabled || isBusy(activeId)) return;
       expandedCmd = expandedCmd === cmd ? null : cmd;
       renderInputZone();
     });
@@ -271,6 +302,7 @@ async function submitCard(cmd, panel) {
   if (payload.error) return;
   const { activeId } = getState();
   if (!activeId) { showError("请先新建或选择会话"); return; }
+  if (isBusy(activeId)) return; // 有任务在跑 / 有待确认沉淀：卡片入口已禁用，此处兜底
 
   if (cmd === "collect") lastCollect = { tech: payload.tech || "", focus: payload.focus || "" };
   expandedCmd = null;
@@ -297,23 +329,50 @@ async function submitCard(cmd, panel) {
   attachStream(activeId);
 }
 
-/* 订阅 SSE 进度：progress 追加 / interrupt 决策 / final 刷新 */
-function attachStream(id) {
+/* 一键沉淀：复用 run 流程发 note 命令，按 note 流订阅 SSE */
+async function triggerNote() {
+  const { activeId } = getState();
+  if (!activeId || isBusy(activeId)) return;
+  expandedCmd = null;
+  renderInputZone();
+  try {
+    await runSession(activeId, { command: "note" });
+  } catch (err) {
+    if (err.status !== 409) { showError(err.message); return; }
+    // 409：已有任务在跑，仍订阅现有流
+  }
+  setState({ running: true, noteRunning: true });
+  renderInputZone();
+  attachStream(activeId, "note");
+}
+
+/* 有任务在跑 / 当前会话有待确认沉淀 → 禁用卡片与沉淀按钮 */
+function isBusy(id) {
+  const { running, notePending, activeId } = getState();
+  const key = id || activeId;
+  return running || !!(notePending || {})[key];
+}
+
+/* 订阅 SSE 进度：progress 追加 / interrupt 决策 / final 刷新
+   kind="note" 时 final/error 走 clearNoteState 清理 pending 状态（task 不碰 note 状态）。 */
+function attachStream(id, kind = "task") {
   closeStream && closeStream();
   showRunStatus();
   closeStream = streamEvents(id, {
     progress: (e) => appendProgress(e.message),
-    interrupt: (e) => showInterrupt(e.payload),
+    interrupt: (e) => onInterrupt(e.payload),
     final: async () => {
       clearRunStatus();
+      if (kind === "note") clearNoteState();
       await refreshActive();
-      setState({ running: false });
+      setState({ running: false, noteRunning: false });
       renderInputZone();
     },
     error: (e) => {
       clearRunStatus();
+      if (kind === "note") clearNoteState();
       showError(e.message || "执行失败");
-      setState({ running: false });
+      setState({ running: false, noteRunning: false });
       renderInputZone();
     },
     done: () => {
@@ -321,6 +380,28 @@ function attachStream(id) {
       closeStream = null;
     },
   });
+}
+
+/* note 合并确认：存 pending 候选 + 释放全局锁，展示决策面板 */
+function onInterrupt(payload) {
+  const { activeId } = getState();
+  if (!activeId) return;
+  setState({
+    notePending: { ...getState().notePending, [activeId]: payload },
+    noteRunning: false,
+    running: false, // worker 已退出（interrupt 暂停），其他会话可继续用
+  });
+  renderInputZone();
+  showInterrupt(payload);
+}
+
+/* 清理当前会话的 note 待决策状态（note 流 final/error 时调用） */
+function clearNoteState() {
+  const { activeId, notePending } = getState();
+  if (!activeId) return;
+  const next = { ...notePending };
+  delete next[activeId];
+  setState({ notePending: next, noteRunning: false });
 }
 
 function showUserMessage(content) {
@@ -408,13 +489,22 @@ function showInterrupt(payload) {
 async function resume(answer) {
   const { activeId } = getState();
   if (!activeId) return;
+  setState({ running: true, noteRunning: true });
   showRunStatus();
   try {
     await resumeSession(activeId, answer);
-    attachStream(activeId);
+    attachStream(activeId, "note"); // 恢复的是 note 合并流，final 时清理 pending
   } catch (err) {
-    if (err.status === 409) attachStream(activeId);
-    else showError(err.message);
+    if (err.status === 409) {
+      attachStream(activeId, "note");
+    } else {
+      // resume 启动失败：interrupt 仍挂在后端，重置状态并恢复决策面板，避免卡死「执行中」反复重试
+      setState({ running: false, noteRunning: false });
+      renderInputZone();
+      showError(err.message);
+      const pending = (getState().notePending || {})[activeId];
+      if (pending) showInterrupt(pending);
+    }
   }
 }
 
@@ -425,6 +515,13 @@ async function refreshActive() {
     const detail = await getSession(activeId);
     const sessions = await listSessions();
     setState({ active: detail, sessions });
+    // 安全网：SSE 未收到 interrupt 但后端已暂停（如刷新/切走再回）→ 恢复决策面板
+    if (detail.pending_note) {
+      setState({ notePending: { ...getState().notePending, [activeId]: detail.pending_note.candidates_text } });
+      renderChat();
+      showInterrupt(detail.pending_note.candidates_text);
+      return;
+    }
     renderChat();
     renderSessionList();
   } catch (_) { /* 刷新失败不阻断 */ }
