@@ -23,6 +23,7 @@ __pycache__/
 materials/
 reports/
 knowledge/
+roadmaps/
 
 # RAG 向量索引（运行时生成）
 .chroma/
@@ -36,3 +37,4 @@ docs/
 
 #测试、验证工具
 scripts/
+

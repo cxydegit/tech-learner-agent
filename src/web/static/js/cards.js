@@ -34,8 +34,12 @@ export const CARDS = [
     btn: "提问",
   },
   {
-    cmd: "route", icon: "🧭", label: "定制路线", desc: "敬请期待",
-    accent: "#A0A69B", soft: "#EEEFEA", disabled: true, fields: [], btn: "",
+    cmd: "route", icon: "🧭", label: "定制路线", desc: "问卷 + 路线 + 陪练",
+    accent: "#8A5A6B", soft: "#F3E9EC",
+    fields: [
+      { name: "tech", label: "技术名", ph: "如 Spring Boot", req: true },
+    ],
+    btn: "开始定制",
   },
 ];
 
@@ -44,6 +48,7 @@ export const VALIDATE_TEXT = {
   collect: "请输入技术名",
   read: "请输入链接",
   ask: "请输入问题",
+  route: "请输入技术名",
 };
 
 export function cardByCmd(cmd) {
@@ -68,6 +73,7 @@ export function collectPayload(cmd, panel) {
     return payload;
   }
   if (cmd === "read") return { command: "read", args: [values.url] };
+  if (cmd === "route") return { command: "route", tech: values.tech };
   return { command: "ask", args: [values.question] };
 }
 

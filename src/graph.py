@@ -17,6 +17,7 @@
         graph.stream_events({...}, config, version="v3")
 """
 
+import json
 import operator
 import threading
 import warnings
@@ -28,11 +29,14 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
+from .domain import exit_intent, survey
 from .pipelines.collect import collect_pipeline
 from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
+from .pipelines.route import COACH_TOOLS_BY_MODE, CoachCtx, coach_system_prompt, run_coach_tool, summarize_conversation
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
@@ -55,6 +59,15 @@ def web_progress(thread_id: str, progress: Callable[[str], None] | None):
     finally:
         with _progress_lock:
             _progress_registry.pop(thread_id, None)
+
+
+def _coach_thread_id() -> str | None:
+    """读取当前运行配置的 thread_id（coach 工具把生成路线的会话记进 roadmap，供恢复定位）。"""
+    try:
+        from langgraph.config import get_config
+        return (get_config().get("configurable") or {}).get("thread_id")
+    except Exception:  # noqa: BLE001 —— 非图上下文取不到即返回 None
+        return None
 
 
 def _get_progress() -> Callable[[str], None] | None:
@@ -91,6 +104,8 @@ def _user_message(state: "LearnState", *, decision: str | None = None) -> str:
         if decision:
             text += f"（合并决策：{decision.strip()}）"
         return text
+    if cmd == "route":
+        return f"route {state.get('tech') or ''}".rstrip()
     return cmd or "note"
 
 
@@ -161,6 +176,28 @@ class LearnState(TypedDict):
     # Web 按轮渲染「用户输入 + AI 回复」，历史会话重载直接读它（§4-①）。
     # CLI 不读此字段，纯增量不破坏现有渲染。
     conversation: Annotated[list[dict], operator.add]
+
+    # ---- 定制化学习路线（模块 2）：coach agent 循环 ----
+    # 模式状态机：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练，Step 4 接工具）。
+    # 切换由确定性代码判定（_route_after_survey / confirm_roadmap 工具），模型只负责对话 + 选工具。
+    mode: str
+    # 模型上下文消息（openai 兼容 dict 列表，有界、覆盖写）：与 conversation（展示用）分离——
+    # conversation 无界保留完整对话供前端渲染，coach_messages 只留最近几轮 + 摘要。
+    coach_messages: list
+    coach_summary: str  # 压缩摘要（后续阶段落地 LLM 摘要，当前为空字符串）
+    # 问卷状态：answers 见 domain/survey；survey_field 当前待收集字段，None 表示进入动态诊断题
+    survey_answers: dict
+    survey_field: str | None
+    learner_profile: dict  # 问卷完成后推导的用户画像（注入 planning/coaching 提示词）
+    roadmap: dict | None  # 路线机器态（planning 生成）
+    roadmap_path: str  # 路线 JSON 文件路径
+    # 护栏：本用户回合已用工具调用数 + 最近几轮工具签名（重复检测）
+    coach_turn_tool_count: int
+    last_tool_signatures: list
+    # note 工具暂存的相似笔记候选（note 提取后待用户决定，note_commit 提交后清空）
+    coach_note_pending: dict | None
+    # collect/read 工具最近一次产出的文档 {path, type}；coach_human 把它附到对话记录（查看完整文档 chip），用后即清
+    coach_doc: dict | None
 
 
 # ============================================================
@@ -301,6 +338,244 @@ def _render_qa(result: dict) -> str:
     return result.get("answer") or "（无回答）"
 
 
+# ============================================================
+# coach 循环（模块 2 定制化学习路线）
+# LangGraph canonical agent 结构：coach_llm ↔ (coach_tool | coach_human) ↔ coach_survey。
+# 三模式（survey/planning/coaching）共用这一套节点，靠 mode 字段换提示词 + 工具集 +
+# 边界路由；模式切换由确定性代码判定。护栏：工具预算 / 重复检测 / 退出意图 / recursion_limit。
+# ============================================================
+
+
+def coach_trim(state: LearnState) -> dict:
+    """上下文管理 + 首次初始化。
+
+    - 初始化：mode 置 survey、问卷起始字段置 self_level（跨会话恢复时已持久化，不重复）。
+    - 压缩：消息总量超 COACH_COMPRESS_AT 时，旧消息经 LLM 摘要进 coach_summary，
+      只保留最近 COACH_HISTORY_KEEP 轮。摘要失败降级为直接丢弃旧消息（保上下文有界）。
+
+    ⚠️ 初始化要基于"即将生效的 mode"判断，不能读 state.mode（它还没被本节点写进去）。
+    """
+    msgs = state.get("coach_messages") or []
+    keep = config.COACH_HISTORY_KEEP * 2  # 一轮 ≈ 一问一答两条
+    updates: dict = {"coach_messages": msgs}
+    mode = state.get("mode") or "survey"
+    updates["mode"] = mode
+    if mode == "survey" and not state.get("survey_field") and not state.get("survey_answers"):
+        updates["survey_field"] = survey.SURVEY_FIELDS[0]  # 从第一问开始
+
+    # 上下文压缩：超阈值 → 旧消息摘要压缩进 coach_summary，只留最近 N 轮
+    if len(msgs) > config.COACH_COMPRESS_AT:
+        old, recent = msgs[:-keep], msgs[-keep:]
+        updates["coach_summary"] = summarize_conversation(
+            state.get("coach_summary") or "", old, state.get("tech") or "")
+        updates["coach_messages"] = recent
+    return updates
+
+
+def coach_llm(state: LearnState) -> dict:
+    """调用模型（按 mode 注入提示词 + 工具集），追加一条 assistant 消息。"""
+    msgs = state.get("coach_messages") or []
+    try:
+        result = chat_with_tools(
+            coach_system_prompt(state),
+            msgs,
+            COACH_TOOLS_BY_MODE.get(state.get("mode") or "survey", []),
+        )
+    except ToolCallError as e:
+        msg = f"⚠️ 模型调用暂时不可用（{e}）。请稍后再试，或输入「结束」退出。"
+        return {"coach_messages": [*msgs, {"role": "assistant", "content": msg}],
+                "last_output": msg}
+
+    content = result.get("content")
+    tool_calls = result.get("tool_calls") or []
+    if not content and not tool_calls:
+        # 模型空输出：给一条内部提示让它重新回复（recursion_limit 兜底防无限空转）
+        return {"coach_messages": [*msgs, {"role": "system",
+                                           "content": "（内部）你上一条输出为空，请直接回复用户或调用工具。"}]}
+    assistant: dict = {"role": "assistant", "content": content}
+    if tool_calls:
+        assistant["tool_calls"] = [
+            {"id": tc["id"], "type": "function",
+             "function": {"name": tc["name"],
+                          "arguments": json.dumps(tc.get("arguments") or {}, ensure_ascii=False)}}
+            for tc in tool_calls
+        ]
+    return {"coach_messages": [*msgs, assistant]}
+
+
+def _assistant_tool_calls(assistant_msg: dict) -> list[dict]:
+    """把 assistant 消息里的 OpenAI 格式 tool_calls 归一化为 [{id, name, arguments(dict)}]。
+
+    coach_llm 写入 coach_messages 时用 OpenAI 兼容格式（function.arguments 是 JSON 字符串），
+    统一在读取侧归一化，避免两套解析逻辑（且 arguments 非法时兜底 {}，护栏兜住异常参数）。
+    """
+    out = []
+    for tc in assistant_msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        args_raw = fn.get("arguments")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+        except Exception:  # noqa: BLE001 —— 非法 JSON 兜底空 dict
+            args = {}
+        out.append({"id": tc.get("id"), "name": fn.get("name"), "arguments": args})
+    return out
+
+
+def coach_tool(state: LearnState) -> dict:
+    """执行模型请求的工具调用；工具异常回喂模型修正（LLM 可恢复错误，官方推荐模式）。"""
+    tool_calls = _assistant_tool_calls(state["coach_messages"][-1])
+    ctx = CoachCtx(state, progress=_get_progress(), thread_id=_coach_thread_id())
+    results = []
+    signatures = []
+    for tc in tool_calls:
+        args = tc["arguments"]
+        signatures.append(f"{tc['name']}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
+        try:
+            out = run_coach_tool(tc["name"], args, ctx)
+        except Exception as e:  # noqa: BLE001 —— 工具异常回喂模型修正
+            out = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        results.append({"role": "tool", "tool_call_id": tc["id"],
+                        "name": tc["name"], "content": json.dumps(out, ensure_ascii=False)})
+    updates: dict = {
+        "coach_messages": state["coach_messages"] + results,
+        "last_tool_signatures": (state.get("last_tool_signatures") or []) + [signatures],
+        "coach_turn_tool_count": (state.get("coach_turn_tool_count") or 0) + len(tool_calls),
+    }
+    for k, v in ctx.updates.items():  # 工具请求的状态变更（如 confirm_roadmap → mode=coaching）
+        updates[k] = v
+    return updates
+
+
+def coach_human(state: LearnState) -> dict:
+    """把模型消息展示给用户（interrupt），收集用户回答后回写 coach_messages。
+
+    每个用户回合重置工具预算与重复检测计数。conversation 记录「AI 提问 + 用户回答」
+    两条（chronological 顺序，供 Web 渲染；CLI 不读）。
+    """
+    msgs = state.get("coach_messages") or []
+    content = (msgs[-1].get("content") or "") if msgs else ""
+    reply = interrupt({
+        "type": "coach_question",
+        "mode": state.get("mode"),
+        "tech": state.get("tech") or "",
+        "message": content,
+    })
+    reply = (reply or "").strip()
+    now = datetime.now().isoformat(timespec="seconds")
+    updates: dict = {
+        "coach_messages": [*msgs, {"role": "user", "content": reply}],
+        "coach_turn_tool_count": 0,
+        "last_tool_signatures": [],
+        "last_output": "",
+    }
+    # collect/read 工具产出文档时，给本条 assistant 记录附上 doc chip（相对路径，前端白名单读取）
+    assistant_rec: dict = {"role": "assistant", "type": "coach", "content": content, "ts": now}
+    doc = state.get("coach_doc")
+    if doc:
+        rel = _rel_doc(doc.get("path"))
+        if rel:
+            assistant_rec["doc"] = rel
+            assistant_rec["doc_type"] = doc.get("type") or "read"
+        updates["coach_doc"] = None  # 只附着一次，避免给后续普通消息误挂 chip
+    updates["conversation"] = [
+        assistant_rec,
+        {"role": "user", "type": "chat", "content": reply, "ts": now},
+    ]
+    return updates
+
+
+def coach_survey(state: LearnState) -> dict:
+    """问卷回答处理：按当前字段确定性解析推进；解析失败给模型一条校验提示重问。
+
+    问卷完成后在**节点内**确定性写 mode=planning（langgraph 1.2.10 条件边不支持返回
+    Command，模式切换统一在节点内完成）。非 survey 模式直接透传（所有模式的
+    post-human 汇聚点）。
+    """
+    if state.get("mode") != "survey":
+        return {}
+    answers = dict(state.get("survey_answers") or {})
+    reply = state["coach_messages"][-1].get("content") or ""
+    field = state.get("survey_field")
+    updates: dict = {}
+    if field is not None:
+        new_answers, err = survey.apply_answer(answers, field, reply)
+        if err:
+            note = (f"[问卷校验] 用户对「{survey.FIELD_QUESTIONS.get(field, field)}」的回答"
+                    f"『{reply[:50]}』无法解析：{err}。请重新问同一个问题，并提示输入格式。")
+            updates["coach_messages"] = state["coach_messages"] + [
+                {"role": "system", "content": note}]
+            return updates
+        answers = new_answers
+        updates["survey_answers"] = answers
+        updates["survey_field"] = survey.next_field(answers)
+    else:
+        # 动态诊断题阶段：自由文本，直接收集
+        diagnostics = list(answers.get("diagnostics") or [])
+        diagnostics.append(reply)
+        answers["diagnostics"] = diagnostics
+        updates["survey_answers"] = answers
+    if survey.is_fixed_done(answers) and not state.get("learner_profile"):
+        updates["learner_profile"] = survey.derive_profile(answers, state.get("tech") or "")
+    if survey.is_survey_complete(answers):
+        updates["mode"] = "planning"  # 问卷完成 → 确定性进入路线规划
+    return updates
+
+
+# ---------- coach 路由 ----------
+
+
+def coach_guard(state: LearnState) -> dict:
+    """护栏节点：把诊断消息作为 assistant 消息插入，随后 coach_human 展示并等用户输入。"""
+    msg = _coach_guard(state)
+    if not msg:
+        return {}  # 理论不可达（只在护栏触发时路由到本节点）
+    return {"coach_messages": state["coach_messages"] + [{"role": "assistant", "content": msg}]}
+
+
+def _coach_guard(state: LearnState) -> str | None:
+    """工具护栏判定：预算耗尽 / 连续重复调用 → 返回诊断消息；无违规返回 None。"""
+    count = state.get("coach_turn_tool_count") or 0
+    if count >= config.ROUTE_MAX_TOOL_CALLS_PER_TURN:
+        return ("本轮工具调用次数已达上限，我暂时停一下。请告诉我下一步方向，"
+                "或直接说「结束」。")
+    last_tc = _assistant_tool_calls(state["coach_messages"][-1])
+    cur = [f"{tc['name']}:{json.dumps(tc['arguments'], sort_keys=True, ensure_ascii=False)}"
+           for tc in last_tc]
+    sigs = state.get("last_tool_signatures") or []
+    if len(sigs) >= 2 and sigs[-1] == cur and sigs[-2] == cur:
+        return ("我连续在重复做同一件事，可能卡住了。请帮我确认接下来该怎么做"
+                "（或说「结束」退出）。")
+    return None
+
+
+def _route_coach(state: LearnState) -> str:
+    """coach_llm 条件边：模型产出后决定下一步（assistant 消息才需要分流）。
+
+    - assistant 带 tool_calls → 过护栏：违规去 coach_guard（问用户），否则 coach_tool
+    - assistant 纯内容 → coach_human（interrupt 展示给用户）
+    - tool / system / user 消息 → coach_trim 继续（用户消息已由 coach_survey 预处理）
+    """
+    msgs = state.get("coach_messages") or []
+    if not msgs:
+        return "coach_trim"
+    last = msgs[-1]
+    if last.get("role") == "assistant":
+        if last.get("tool_calls"):
+            if _coach_guard(state):
+                return "coach_guard"
+            return "coach_tool"
+        return "coach_human"
+    return "coach_trim"
+
+
+def _route_after_human(state: LearnState) -> str:
+    """coach_human 条件边：用户刚回答——退出意图（确定性正则）→ END；否则 coach_survey 处理。"""
+    msgs = state.get("coach_messages") or []
+    if msgs and msgs[-1].get("role") == "user" and exit_intent.is_exit_intent(msgs[-1].get("content")):
+        return END
+    return "coach_survey"
+
+
 def _notes_to_content(notes: list[dict]) -> str:
     """把已解读的 report 汇总成 note 管道的输入文本。"""
     parts = []
@@ -351,6 +626,7 @@ def build_graph(checkpointer):
         "read": "read",
         "note": "note_extract",
         "qa": "qa",
+        "route": "coach_trim",
     })
 
     # note 两段式：提取（昂贵 LLM，只跑一次）→ 确认入库（interrupt 点，resume 只重跑它）
@@ -360,6 +636,31 @@ def build_graph(checkpointer):
 
     for n in ("collect", "read", "qa"):
         builder.add_edge(n, END)
+
+    # coach 循环（模块 2）：llm ↔ (tool | human | guard) ↔ survey，共用 trim 保底上下文有界。
+    # 模式切换（survey→planning→coaching）全部在节点内写 mode，条件边只做路由
+    # （langgraph 1.2.10 条件边不支持返回 Command）。
+    builder.add_node("coach_trim", coach_trim)
+    builder.add_node("coach_llm", coach_llm)
+    builder.add_node("coach_tool", coach_tool)
+    builder.add_node("coach_human", coach_human)
+    builder.add_node("coach_survey", coach_survey)
+    builder.add_node("coach_guard", coach_guard)
+
+    builder.add_edge("coach_trim", "coach_llm")
+    builder.add_conditional_edges("coach_llm", _route_coach, {
+        "coach_tool": "coach_tool",
+        "coach_human": "coach_human",
+        "coach_guard": "coach_guard",
+        "coach_trim": "coach_trim",
+    })
+    builder.add_edge("coach_tool", "coach_trim")
+    builder.add_conditional_edges("coach_human", _route_after_human, {
+        "coach_survey": "coach_survey",
+        END: END,
+    })
+    builder.add_edge("coach_guard", "coach_human")
+    builder.add_edge("coach_survey", "coach_trim")
 
     return builder.compile(checkpointer=checkpointer)
 

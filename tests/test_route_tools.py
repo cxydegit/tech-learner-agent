@@ -1,0 +1,279 @@
+"""pipelines/route coach 工具单测：generate_roadmap / confirm_roadmap / get_roadmap。
+
+零网络；ROADMAP_DIR 重定向到临时目录，不污染仓库。
+
+运行：PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m pytest tests/test_route_tools.py -v
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import src.pipelines.route as route_mod
+from src.config import config
+from src.domain import roadmap as rm
+from src.pipelines.route import CoachCtx, run_coach_tool
+
+
+def _ctx(state=None):
+    return CoachCtx(state or {"tech": "spring-boot", "survey_answers": {}, "learner_profile": {}})
+
+
+def _gen_args():
+    return {
+        "goal": "能跑通最小项目",
+        "total_hours": 12,
+        "revision": "",
+        "stages": [
+            {"name": "环境搭建", "goal": "跑通 hello", "est_hours": 4,
+             "milestones": [{"desc": "安装完成"}, {"desc": "跑通 hello"}]},
+            {"name": "核心概念", "goal": "掌握核心", "est_hours": 8,
+             "milestones": [{"desc": "理解 A"}]},
+        ],
+    }
+
+
+def test_generate_roadmap_saves_json_and_md(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    ctx = _ctx()
+    out = run_coach_tool("generate_roadmap", _gen_args(), ctx)
+    assert out["status"] == "ok"
+    assert out["current_stage"] == "s1"
+    assert len(out["stages"]) == 2
+    assert ctx.updates["roadmap"]["tech"] == "spring-boot"
+    assert ctx.updates["roadmap"]["goal"] == "能跑通最小项目"
+    assert (tmp_path / "roadmaps" / "spring-boot.json").exists()
+    assert (tmp_path / "roadmaps" / "spring-boot-roadmap.md").exists()
+
+
+def test_generate_roadmap_records_thread_and_profile(tmp_path, monkeypatch):
+    """生成路线时记录 session_thread_id + 画像落盘（按 tech 归档，不含诊断原文）。"""
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
+    ctx = CoachCtx({"tech": "spring-boot",
+                    "learner_profile": {"self_level": 5, "bucket": "intermediate", "diagnostics": ["x"]}},
+                   thread_id="route-abc")
+    out = run_coach_tool("generate_roadmap", _gen_args(), ctx)
+    assert out["status"] == "ok"
+    assert ctx.updates["roadmap"]["session_thread_id"] == "route-abc"
+    from src.adapters import learner as le
+    profile = le.load_profile()
+    assert "spring-boot" in profile
+    assert profile["spring-boot"]["bucket"] == "intermediate"
+    assert "diagnostics" not in profile["spring-boot"]
+
+
+def test_generate_roadmap_without_profile_skips_save(tmp_path, monkeypatch):
+    """无画像时生成路线不写 profile.json（正常降级）。"""
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
+    ctx = CoachCtx({"tech": "spring-boot"})
+    out = run_coach_tool("generate_roadmap", _gen_args(), ctx)
+    assert out["status"] == "ok"
+    from src.adapters import learner as le
+    assert le.load_profile() == {}
+
+
+def test_generate_roadmap_missing_fields_is_error():
+    ctx = _ctx()
+    out = run_coach_tool("generate_roadmap", {"goal": "g", "total_hours": 5, "stages": []}, ctx)
+    assert out["status"] == "error"
+    assert not ctx.updates  # 不落盘、不写状态
+
+
+def test_generate_roadmap_bad_stage_reports_errors():
+    ctx = _ctx()
+    args = _gen_args()
+    args["stages"] = [{"name": "", "goal": "x", "est_hours": 1, "milestones": [{"desc": "d"}]}]
+    out = run_coach_tool("generate_roadmap", args, ctx)
+    assert out["status"] == "error"
+    assert out["errors"]
+    assert not ctx.updates
+
+
+def test_confirm_roadmap_sets_mode_coaching():
+    ctx = _ctx({"tech": "t", "roadmap": {"tech": "t", "current_stage": "s1"}})
+    out = run_coach_tool("confirm_roadmap", {}, ctx)
+    assert out["status"] == "ok"
+    assert ctx.updates["mode"] == "coaching"
+
+
+def test_confirm_roadmap_without_roadmap_is_error():
+    ctx = _ctx()
+    out = run_coach_tool("confirm_roadmap", {}, ctx)
+    assert out["status"] == "error"
+    assert not ctx.updates
+
+
+def test_get_roadmap_none_when_absent():
+    out = run_coach_tool("get_roadmap", {}, _ctx())
+    assert out["status"] == "ok"
+    assert out["roadmap"] is None
+
+
+def test_get_roadmap_present():
+    roadmap = {"tech": "t", "goal": "g", "total_hours": 5, "current_stage": "s1",
+               "stages": [{"id": "s1", "name": "a", "goal": "g", "est_hours": 2,
+                           "milestones": [{"id": "s1-m1", "desc": "m", "done": False}]}]}
+    out = run_coach_tool("get_roadmap", {}, _ctx({"roadmap": roadmap}))
+    assert out["current_stage"] == "s1"
+    assert out["stages"][0]["milestones"][0]["id"] == "s1-m1"
+
+
+def test_unknown_tool_is_error():
+    out = run_coach_tool("nope", {}, _ctx())
+    assert out["status"] == "error"
+
+
+# ---------- coaching 工具：collect / read / ask ----------
+
+def test_collect_tool(monkeypatch):
+    captured = {}
+
+    def fake_collect(tech, focus=None, progress=None):
+        captured.update(tech=tech, focus=focus)
+        return {"urls": ["a", "b"], "report": "## 资料\n内容", "materials_path": "materials/x.md"}
+
+    monkeypatch.setattr(route_mod, "collect_pipeline", fake_collect)
+    out = run_coach_tool("collect", {"tech": "FastAPI", "focus": "异步"}, _ctx())
+    assert out["status"] == "ok"
+    assert captured["tech"] == "FastAPI"
+    assert captured["focus"] == "异步"
+    assert out["url_count"] == 2
+
+
+def test_collect_progress_passthrough(monkeypatch):
+    seen = []
+
+    def fake_collect(tech, focus=None, progress=None):
+        if progress:
+            progress("进度")
+        return {"urls": [], "report": "r", "materials_path": "materials/x.md"}
+
+    monkeypatch.setattr(route_mod, "collect_pipeline", fake_collect)
+    ctx = _ctx()
+    ctx.progress = seen.append
+    run_coach_tool("collect", {"tech": "t"}, ctx)
+    assert seen == ["进度"]
+
+
+def test_read_tool_error(monkeypatch):
+    monkeypatch.setattr(route_mod, "read_pipeline", lambda url, progress=None: {"error": "抓取失败"})
+    out = run_coach_tool("read", {"url": "http://x"}, _ctx())
+    assert out["status"] == "error"
+
+
+def test_read_tool_ok(monkeypatch):
+    monkeypatch.setattr(route_mod, "read_pipeline",
+                        lambda url, progress=None: {"report": "解读", "title": "T", "report_path": "reports/t.md",
+                                                    "notes": [], "error": None})
+    out = run_coach_tool("read", {"url": "http://x"}, _ctx())
+    assert out["status"] == "ok"
+    assert out["title"] == "T"
+
+
+def test_ask_tool(monkeypatch):
+    monkeypatch.setattr(route_mod, "qa_pipeline",
+                        lambda q, tech=None, progress=None: {"answer": "答", "sources": [], "no_hit": False})
+    out = run_coach_tool("ask", {"question": "什么是X"}, _ctx())
+    assert out["status"] == "ok"
+    assert out["answer"] == "答"
+
+
+# ---------- coaching 工具：note / note_commit ----------
+
+_MERGE_RESULT = {
+    "new_points": [],
+    "merge_candidates": [{"old_path": "a.md", "old_topic": "A", "old_content": "o",
+                          "similarity": 0.9, "reason": "r", "topic": "T", "tags": [], "content": "n"}],
+    "empty_reason": None, "summary": "s", "raw": "r", "new_count": 0, "merged_count": 1,
+}
+
+
+def test_note_tool_no_merge_persists(monkeypatch):
+    monkeypatch.setattr(route_mod, "note_pipeline",
+                        lambda tech, log, materials_path=None, progress=None: {
+                            **{k: v for k, v in _MERGE_RESULT.items() if k != "merge_candidates"},
+                            "merge_candidates": [], "new_count": 1, "merged_count": 0,
+                            "new_points": [{"topic": "T", "tags": [], "content": "c"}]})
+    monkeypatch.setattr(route_mod, "persist_points",
+                        lambda tech, np, mc, mi: {"results": [{"topic": "T", "path": "t.md", "action": "new"}],
+                                                  "new_count": 1, "merged_count": 0})
+    out = run_coach_tool("note", {"tech": "t", "content": "学习内容"}, _ctx())
+    assert out["status"] == "ok"
+    assert out["new_count"] == 1
+
+
+def test_note_tool_merge_needs_decision(monkeypatch):
+    monkeypatch.setattr(route_mod, "note_pipeline",
+                        lambda tech, log, materials_path=None, progress=None: _MERGE_RESULT)
+    ctx = _ctx()
+    out = run_coach_tool("note", {"tech": "t", "content": "学习内容"}, ctx)
+    assert out["status"] == "needs_decision"
+    assert "发现 1 条" in out["message"]
+    assert ctx.updates["coach_note_pending"]
+
+
+def test_note_commit_uses_pending(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(route_mod, "persist_points",
+                        lambda tech, np, mc, mi: captured.update(tech=tech, mi=mi) or
+                            {"results": [{"topic": "A", "path": "a.md", "action": "merged"}],
+                             "new_count": 0, "merged_count": 1})
+    state = {"tech": "t", "coach_note_pending": {**_MERGE_RESULT, "_tech": "t"}}
+    ctx = CoachCtx(state)
+    out = run_coach_tool("note_commit", {"decision": "all"}, ctx)
+    assert out["status"] == "ok"
+    assert captured["tech"] == "t"
+    assert captured["mi"] == {0}  # all → 合并全部
+    assert ctx.updates["coach_note_pending"] is None  # 提交后清空
+
+
+def test_note_commit_without_pending():
+    out = run_coach_tool("note_commit", {"decision": "skip"}, _ctx())
+    assert out["status"] == "error"
+
+
+def test_note_commit_parse_indices(monkeypatch):
+    monkeypatch.setattr(route_mod, "persist_points",
+                        lambda tech, np, mc, mi: {"results": [], "new_count": 0, "merged_count": 0})
+    state = {"tech": "t", "coach_note_pending": {**_MERGE_RESULT, "_tech": "t"}}
+    ctx = CoachCtx(state)
+    run_coach_tool("note_commit", {"decision": "1"}, ctx)
+    # 由 note_commit 内部调 parse_merge_decision（"1" → {0}），persist 被调用即通过
+
+
+# ---------- coaching 工具：update_roadmap ----------
+
+def _roadmap():
+    stages, _ = rm.normalize_stages([
+        {"name": "环境搭建", "goal": "g", "est_hours": 4,
+         "milestones": [{"desc": "安装完成"}, {"desc": "跑通 hello"}]},
+        {"name": "核心概念", "goal": "g", "est_hours": 8, "milestones": [{"desc": "理解 A"}]},
+    ])
+    return rm.build_roadmap("t", "goal", 12, stages)
+
+
+def test_update_roadmap_completes_and_advances(monkeypatch):
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    ctx = _ctx({"tech": "t", "roadmap": _roadmap()})
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out["status"] == "ok"
+    # s1 还有 s1-m2 未完成 → 阶段不推进
+    assert ctx.updates["roadmap"]["current_stage"] == "s1"
+    out2 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True}, ctx)
+    assert ctx.updates["roadmap"]["current_stage"] == "s2"  # s1 全完成 → 推进
+
+
+def test_update_roadmap_unknown_milestone(monkeypatch):
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    ctx = _ctx({"tech": "t", "roadmap": _roadmap()})
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s9-m9", "done": True}, ctx)
+    assert out["status"] == "error"
+    assert "available" in out
+
+
+def test_update_roadmap_without_roadmap():
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1"}, _ctx())
+    assert out["status"] == "error"

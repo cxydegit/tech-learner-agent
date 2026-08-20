@@ -23,6 +23,8 @@ const CHIP_LABEL = { collect: "查看资料清单", read: "阅读全文", qa: "�
 let expandedCmd = null;      // 当前展开的卡片
 let lastCollect = { tech: "", focus: "" }; // 记忆回填上次 collect 的技术名
 let closeStream = null;      // 当前 SSE 关闭函数（切换会话时关闭）
+let interruptKind = null;    // 当前 interrupt 类型：note（合并确认）/ coach（陪练问答）
+let coachPayload = null;     // 当前 coach 问题负载（resume 失败时恢复面板）
 
 /* ============================================================
    渲染
@@ -113,7 +115,7 @@ export function renderChat() {
       html += `<div class="md-body">${mdToHtml(m.content)}</div>`;
       if (m.doc) {
         html += `<button class="doc-chip" data-doc="${escapeHtml(m.doc)}">` +
-          `📄 ${CHIP_LABEL[m.type] || "阅读全文"} ↗</button>`;
+          `📄 ${CHIP_LABEL[m.type] || CHIP_LABEL[m.doc_type] || "阅读全文"} ↗</button>`;
       }
       if (m.sources && m.sources.length) {
         html += `<div class="source-cards"><div class="sc-label">📚 来源笔记</div><div class="sc-list">`;
@@ -180,6 +182,16 @@ export async function selectSession(id) {
   try {
     const detail = await getSession(id);
     setState({ active: detail });
+    // 有待答的 coach 问题 → 恢复问答面板（定制路线：切会话 / 刷新不丢）
+    if (detail.pending_coach) {
+      interruptKind = "coach";
+      coachPayload = detail.pending_coach;
+      setState({ running: false, coachPending: { ...getState().coachPending, [id]: detail.pending_coach } });
+      renderChat();
+      appendAiMessage(detail.pending_coach.message || "");
+      showCoachReplyInput();
+      return;
+    }
     // 有待确认的 note 合并 → 恢复决策面板（核心需求 4：切会话 / 刷新不丢）
     if (detail.pending_note) {
       setState({ notePending: { ...getState().notePending, [id]: detail.pending_note.candidates_text } });
@@ -215,11 +227,13 @@ export async function newSession() {
 }
 
 export async function removeSession(id) {
-  const { activeId, notePending } = getState();
-  // 删除会话时清理其待确认沉淀，避免残留状态影响 isBusy / beforeunload
+  const { activeId, notePending, coachPending } = getState();
+  // 删除会话时清理其待确认沉淀 / 待答问题，避免残留状态影响 isBusy / beforeunload
   const next = { ...notePending };
   delete next[id];
-  setState({ notePending: next });
+  const cnext = { ...coachPending };
+  delete cnext[id];
+  setState({ notePending: next, coachPending: cnext });
   try {
     await deleteSession(id);
     const sessions = await listSessions();
@@ -310,6 +324,7 @@ async function submitCard(cmd, panel) {
 
   // 乐观显示用户消息 + 运行状态（最终以 SSE final 后刷新为准）
   showUserMessage(cmd === "collect" ? `${payload.tech}${payload.focus ? " " + payload.focus : ""}`
+    : cmd === "route" ? (payload.tech || "")
     : (payload.args ? payload.args[0] : ""));
 
   let started = false;
@@ -346,11 +361,11 @@ async function triggerNote() {
   attachStream(activeId, "note");
 }
 
-/* 有任务在跑 / 当前会话有待确认沉淀 → 禁用卡片与沉淀按钮 */
+/* 有任务在跑 / 有待确认沉淀 / 有待答 coach 问题 → 禁用卡片与沉淀按钮 */
 function isBusy(id) {
-  const { running, notePending, activeId } = getState();
+  const { running, notePending, coachPending, activeId } = getState();
   const key = id || activeId;
-  return running || !!(notePending || {})[key];
+  return running || !!(notePending || {})[key] || !!(coachPending || {})[key];
 }
 
 /* 订阅 SSE 进度：progress 追加 / interrupt 决策 / final 刷新
@@ -360,10 +375,11 @@ function attachStream(id, kind = "task") {
   showRunStatus();
   closeStream = streamEvents(id, {
     progress: (e) => appendProgress(e.message),
-    interrupt: (e) => onInterrupt(e.payload),
+    interrupt: (e) => onInterrupt(e),
     final: async () => {
       clearRunStatus();
       if (kind === "note") clearNoteState();
+      clearCoachState(id);
       await refreshActive();
       setState({ running: false, noteRunning: false });
       renderInputZone();
@@ -371,6 +387,7 @@ function attachStream(id, kind = "task") {
     error: (e) => {
       clearRunStatus();
       if (kind === "note") clearNoteState();
+      clearCoachState(id);
       showError(e.message || "执行失败");
       setState({ running: false, noteRunning: false });
       renderInputZone();
@@ -382,26 +399,48 @@ function attachStream(id, kind = "task") {
   });
 }
 
-/* note 合并确认：存 pending 候选 + 释放全局锁，展示决策面板 */
-function onInterrupt(payload) {
+/* interrupt 分发：coach 问答（定制路线）/ note 合并确认 */
+function onInterrupt(e) {
   const { activeId } = getState();
   if (!activeId) return;
+  if (e.kind === "coach_question") {
+    interruptKind = "coach";
+    coachPayload = e.payload;
+    setState({
+      coachPending: { ...getState().coachPending, [activeId]: e.payload },
+      running: false, // worker 已退出（interrupt 暂停），其他会话可继续用
+    });
+    renderInputZone();
+    appendAiMessage((e.payload && e.payload.message) || ""); // 陪练问题即时上屏
+    showCoachReplyInput();
+    return;
+  }
+  // note 合并确认（原流程）
+  interruptKind = "note";
   setState({
-    notePending: { ...getState().notePending, [activeId]: payload },
+    notePending: { ...getState().notePending, [activeId]: e.payload },
     noteRunning: false,
-    running: false, // worker 已退出（interrupt 暂停），其他会话可继续用
+    running: false,
   });
   renderInputZone();
-  showInterrupt(payload);
+  showInterrupt(e.payload);
 }
 
-/* 清理当前会话的 note 待决策状态（note 流 final/error 时调用） */
+/* 清理某会话的 note 待决策状态（note 流 final/error 时调用） */
 function clearNoteState() {
   const { activeId, notePending } = getState();
   if (!activeId) return;
   const next = { ...notePending };
   delete next[activeId];
   setState({ notePending: next, noteRunning: false });
+}
+
+/* 清理某会话的 coach 待答状态（coach 流 final/error 时调用） */
+function clearCoachState(id) {
+  if (!id) return;
+  const next = { ...getState().coachPending };
+  delete next[id];
+  setState({ coachPending: next });
 }
 
 function showUserMessage(content) {
@@ -486,24 +525,72 @@ function showInterrupt(payload) {
   });
 }
 
+/* 把陪练问题作为 AI 气泡追加到聊天区（coach 问答即时上屏；final 时由权威状态整体重渲染，无重复） */
+function appendAiMessage(content) {
+  const body = $("#chatBody");
+  let stream = body.querySelector(".chat-stream");
+  if (!stream) {
+    body.innerHTML = "";
+    stream = document.createElement("div");
+    stream.className = "chat-stream";
+    body.appendChild(stream);
+  }
+  const div = document.createElement("div");
+  div.className = "msg-ai";
+  div.innerHTML = `<div class="bubble"><div class="msg-meta"><span class="msg-role">AI 学习助手</span>` +
+    `<span>${escapeHtml(fmtTime(new Date().toISOString()))}</span></div>` +
+    `<div class="md-body">${mdToHtml(content)}</div></div>`;
+  stream.appendChild(div);
+  scrollChatBottom();
+}
+
+/* coach 问答输入框：问题已作为气泡上屏，这里只放回复输入（发送时把用户回复先上屏再 resume） */
+function showCoachReplyInput() {
+  const el = runStatusEl();
+  el.innerHTML =
+    `<div class="interrupt-panel coach-panel">` +
+    `<div class="interrupt-custom coach-reply">` +
+    `<input id="coachReply" type="text" placeholder="回复陪练…（输入 结束 可退出）" />` +
+    `<button class="btn-primary" data-coach-send type="button">发送</button>` +
+    `</div></div>`;
+  el.hidden = false;
+  scrollChatBottom();
+  const input = el.querySelector("#coachReply");
+  const send = () => {
+    const v = (input.value || "").trim();
+    if (!v) return;
+    showUserMessage(v); // 用户回复先上屏（final 时由权威状态重渲染）
+    resume(v);
+  };
+  el.querySelector("[data-coach-send]").addEventListener("click", send);
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  input.focus();
+}
+
 async function resume(answer) {
   const { activeId } = getState();
   if (!activeId) return;
-  setState({ running: true, noteRunning: true });
+  const kind = interruptKind === "coach" ? "task" : "note";
+  setState({ running: true });
+  if (kind === "note") setState({ noteRunning: true });
   showRunStatus();
   try {
     await resumeSession(activeId, answer);
-    attachStream(activeId, "note"); // 恢复的是 note 合并流，final 时清理 pending
+    attachStream(activeId, kind); // coach → task 流；note → note 流
   } catch (err) {
     if (err.status === 409) {
-      attachStream(activeId, "note");
+      attachStream(activeId, kind);
     } else {
-      // resume 启动失败：interrupt 仍挂在后端，重置状态并恢复决策面板，避免卡死「执行中」反复重试
+      // resume 启动失败：interrupt 仍挂在后端，重置状态并恢复面板，避免卡死「执行中」反复重试
       setState({ running: false, noteRunning: false });
       renderInputZone();
       showError(err.message);
-      const pending = (getState().notePending || {})[activeId];
-      if (pending) showInterrupt(pending);
+      if (kind === "note") {
+        const pending = (getState().notePending || {})[activeId];
+        if (pending) showInterrupt(pending);
+      } else if (coachPayload) {
+        showCoachReplyInput();
+      }
     }
   }
 }
@@ -515,7 +602,16 @@ async function refreshActive() {
     const detail = await getSession(activeId);
     const sessions = await listSessions();
     setState({ active: detail, sessions });
-    // 安全网：SSE 未收到 interrupt 但后端已暂停（如刷新/切走再回）→ 恢复决策面板
+    // 安全网：SSE 未收到 interrupt 但后端已暂停（如刷新/切走再回）→ 恢复面板
+    if (detail.pending_coach) {
+      interruptKind = "coach";
+      coachPayload = detail.pending_coach;
+      setState({ running: false, coachPending: { ...getState().coachPending, [activeId]: detail.pending_coach } });
+      renderChat();
+      appendAiMessage(detail.pending_coach.message || "");
+      showCoachReplyInput();
+      return;
+    }
     if (detail.pending_note) {
       setState({ notePending: { ...getState().notePending, [activeId]: detail.pending_note.candidates_text } });
       renderChat();

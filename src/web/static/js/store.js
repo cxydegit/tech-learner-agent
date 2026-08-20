@@ -15,6 +15,7 @@ const state = {
   running: false,
   noteRunning: false,        // 当前 note 流进行中（一键沉淀）
   notePending: {},           // thread_id → merge 候选文本，跨会话/跨刷新保持，等待用户决策
+  coachPending: {},          // thread_id → coach 问题负载（定制路线问答暂停，等用户回复）
   currentDoc: null,
   docsCache: {},
   view: "chat",          // chat(对话流) / docs(资料库浏览)

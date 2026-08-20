@@ -1,0 +1,526 @@
+"""coach agent 循环的提示词 + 工具实现（模块 2 定制化学习路线）。
+
+定位：pipelines 层，prompts 就近存放；graph.py 的 coach 节点组负责循环编排，
+本模块只提供"单次往返"需要的东西——按 mode 的系统提示词、各模式可用工具
+schema、工具执行（大内容写文件、出入参短，工具可经 ctx.updates 请求状态变更）。
+
+Step 1-3 范围：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练，
+完整工具在后续阶段接入；现为对话 stub）。
+"""
+
+import json
+
+from ..adapters import learner
+from ..adapters.llm import generate_text
+from ..domain import roadmap as roadmap_domain
+from ..domain import survey
+from .collect import collect_pipeline
+from .note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
+from .qa import qa_pipeline
+from .read import read_pipeline
+
+# ============================================================
+# coach 系统提示词（按 mode）
+# ============================================================
+
+_FIELD_LABELS = {
+    "self_level": "自评熟悉度（0-10）",
+    "related": "相关技术",
+    "goal": "学习目标",
+    "time_budget": "时间预算",
+}
+_FIELD_HINTS = {
+    "self_level": "0-10 之间的数字",
+    "related": "自由文本（没有就填「无」）",
+    "goal": "「快速上手跑通最小项目」或「深入原理」",
+    "time_budget": "每天小时数（如 2）",
+}
+
+
+def _survey_prompt(state, tech: str) -> str:
+    answers = state.get("survey_answers") or {}
+    field = state.get("survey_field")
+    profile = state.get("learner_profile") or {}
+    field_label = _FIELD_LABELS.get(field) if field else "动态诊断题"
+    answers_txt = "；".join(f"{k}={v}" for k, v in answers.items()) or "（暂无）"
+    profile_txt = survey.profile_summary(profile) if profile else "（尚未推导）"
+    diag_remaining = max(survey.DIAGNOSTIC_QUESTIONS_MAX - len(answers.get("diagnostics") or []), 0)
+    lines = [
+        f"你是「技术学习陪练」的水平探测助手。用户要学习：{tech}。",
+        "通过一轮简短问卷了解用户水平，为后续定制学习路线收集信息。",
+        "",
+        "当前问卷状态：",
+        f"- 正在收集字段：{field_label}",
+        f"- 已收集：{answers_txt}",
+        f"- 用户画像（参考调整语气）：{profile_txt}",
+        "",
+        "规则：",
+        f"1. 一次只问一个问题，且只问「正在收集字段」对应的问题：{field_label}。",
+    ]
+    if field:
+        lines.append(f"2. 该字段用户需要回答成：{_FIELD_HINTS.get(field)}。")
+        lines.append("3. 只输出问题本身，不要编号、解释或寒暄；根据画像调整语气（小白少用术语、多类比）。")
+    else:
+        lines.append(f"2. 固定字段已收齐，进入动态出题：基于画像出 1 道与「{tech}」相关的小诊断题（概念题/选择题），检验前置知识；还需 {diag_remaining} 道。")
+        lines.append("3. 只输出题目本身；根据画像调整难度与语气。")
+    lines.append("4. 若收到一条【问卷校验】内部提示，说明用户上一条回答格式不对，请按提示重新问同一个字段。")
+    return "\n".join(lines)
+
+
+def _planning_prompt(state, tech: str) -> str:
+    profile = state.get("learner_profile") or {}
+    summary = survey.profile_summary(profile) if profile else "（问卷信息缺失）"
+    conv = (state.get("coach_summary") or "").strip()
+    conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
+    return (
+        f"你是「技术学习陪练」的路线规划助手。用户要学习：{tech}。\n"
+        f"用户水平画像：{summary}{conv_block}\n"
+        "任务：为用户生成一份个性化、可执行的分阶段学习路线（3-5 个阶段，每阶段含可检验的里程碑）。\n"
+        "步骤：\n"
+        "1. 调用 generate_roadmap 生成路线（goal / total_hours / stages；stages 含 name/goal/materials/est_hours/milestones）。\n"
+        "2. 把生成后的路线（阶段、里程碑、预估时长）用 Markdown 完整呈现给用户，请用户确认或提出修改。\n"
+        "3. 用户确认后调用 confirm_roadmap 进入执行阶段；用户提出修改时，带上修改意见重新调用 generate_roadmap。\n"
+        "规则：\n"
+        "- 路线必须贴合用户水平：技术小白从环境搭建和最小 demo 起步、拆小步；开发者可跳过基础直达要点。\n"
+        "- 里程碑必须是可检验的动作（如「本地跑通 hello world」「能用 XX 完成一个接口」），不要空洞目标。\n"
+        "- 阶段按依赖排序，每阶段给出预估小时数。\n"
+        "- materials 可引用已收集的资料或留空（留空由后续 collect 补充）。\n"
+        "- 不要编造资料链接；没有的信息写「待收集」。"
+    )
+
+
+def _coaching_prompt(state, tech: str) -> str:
+    roadmap = state.get("roadmap")
+    prog = ""
+    if roadmap:
+        prog = "\n\n当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap)
+    conv = (state.get("coach_summary") or "").strip()
+    conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
+    return (
+        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}{conv_block}\n\n"
+        "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ note（沉淀笔记）/ "
+        "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）。"
+        "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
+        "不要原样堆砌。里程碑完成时用 update_roadmap 勾选。"
+    )
+
+
+def coach_system_prompt(state) -> str:
+    """按 mode 挑选 coach 系统提示词（survey / planning / coaching）。"""
+    mode = state.get("mode") or "survey"
+    tech = state.get("tech") or ""
+    if mode == "planning":
+        return _planning_prompt(state, tech)
+    if mode == "coaching":
+        return _coaching_prompt(state, tech)
+    return _survey_prompt(state, tech)
+
+
+# ============================================================
+# 工具 schema（OpenAI function calling 格式）
+# ============================================================
+
+GENERATE_ROADMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "generate_roadmap",
+        "description": "根据用户水平画像生成或修订学习路线（阶段+里程碑）。修订时把改动说明写进 revision，stages 给出完整新结构。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "学习总目标（一句话，可复用问卷目标）"},
+                "total_hours": {"type": "integer", "description": "预估总学习时长（小时）"},
+                "revision": {"type": "string", "description": "修订说明；首次生成填空字符串"},
+                "stages": {
+                    "type": "array",
+                    "description": "学习阶段列表（3-5 个，按依赖排序）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "阶段名（如 环境搭建 / 核心概念 / 实战项目 / 进阶调优）"},
+                            "goal": {"type": "string", "description": "本阶段目标"},
+                            "materials": {"type": "string", "description": "推荐资料（可留空由后续 collect 补充）"},
+                            "est_hours": {"type": "integer", "description": "本阶段预估小时数"},
+                            "milestones": {
+                                "type": "array",
+                                "description": "可检验的里程碑（完成一个可检验动作才算通关）",
+                                "items": {"type": "object",
+                                          "properties": {"desc": {"type": "string"}},
+                                          "required": ["desc"]},
+                            },
+                        },
+                        "required": ["name", "goal", "est_hours", "milestones"],
+                    },
+                },
+            },
+            "required": ["goal", "total_hours", "stages"],
+        },
+    },
+}
+
+CONFIRM_ROADMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "confirm_roadmap",
+        "description": "用户已确认路线，进入执行阶段。调用前必须先把路线完整呈现给用户并获得明确确认。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+GET_ROADMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_roadmap",
+        "description": "获取当前学习路线（阶段 / 当前阶段 / 里程碑进度）。",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
+COLLECT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "collect",
+        "description": "搜索并筛选某个技术的学习资料，生成资料清单报告（保存到 materials/）。耗时较长，会推送进度。",
+        "parameters": {"type": "object", "properties": {
+            "tech": {"type": "string", "description": "技术名称（如 Spring Boot）"},
+            "focus": {"type": "string", "description": "可选，关注点（如 异步编程）"},
+        }, "required": ["tech"]},
+    },
+}
+
+READ_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "read",
+        "description": "抓取并解读一篇技术文档（URL），生成结构化解读报告（保存到 reports/）。",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string", "description": "文档完整 URL"},
+        }, "required": ["url"]},
+    },
+}
+
+NOTE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "note",
+        "description": "把一段学习内容沉淀为知识笔记（差量提取；有相似笔记时返回候选待用户确认，用户决定后再调 note_commit）。content 必须短（≤2000 字）。",
+        "parameters": {"type": "object", "properties": {
+            "tech": {"type": "string", "description": "技术名称"},
+            "content": {"type": "string", "description": "本次要沉淀的学习内容（较短，≤2000 字）"},
+        }, "required": ["tech", "content"]},
+    },
+}
+
+NOTE_COMMIT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "note_commit",
+        "description": "用户对相似笔记候选做出决定后提交沉淀。decision 传用户原话（如 all / 1,3 / skip）。",
+        "parameters": {"type": "object", "properties": {
+            "decision": {"type": "string", "description": "用户原话：all 全合并 / 编号逗号分隔逐条（如 1,3）/ skip 全部跳过"},
+        }, "required": ["decision"]},
+    },
+}
+
+ASK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "ask",
+        "description": "向用户的知识笔记库提问并综合回答（跨笔记联想检索，带来源标注）。",
+        "parameters": {"type": "object", "properties": {
+            "question": {"type": "string", "description": "要问的问题"},
+        }, "required": ["question"]},
+    },
+}
+
+UPDATE_ROADMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "update_roadmap",
+        "description": "勾选/取消勾选一个里程碑（完成一个可检验的动作后调用），自动推进当前阶段。",
+        "parameters": {"type": "object", "properties": {
+            "milestone_id": {"type": "string", "description": "里程碑 id（如 s1-m1）"},
+            "done": {"type": "boolean", "description": "true 勾选 / false 取消"},
+        }, "required": ["milestone_id"]},
+    },
+}
+
+COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
+    "survey": [],
+    "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA, GET_ROADMAP_SCHEMA],
+    "coaching": [COLLECT_SCHEMA, READ_SCHEMA, NOTE_SCHEMA, NOTE_COMMIT_SCHEMA, ASK_SCHEMA,
+                 GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA],
+}
+
+
+# ============================================================
+# 工具实现（出入参短；大内容写文件）
+# ============================================================
+
+
+class CoachCtx:
+    """coach 工具执行上下文（graph 层构造）。updates 由工具写入，graph 节点合并进状态。
+
+    progress 为 Web 端流式进度回调（graph 层经 _get_progress 从注册表取，CLI 为 None 静默）。
+    """
+
+    def __init__(self, state: dict, *, progress=None, thread_id: str | None = None):
+        self.state = state
+        self.updates: dict = {}
+        self.progress = progress
+        self.thread_id = thread_id  # 当前图会话的 thread_id（路线恢复定位用）
+
+    # 属性读取：先查本批工具产生的 updates（同一 assistant 消息的多个 tool_calls 可见彼此
+    # 的更新），再回退到 graph 状态——保证同批多次调用（如连勾两个里程碑）不读到旧值。
+    @property
+    def tech(self) -> str:
+        return self.updates.get("tech", self.state.get("tech") or "")
+
+    @property
+    def survey_answers(self) -> dict:
+        return self.state.get("survey_answers") or {}
+
+    @property
+    def learner_profile(self) -> dict:
+        return self.state.get("learner_profile") or {}
+
+    @property
+    def materials_path(self) -> str | None:
+        return self.updates.get("materials_path", self.state.get("materials_path"))
+
+    @property
+    def roadmap(self):
+        return self.updates.get("roadmap", self.state.get("roadmap"))
+
+
+def _generate_roadmap(args: dict, ctx: CoachCtx) -> dict:
+    goal = str(args.get("goal") or "").strip()
+    total_hours = args.get("total_hours")
+    stages = args.get("stages") or []
+    if not goal or not isinstance(total_hours, int) or total_hours <= 0 or not stages:
+        return {"status": "error", "error": "缺少 goal / total_hours / stages",
+                "hint": "请按 generate_roadmap 的 schema 补全后重试"}
+    norm, errors = roadmap_domain.normalize_stages(stages)
+    if not norm:
+        return {"status": "error", "errors": errors or ["没有合法阶段"],
+                "hint": "请修正阶段结构（每阶段至少 1 个里程碑）后重新调用 generate_roadmap"}
+    roadmap = roadmap_domain.build_roadmap(ctx.tech, goal, total_hours, norm)
+    # 记录生成路线的会话线程：CLI「按技术名继续上次陪练」靠它定位恢复
+    if ctx.thread_id:
+        roadmap["session_thread_id"] = ctx.thread_id
+    jp = learner.save_roadmap(roadmap)
+    ctx.updates["roadmap"] = roadmap
+    ctx.updates["roadmap_path"] = str(jp)
+    # 画像落盘（profile.json 按 tech 归档；不含诊断题原文）
+    if ctx.learner_profile:
+        entry = {k: v for k, v in ctx.learner_profile.items() if k != "diagnostics"}
+        entry["roadmap_path"] = str(jp)
+        try:
+            learner.save_tech_profile(ctx.tech, entry)
+        except Exception:  # noqa: BLE001 —— 画像落盘失败不阻断路线生成
+            pass
+    return {
+        "status": "ok",
+        "roadmap_path": str(jp),
+        "stages": [{"id": s["id"], "name": s["name"], "est_hours": s["est_hours"]} for s in roadmap["stages"]],
+        "current_stage": roadmap["current_stage"],
+        "total_hours": roadmap["total_hours"],
+        "note": "路线已保存。请把路线完整呈现给用户确认；用户确认后调用 confirm_roadmap。",
+    }
+
+
+def _confirm_roadmap(args: dict, ctx: CoachCtx) -> dict:
+    if not ctx.roadmap:
+        return {"status": "error", "error": "还没有路线，请先调用 generate_roadmap"}
+    ctx.updates["mode"] = "coaching"
+    return {"status": "ok", "current_stage": ctx.roadmap.get("current_stage"),
+            "note": "路线已确认，进入执行阶段（coaching）。"}
+
+
+def _get_roadmap(args: dict, ctx: CoachCtx) -> dict:
+    r = ctx.roadmap
+    if not r:
+        return {"status": "ok", "roadmap": None, "note": "还没有生成路线"}
+    return {
+        "status": "ok", "tech": r.get("tech"), "goal": r.get("goal"),
+        "total_hours": r.get("total_hours"), "current_stage": r.get("current_stage"),
+        "stages": [{"id": s.get("id"), "name": s.get("name"), "goal": s.get("goal"),
+                    "est_hours": s.get("est_hours"),
+                    "milestones": [{"id": m.get("id"), "desc": m.get("desc"), "done": m.get("done")}
+                                   for m in s.get("milestones") or []]}
+                   for s in r.get("stages") or []],
+    }
+
+
+def _collect(args: dict, ctx: CoachCtx) -> dict:
+    tech = str(args.get("tech") or "").strip() or ctx.tech
+    if not tech:
+        return {"status": "error", "error": "collect 需要 tech"}
+    focus = str(args.get("focus") or "").strip() or None
+    try:
+        result = collect_pipeline(tech, focus, progress=ctx.progress)
+    except Exception as e:  # noqa: BLE001 —— 回喂模型修正
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    ctx.updates["coach_doc"] = {"path": result["materials_path"], "type": "collect"}
+    return {"status": "ok", "materials_path": result["materials_path"],
+            "url_count": len(result["urls"]),
+            "report_excerpt": (result["report"] or "")[:800],
+            "note": "资料报告已保存，可据此推进学习。"}
+
+
+def _read(args: dict, ctx: CoachCtx) -> dict:
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"status": "error", "error": "read 需要 url"}
+    try:
+        result = read_pipeline(url, progress=ctx.progress)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    if result.get("error"):
+        return {"status": "error", "error": result["error"]}
+    ctx.updates["coach_doc"] = {"path": result["report_path"], "type": "read"}
+    return {"status": "ok", "report_path": result["report_path"], "title": result.get("title"),
+            "report_excerpt": (result["report"] or "")[:800]}
+
+
+def _ask(args: dict, ctx: CoachCtx) -> dict:
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return {"status": "error", "error": "ask 需要 question"}
+    try:
+        result = qa_pipeline(question, tech=ctx.tech or None, progress=ctx.progress)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    return {"status": "ok", "answer": result["answer"],
+            "sources": [{"path": s.get("path"), "topic": s.get("topic"),
+                         "similarity": s.get("similarity")} for s in result["sources"]],
+            "no_hit": result["no_hit"]}
+
+
+def _note(args: dict, ctx: CoachCtx) -> dict:
+    tech = str(args.get("tech") or "").strip() or ctx.tech
+    content = str(args.get("content") or "").strip()
+    if not tech or not content:
+        return {"status": "error", "error": "note 需要 tech 和 content（≤2000 字）"}
+    try:
+        result = note_pipeline(tech, content, materials_path=ctx.materials_path, progress=ctx.progress)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    if result.get("empty_reason"):
+        return {"status": "empty", "reason": result["empty_reason"]}
+    if result["merge_candidates"]:
+        # 相似候选暂存状态，等用户决定后再 note_commit（复用现有 format/parse 纯函数）
+        ctx.updates["coach_note_pending"] = {**result, "_tech": tech}
+        return {"status": "needs_decision",
+                "message": format_merge_candidates(result["merge_candidates"]),
+                "note": "把上面的候选呈现给用户，让用户回复 all（全合并）/ 编号逐条（如 1,3）/ skip（跳过）；用户决定后调用 note_commit，decision 传用户原话。"}
+    persisted = persist_points(tech, result["new_points"], [], set())
+    return {"status": "ok", "new_count": persisted["new_count"], "merged_count": 0,
+            "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
+                        for r in persisted["results"]]}
+
+
+def _note_commit(args: dict, ctx: CoachCtx) -> dict:
+    pending = ctx.state.get("coach_note_pending")
+    if not pending:
+        return {"status": "error", "error": "没有待确认的笔记，请先调用 note"}
+    decision = str(args.get("decision") or "").strip()
+    tech = pending.get("_tech") or ctx.tech
+    indices = parse_merge_decision(decision, len(pending["merge_candidates"]))
+    persisted = persist_points(tech, pending["new_points"], pending["merge_candidates"], indices)
+    ctx.updates["coach_note_pending"] = None  # 提交后清掉，避免重复提交
+    return {"status": "ok", "new_count": persisted["new_count"], "merged_count": persisted["merged_count"],
+            "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
+                        for r in persisted["results"]]}
+
+
+def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
+    r = ctx.roadmap
+    if not r:
+        return {"status": "error", "error": "还没有路线，请先走问卷 + 路线规划"}
+    milestone_id = str(args.get("milestone_id") or "").strip()
+    done = bool(args.get("done", True))
+    if not milestone_id:
+        return {"status": "error", "error": "update_roadmap 需要 milestone_id（如 s1-m1）"}
+    try:
+        updated = roadmap_domain.complete_milestone(r, milestone_id, done)
+    except KeyError:
+        ids = [m["id"] for s in (r.get("stages") or [])
+               for m in (s.get("milestones") or [])]
+        return {"status": "error", "error": f"未知里程碑 {milestone_id}", "available": ids}
+    learner.save_roadmap(updated)
+    ctx.updates["roadmap"] = updated
+    prog = roadmap_domain.stage_progress(updated, updated["current_stage"])
+    return {"status": "ok", "milestone_id": milestone_id, "done": done,
+            "current_stage": updated["current_stage"],
+            "progress": f"{prog['done']}/{prog['total']}",
+            "roadmap_status": updated.get("status")}
+
+
+_TOOL_IMPL = {
+    "generate_roadmap": _generate_roadmap,
+    "confirm_roadmap": _confirm_roadmap,
+    "get_roadmap": _get_roadmap,
+    "collect": _collect,
+    "read": _read,
+    "ask": _ask,
+    "note": _note,
+    "note_commit": _note_commit,
+    "update_roadmap": _update_roadmap,
+}
+
+
+def run_coach_tool(name: str, args: dict, ctx: CoachCtx) -> dict:
+    """按名分发工具；未知工具返回错误（护栏层保证不会出现）。"""
+    fn = _TOOL_IMPL.get(name)
+    if fn is None:
+        return {"status": "error", "error": f"未知工具: {name}"}
+    return fn(args, ctx)
+
+
+# ============================================================
+# 上下文压缩：会话摘要（Step 4 落地，提示词待用户审核）
+# ============================================================
+
+SUMMARIZE_COACH_PROMPT = """你是一个学习会话的摘要助手。把一段较长的对话压缩成一条精炼摘要，供后续对话继续使用（作为长期上下文）。
+
+## 必须保留
+- 用户的身份信息与学习偏好（技术水平、目标、时间预算）
+- 学习进度（已学内容、已完成里程碑、当前阶段）
+- 未解决的问题 / 待办事项 / 用户明确提出的问题
+- 已做出的决定（如路线确认、笔记合并决策）
+
+## 必须丢弃
+- 寒暄、重复、与学习无关的闲聊、工具执行的内部细节
+
+## 要求
+- 只输出一段纯文本，不要标题、不要列表符号、不要"摘要："前缀
+- 信息密度高，控制在 200 字以内"""
+
+
+def summarize_conversation(existing_summary: str, messages: list[dict], tech: str) -> str:
+    """把旧对话消息压缩成摘要（叠加既有摘要），供 coach 长期上下文使用。
+
+    Args:
+        existing_summary: 上一轮的摘要（可为空）
+        messages: 待压缩的消息（只取 user/assistant 文本，工具结果机器态不入摘要）
+        tech: 技术名
+
+    Returns:
+        新摘要（非空）；LLM 失败时降级为既有摘要（调用方决定是否丢弃旧消息）。
+    """
+    parts = []
+    for m in messages:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            parts.append(f"{m['role']}：{m['content']}")
+    block = "\n".join(parts[-50:])  # 单次压缩输入封顶，防止摘要调用过长
+    if not block.strip():
+        return existing_summary
+    user_content = (f"技术：{tech}\n"
+                    f"已有摘要：{existing_summary or '（无）'}\n"
+                    f"===== 待压缩对话 =====\n{block}")
+    try:
+        text = generate_text(SUMMARIZE_COACH_PROMPT, user_content).strip()
+        return text or existing_summary
+    except Exception:  # noqa: BLE001 —— LLM 不可用时保留旧摘要
+        return existing_summary

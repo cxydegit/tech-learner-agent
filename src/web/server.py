@@ -61,6 +61,8 @@ def _build_payload(req: RunRequest) -> dict:
         return parse_card_input("collect", tokens)
     if cmd == "note":
         return {"command": "note"}
+    if cmd == "route":
+        return parse_card_input("route", [(req.tech or "").strip()])
     return parse_card_input(cmd, req.args or [])
 
 

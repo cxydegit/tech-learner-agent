@@ -4,6 +4,7 @@
 管道共用的 current_time_label / replace_time_line（Step 1 修复时间编造的产物）。
 """
 
+import json
 import re
 from datetime import datetime
 
@@ -53,6 +54,84 @@ def generate_text(system_prompt: str, user_content: str) -> str:
         ],
     )
     return response.choices[0].message.content
+
+
+# ============================================================
+# 工具调用通道（coach agent 循环用）
+# 与 generate_text 的区别：向模型暴露 tools 定义，模型可返回 tool_calls。
+# RISKS 教训的回应：大内容走文件、工具出入参短、失败回退——由 graph 层护栏兜底。
+# ============================================================
+
+
+class ToolCallError(Exception):
+    """工具调用通道持久失败（重试 + 回退后仍失败），由 graph 层降级处理。"""
+
+
+def _parse_chat_response(msg) -> dict:
+    """把 openai 响应消息转成统一 dict：{content, tool_calls:[{id,name,arguments}]}。
+
+    arguments 是 JSON 字符串，解析失败兜底为 {}（graph 层护栏会拦截异常参数）。
+    """
+    tool_calls = []
+    for tc in (getattr(msg, "tool_calls", None) or []):
+        args = tc.function.arguments or ""
+        try:
+            args_obj = json.loads(args) if args.strip() else {}
+        except Exception:  # noqa: BLE001 —— 模型给的 arguments 不合法 JSON，兜底空 dict
+            args_obj = {}
+        tool_calls.append({"id": tc.id, "name": tc.function.name, "arguments": args_obj})
+    return {"content": msg.content, "tool_calls": tool_calls}
+
+
+def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
+                    *, max_tokens: int | None = None) -> dict:
+    """执行一次带原生工具定义的对话补全。
+
+    与 generate_text 的定位不同：generate_text 是"单次生成"，适用于确定性管道；
+    chat_with_tools 暴露工具，模型可返回 tool_calls，供 coach 循环反复调用。
+
+    Args:
+        system_prompt: 系统提示词（mode 相关，由调用方按模式挑选）
+        messages: 历史消息（dict 列表，含 role/content/tool_calls/tool_call_id），
+            格式对齐 openai 兼容接口（DashScope 支持原生 tool_calls）
+        tools: OpenAI function 定义列表
+        max_tokens: 可选，覆盖 config.LLM_MAX_TOKENS
+
+    Returns:
+        {"content": str | None, "tool_calls": [{id, name, arguments(dict)}], "fallback": bool}
+        - 模型决定调用工具：content 可为 None、tool_calls 非空
+        - 模型直接回复文本：tool_calls 为空
+        - 持久失败且 config.ROUTE_FALLBACK_TO_TEXT：去掉 tools 再问一次，返回纯文本
+          （fallback=True，调用方可感知降级）
+        - 全部失败：抛 ToolCallError
+    """
+    messages_payload = [{"role": "system", "content": system_prompt}, *messages]
+    kwargs: dict = {
+        "model": config.LLM_MODEL,
+        "temperature": 0.5,
+        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+        "messages": messages_payload,
+    }
+    last_err: Exception | None = None
+    for attempt in range(3):  # 瞬时故障（网络/400）重试
+        try:
+            kwargs["tools"] = tools
+            client = OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+            response = client.chat.completions.create(**kwargs)
+            return _parse_chat_response(response.choices[0].message)
+        except Exception as e:  # noqa: BLE001 —— 网络 / 400 / 解析，尝试重试或降级
+            last_err = e
+    if config.ROUTE_FALLBACK_TO_TEXT:
+        try:
+            kwargs.pop("tools", None)
+            client = OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+            response = client.chat.completions.create(**kwargs)
+            parsed = _parse_chat_response(response.choices[0].message)
+            parsed["fallback"] = True
+            return parsed
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise ToolCallError(str(last_err)) from last_err
 
 
 # ============================================================

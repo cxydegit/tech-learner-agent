@@ -182,6 +182,122 @@ def index(force: bool = False):
             console.print(f"  [dim]{e}[/dim]")
 
 
+def _route_threads() -> list[dict]:
+    """读取所有定制路线会话线程（state.command == "route"）的最新状态，供 --list 找回。"""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    if not config.GRAPH_DB_PATH.exists():
+        return []
+    rows = []
+    seen: set[str] = set()
+    with SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH)) as saver:
+        for tup in saver.list(None):  # checkpoint_id 降序 → 每线程第一个即最新
+            tid = (tup.config.get("configurable") or {}).get("thread_id")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            ckpt = tup.checkpoint
+            values = ckpt.get("channel_values") if isinstance(ckpt, dict) else {}
+            if values.get("command") != "route":
+                continue
+            conv = values.get("conversation") or []
+            rows.append({
+                "thread_id": tid,
+                "tech": values.get("tech") or "",
+                "title": values.get("title") or "",
+                "updated_at": (conv[-1].get("ts") if conv else "") or "",
+            })
+    return rows
+
+
+def _thread_values(thread_id: str) -> dict:
+    """读取某会话线程的最新 checkpoint 状态（--resume 时自动取 tech 等字段）。"""
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    if not config.GRAPH_DB_PATH.exists():
+        return {}
+    try:
+        with SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH)) as saver:
+            tup = saver.get_tuple({"configurable": {"thread_id": thread_id}})
+            if tup is None:
+                return {}
+            ckpt = tup.checkpoint
+            return ckpt.get("channel_values") if isinstance(ckpt, dict) else {}
+    except Exception:  # noqa: BLE001 —— 线程读取失败按空处理
+        return {}
+
+
+def _list_route_threads() -> None:
+    """打印所有 route 会话线程（找回入口）。"""
+    rows = _route_threads()
+    if not rows:
+        console.print("[dim]暂无定制路线会话（先运行 route <技术名>）[/dim]")
+        return
+    console.print("[bold]已有的定制路线会话：[/bold]")
+    for r in sorted(rows, key=lambda x: x["updated_at"], reverse=True):
+        console.print(f"  [bold]{r['thread_id']}[/bold]  {r['tech'] or r['title'] or ''}"
+                      f"[dim]  {r['updated_at'] or ''}[/dim]")
+    console.print("[dim]恢复：route <技术名> --resume <thread_id>[/dim]")
+
+
+@cli.command()
+@click.argument("tech_name", required=False)
+@click.option("--list", "list_threads", is_flag=True, help="列出所有定制路线会话（找回用）")
+@click.option("--resume", "resume_thread", default=None, help="恢复指定会话线程（thread_id 见 --list）")
+def route(tech_name: str = None, list_threads: bool = False, resume_thread: str = None):
+    """定制学习路线：问卷 → 学习路线 → 执行陪练（coach agent 循环）。
+
+    TECH_NAME: 要学习的技术名（含空格需加引号）；不传则交互式询问。
+
+    --list:   列出所有定制路线会话。
+    --resume: 恢复指定会话线程（退出后继续上次陪练；thread_id 见 --list）。
+    """
+    from .adapters import learner as learner_mod
+    from .graph import open_graph
+
+    if list_threads:
+        _list_route_threads()
+        return
+
+    # --resume 且未给技术名：从该线程状态读取 tech，避免重复输入
+    if resume_thread and not tech_name:
+        tech_name = _thread_values(resume_thread).get("tech") or ""
+
+    if not tech_name:
+        try:
+            tech_name = input("要学习哪个技术？> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            tech_name = ""
+    parsed = parse_card_input("route", [tech_name] if tech_name else [])
+    if parsed.get("error"):
+        console.print(f"[yellow]{parsed['error']}[/yellow]")
+        return
+
+    thread_id = resume_thread or None
+    if thread_id is None:
+        # 检测已有路线 → 询问继续 / 重新规划（roadmap.json 记录了生成它的会话线程）
+        existing = learner_mod.load_roadmap(parsed["tech"])
+        if existing and existing.get("session_thread_id"):
+            thread_id = existing["session_thread_id"]
+            console.print(Panel(
+                f"目标：{existing.get('goal') or ''}\n"
+                f"当前阶段：{existing.get('current_stage') or ''}",
+                title=f"🧭 已有「{parsed['tech']}」学习路线", style="cyan"))
+            ans = input("[c] 继续上次陪练  [n] 重新规划  [回车] 退出 > ").strip().lower()
+            if ans in ("n", "new", "重"):
+                thread_id = None  # 重新规划 → 新会话
+            elif ans not in ("c", "continue", "继续", "y", "yes"):
+                return  # 回车/其他 → 退出
+
+    if thread_id is None:
+        thread_id = f"route-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        console.print(Panel(f"🧭 开始定制「{parsed['tech']}」的学习路线（问卷 → 路线 → 陪练）", style="bold blue"))
+    else:
+        console.print(Panel(f"🧭 继续「{parsed['tech']}」的定制路线（会话 {thread_id}）", style="bold blue"))
+
+    with open_graph() as graph:
+        gconfig = {"configurable": {"thread_id": thread_id}}
+        _drive(graph, gconfig, parsed, render="markdown")
+
+
 # ============================================================
 # note 交互辅助
 # ============================================================
@@ -302,7 +418,9 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
     from langgraph.types import Command
 
     while True:
-        stream = graph.stream_events(payload, gconfig, version="v3")
+        # recursion_limit 是运行 config 的一部分（防 coach 循环失控打转）
+        run_config = {**gconfig, "recursion_limit": gconfig.get("recursion_limit", config.ROUTE_RECURSION_LIMIT)}
+        stream = graph.stream_events(payload, run_config, version="v3")
         if not stream.interrupted:
             final = stream.output
             last = (final or {}).get("last_output")
@@ -314,7 +432,16 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
             return final
         resumed = False
         for intr in stream.interrupts:
-            console.print(f"\n[bold cyan]🧭 {intr.value}[/bold cyan]")
+            val = intr.value
+            if isinstance(val, dict) and val.get("type") == "coach_question":
+                # coach 循环：interrupt 负载是结构化问题（mode / tech / message）
+                mode = val.get("mode") or ""
+                tech = val.get("tech") or ""
+                badge = f"🧭 [{mode}]{(' ' + tech) if tech else ''}"
+                console.print(f"\n[bold cyan]{badge}[/bold cyan]")
+                console.print(Markdown(val.get("message") or ""))
+            else:
+                console.print(f"\n[bold cyan]🧭 {val}[/bold cyan]")
             payload = Command(resume=input("> ").strip())
             resumed = True
         if not resumed:

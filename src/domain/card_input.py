@@ -52,4 +52,9 @@ def parse_card_input(command: str, tokens: list[str]) -> dict:
         if not question:
             return {"error": _REQUIRED_MESSAGES["ask"]}
         return {"command": "qa", "args": [question]}
+    if command == "route":
+        tech = " ".join((t or "").strip() for t in tokens).strip()
+        if not tech:
+            return {"error": "请输入技术名"}
+        return {"command": "route", "tech": tech}
     return {"error": f"未知命令: {command}"}

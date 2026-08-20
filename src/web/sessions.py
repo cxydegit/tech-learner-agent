@@ -31,19 +31,30 @@ def _get_state_values(tup) -> dict:
     return {}
 
 
-def _pending_note_interrupt(tup) -> dict | None:
-    """从 CheckpointTuple.pending_writes 读 note 合并确认的 interrupt 负载。
+def _pending_interrupt(tup) -> dict | None:
+    """从 CheckpointTuple.pending_writes 读任意 interrupt 负载。
 
     langgraph 的 interrupt() 以 __interrupt__ channel 写 pending write（value=[Interrupt(...)]）。
-    本应用唯一 interrupt 即 note 合并确认。命中返回 {candidates_text}，否则 None。
+    返回值：{"kind": "coach_question", "value": dict} 或 {"kind": "merge_candidates", "value": str}；
+    无 pending interrupt 返回 None。
     """
     for _tid, channel, value in (tup.pending_writes or []):
         if channel == "__interrupt__" and value:
             try:
-                text = value[0].value if hasattr(value[0], "value") else str(value[0])
+                v = value[0].value if hasattr(value[0], "value") else str(value[0])
             except Exception:  # noqa: BLE001 —— 兜底取值，失败用 str 表示
-                text = str(value[0])
-            return {"candidates_text": text}
+                v = str(value[0])
+            if isinstance(v, dict) and v.get("type") == "coach_question":
+                return {"kind": "coach_question", "value": v}
+            return {"kind": "merge_candidates", "value": v}
+    return None
+
+
+def _pending_note_interrupt(tup) -> dict | None:
+    """向后兼容：仅当 pending interrupt 是 note 合并确认时返回 {candidates_text}。"""
+    p = _pending_interrupt(tup)
+    if p and p["kind"] == "merge_candidates":
+        return {"candidates_text": p["value"]}
     return None
 
 
@@ -170,9 +181,12 @@ def get_session(thread_id: str) -> dict | None:
             "qa_history": values.get("qa_history") or [],
         },
     }
-    pending = _pending_note_interrupt(tup)
+    pending = _pending_interrupt(tup)
     if pending:
-        result["pending_note"] = pending
+        if pending["kind"] == "coach_question":
+            result["pending_coach"] = pending["value"]  # 前端据此恢复 coach 问答面板
+        else:
+            result["pending_note"] = {"candidates_text": pending["value"]}
     return result
 
 

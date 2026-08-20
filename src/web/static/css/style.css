@@ -370,6 +370,11 @@ button { font-family: inherit; cursor: pointer; }
 .interrupt-custom input:focus { outline: none; border-bottom-color: var(--accent); box-shadow: 0 1px 0 0 var(--accent); }
 .interrupt-custom .btn-primary { margin: 0; }
 
+/* ============ coach 问答（定制路线） ============ */
+.coach-panel .coach-q { margin: 0 0 6px; font-size: 13px; color: var(--ink); }
+.coach-reply { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+.coach-reply input { flex: 1; width: auto; }
+
 /* ============ 侧栏资料库入口（P3） ============ */
 .lib-nav { padding: 6px 16px 12px; border-top: 1px solid var(--line-soft); flex-shrink: 0; }
 .lib-label { font-size: 11px; color: var(--ink-3); letter-spacing: 2px; margin: 10px 0 6px; }

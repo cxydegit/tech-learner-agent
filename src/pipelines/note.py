@@ -313,9 +313,9 @@ def parse_merge_decision(answer: str | None, n: int) -> set[int]:
         要合并的候选 0-based 索引集合；空集表示全部跳过。
     """
     text = (answer or "").strip().lower()
-    if text in ("all", "a", "y", "yes", "全合并"):
+    if text in ("all", "a", "y", "yes", "全合并", "全部合并", "都合并"):
         return set(range(n))
-    if text in ("skip", "s", "n", "no", "跳过", "none", ""):
+    if text in ("skip", "s", "n", "no", "跳过", "全部跳过", "none", ""):
         return set()
     picked: set[int] = set()
     for part in re.split(r"[,，\s]+", text):

@@ -59,6 +59,28 @@ class Config:
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"
     GRAPH_DB_PATH: Path = GRAPH_DB_DIR / "checkpoints.sqlite"
 
+    # 定制化学习路线（模块 2）：coach agent 循环配置
+    # 工具调用护栏：每用户回合最大连续工具调用数（超限强制 interrupt 找用户确认方向，防死循环）
+    ROUTE_MAX_TOOL_CALLS_PER_TURN: int = int(os.getenv("ROUTE_MAX_TOOL_CALLS_PER_TURN", "8"))
+
+    # 图级执行硬上限（LangGraph recursion_limit，防 agent 失控打转）
+    ROUTE_RECURSION_LIMIT: int = int(os.getenv("ROUTE_RECURSION_LIMIT", "50"))
+
+    # 上下文管理：coach 模型上下文每次只带最近 N 轮（一问一答约 2 条/轮）
+    #压缩后保留 20 条消息（最近 10 轮对话）
+    COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "10"))
+    #消息数 超过 40 条 才触发压缩
+    COACH_COMPRESS_AT: int = int(os.getenv("COACH_COMPRESS_AT", "40"))
+    #摘要输出不超过 800 Token，防止摘要膨胀
+    COACH_SUMMARY_MAX_TOKENS: int = int(os.getenv("COACH_SUMMARY_MAX_TOKENS", "800"))
+
+    # 工具调用通道失败时的回退开关：true → 去掉 tools 定义用纯文本再问一次（降级可用性）
+    ROUTE_FALLBACK_TO_TEXT: bool = os.getenv("ROUTE_FALLBACK_TO_TEXT", "true").lower() == "true"
+
+    # 用户画像 + 学习路线持久化目录（Markdown 是源，JSON 只存机器态）
+    LEARNER_DIR: Path = BASE_DIR / "learner"
+    ROADMAP_DIR: Path = BASE_DIR / "roadmaps"
+
     # Note 模块（Step 3 差量提取）：召回已有笔记作上下文的预算参数
     NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "3"))  # 召回该 tech 已有笔记 top-k 作差量上下文
     NOTE_CONTEXT_LIMIT: int = int(os.getenv("NOTE_CONTEXT_LIMIT", "500"))  # 每条已有笔记在提取提示词里的截断字数
@@ -123,7 +145,8 @@ class Config:
     @classmethod
     def ensure_dirs(cls) -> None:
         """确保输出目录存在"""
-        for d in [cls.MATERIALS_DIR, cls.REPORTS_DIR, cls.KNOWLEDGE_DIR]:
+        for d in [cls.MATERIALS_DIR, cls.REPORTS_DIR, cls.KNOWLEDGE_DIR,
+                  cls.LEARNER_DIR, cls.ROADMAP_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
 

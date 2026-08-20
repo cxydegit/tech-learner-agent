@@ -78,7 +78,8 @@ def _worker(thread_id: str, payload: Any) -> None:
         with SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH)) as saver:
             saver.setup()
             graph = build_graph(saver)
-            cfg = {"configurable": {"thread_id": thread_id}}
+            cfg = {"configurable": {"thread_id": thread_id},
+                   "recursion_limit": config.ROUTE_RECURSION_LIMIT}
             # ⚠️ stream_events(v3) 是异步后台执行：返回时节点可能仍在 ThreadPoolExecutor 线程跑。
             # 必须在 with 内立即访问 .interrupted/.output（会阻塞等待后台完成），
             # 否则 web_progress 的 finally 会在节点执行前注销注册表，进度全部丢失。
@@ -88,9 +89,12 @@ def _worker(thread_id: str, payload: Any) -> None:
                 interrupts = stream.interrupts
                 output = stream.output
             if interrupted:
-                # note 合并确认：把 interrupt 负载（merge 候选展示文本）推给前端等 resume
+                # coach 循环的 interrupt 负载是结构化 dict（coach_question）；其余视为 note 合并确认
                 value = interrupts[0].value if interrupts else ""
-                job.queue.put({"type": "interrupt", "kind": "merge_candidates", "payload": value})
+                if isinstance(value, dict) and value.get("type") == "coach_question":
+                    job.queue.put({"type": "interrupt", "kind": "coach_question", "payload": value})
+                else:
+                    job.queue.put({"type": "interrupt", "kind": "merge_candidates", "payload": value})
             else:
                 job.queue.put({"type": "final", "output": output})
     except Exception as exc:  # noqa: BLE001 —— 线程内兜底，事件里透传错误给前端
