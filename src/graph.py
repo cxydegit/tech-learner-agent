@@ -349,11 +349,13 @@ def _render_qa(result: dict) -> str:
 def coach_trim(state: LearnState) -> dict:
     """上下文管理 + 首次初始化。
 
-    - 初始化：mode 置 survey、问卷起始字段置 self_level（跨会话恢复时已持久化，不重复）。
+    - 初始化：仅新线程兜底——mode 缺省置 survey、问卷起始字段置 self_level
+      （跨会话恢复时两者已在 checkpoint 持久化，本节点不重复初始化）。
     - 压缩：消息总量超 COACH_COMPRESS_AT 时，旧消息经 LLM 摘要进 coach_summary，
       只保留最近 COACH_HISTORY_KEEP 轮。摘要失败降级为直接丢弃旧消息（保上下文有界）。
 
-    ⚠️ 初始化要基于"即将生效的 mode"判断，不能读 state.mode（它还没被本节点写进去）。
+    ⚠️ 初始化判断要用「带 survey 默认值的有效 mode」，不能用裸 state.mode：
+    新线程时它是 None；且本节点写入的 mode 要等返回后才生效。
     """
     msgs = state.get("coach_messages") or []
     keep = config.COACH_HISTORY_KEEP * 2  # 一轮 ≈ 一问一答两条
