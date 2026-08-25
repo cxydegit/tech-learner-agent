@@ -149,6 +149,8 @@ def note(tech: str, file_path: str = None, content: str = None):
 
     console.print(f"✅ 本次沉淀：新增 [bold]{persisted['new_count']}[/bold] 篇，"
                   f"合并更新 [bold]{persisted['merged_count']}[/bold] 篇")
+    for c in (persisted.get("conflict_reports") or []):
+        console.print(f"  [bold yellow]⚠️ 合并发现矛盾：[/bold yellow]{c['report']}")
     for r in persisted["results"]:
         label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
         console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")

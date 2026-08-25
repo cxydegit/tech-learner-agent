@@ -9,14 +9,16 @@ Step 1-3 范围：survey（问卷）→ planning（路线生成/确认）→ coa
 """
 
 import json
+import re
 
+from ..config import config
 from ..adapters import learner
 from ..adapters.llm import generate_text
 from ..domain import roadmap as roadmap_domain
 from ..domain import survey
 from .collect import collect_pipeline
 from .note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
-from .qa import qa_pipeline
+from .qa import _search_notes, qa_pipeline
 from .read import read_pipeline
 
 # ============================================================
@@ -96,8 +98,18 @@ def _coaching_prompt(state, tech: str) -> str:
         prog = "\n\n当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap)
     conv = (state.get("coach_summary") or "").strip()
     conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
+    # 记忆系统 Step 2：确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
+    kb = state.get("kb_context") or []
+    kb_block = ""
+    if kb:
+        parts = [f"（来源：{it.get('path', '')}）\n{it.get('snippet', '')}" for it in kb]
+        kb_block = ("\n\n===== 知识库相关片段（按来源标注） =====\n"
+                    + "\n\n".join(parts)
+                    + "\n===== 片段结束 =====\n"
+                    "优先依据上述片段作答，引用时标注来源；片段未覆盖的部分可用你自己的知识补充，"
+                    "但必须明确区分「来自你笔记的内容」与「基于经验的讲解」。")
     return (
-        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}{conv_block}\n\n"
+        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}{conv_block}{kb_block}\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ note（沉淀笔记）/ "
         "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）。"
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
@@ -429,9 +441,134 @@ def _note_commit(args: dict, ctx: CoachCtx) -> dict:
     indices = parse_merge_decision(decision, len(pending["merge_candidates"]))
     persisted = persist_points(tech, pending["new_points"], pending["merge_candidates"], indices)
     ctx.updates["coach_note_pending"] = None  # 提交后清掉，避免重复提交
+    # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给 agent 转述用户
+    conflict_reports = persisted.get("conflict_reports") or []
     return {"status": "ok", "new_count": persisted["new_count"], "merged_count": persisted["merged_count"],
+            "conflict_reports": conflict_reports,
             "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
                         for r in persisted["results"]]}
+
+
+# ============================================================
+# 记忆系统 Step 1：确定性写触发（学习内容自动沉淀）
+# 纯函数：对话缓冲 → note_pipeline → 返回决策，落库/暂存由 graph 节点编排。
+# ============================================================
+
+
+def _sweep_buffer_text(buffer: list[dict]) -> str:
+    """把沉淀缓冲（[{role, content}]）拼成 note 管道的输入文本（只取 user/assistant 纯文本）。"""
+    parts = []
+    for m in buffer:
+        if m.get("role") in ("user", "assistant") and m.get("content"):
+            parts.append(f"{m['role']}：{m['content']}")
+    return "\n".join(parts)
+
+
+def run_memory_sweep(tech: str, buffer: list[dict], progress=None) -> dict:
+    """确定性写触发：把自上次沉淀以来的对话文本喂给 note 管道沉淀。
+
+    Args:
+        tech: 技术名
+        buffer: 消息对列表 [{role, content}]（user/assistant 纯文本）
+        progress: 可选进度回调
+
+    Returns:
+        {
+          "action": "skip" | "persisted" | "pending",
+          "count": int,            # persisted: 新建知识点数
+          "pending": dict | None,  # pending: coach_note_pending 负载（含 _tech/_auto）
+          "message": str | None,   # 追加给 agent 的 system 提示（可选）
+        }
+    """
+    if not tech or not buffer:
+        return {"action": "skip", "count": 0, "pending": None, "message": None}
+    text = _sweep_buffer_text(buffer)
+    if not text.strip():
+        return {"action": "skip", "count": 0, "pending": None, "message": None}
+    if progress:
+        progress("🗂️ 正在沉淀学习内容...")
+    result = note_pipeline(tech, text, progress=progress)
+    if result.get("empty_reason"):
+        return {"action": "skip", "count": 0, "pending": None, "message": None}
+    # LLM 输出条目全无效（topic/正文为空被过滤）→ 两个桶都空，等价于无新内容，按 skip 处理
+    if not result.get("new_points") and not result.get("merge_candidates"):
+        return {"action": "skip", "count": 0, "pending": None, "message": None}
+    if result["merge_candidates"]:
+        # 有相似候选：新点与候选一起暂存，等用户决定后经 note_commit 一次落库（与 note 工具流一致）
+        pending = {**result, "_tech": tech, "_auto": True}
+        msg = (f"（内部）检测到 {len(result['new_points'])} 个新知识点、"
+               f"{len(result['merge_candidates'])} 个与旧笔记相似的候选，"
+               "请在回复中呈现候选并请用户决定（all / 编号逗号分隔 / skip），"
+               "用户决定后调用 note_commit，decision 传用户原话。")
+        return {"action": "pending", "count": len(result["new_points"]),
+                "pending": pending, "message": msg}
+    persisted = persist_points(tech, result["new_points"], [], set())
+    msg = f"（内部）已自动沉淀 {persisted['new_count']} 个新知识点。"
+    return {"action": "persisted", "count": persisted["new_count"],
+            "pending": None, "message": msg}
+
+
+# ============================================================
+# 记忆系统 Step 2：确定性读路由（提问先查库）
+# 纯函数：元问题廉价闸门 + 知识库检索 + 相似度阈值过滤 → 命中片段列表，注入 coaching 提示词。
+# ============================================================
+
+# 廉价闸门关键词：明显过程 / 元问题（继续、现在到哪、路线对吗…）确定性跳过，不查库。
+# 判定沿用 exit_intent 的「残留检查」思路：短文本整体由元关键词 + 语气词组成才算元问题，
+# 避免「这个写法对不对」这类含学习内容的提问被误判跳过。
+_META_RE = re.compile(
+    r"(继续|接着|下一步|然后呢|接下来|之后呢|还有吗|现在到哪|到哪了|现在在哪|"
+    r"什么进度|进度|当前阶段|在哪一步|第几阶段|学了多少|完成了吗|"
+    r"这个路线|路线对吗|路线正确吗|路线合理吗|对不对|对吗|对不|"
+    r"明白了|懂了|知道了|好的|可以|行|嗯|开始吧|就这样|先这样|"
+    r"继续说|讲下去|再说一遍|什么意思|听不懂|举个例子)",
+    re.IGNORECASE,
+)
+_META_MAX_LEN = 12  # 元问题判定只对短文本生效（长回答含学习内容，交给检索判断）
+_META_PARTICLES = "吧了呀呢嘛啊哦哈嗯~～。，,.！!？? "
+
+
+def _is_meta_question(text: str) -> bool:
+    """确定性判定：整句是否仅为过程 / 元问题（零成本廉价闸门，命中即不查库）。"""
+    t = (text or "").strip()
+    if not t or len(t) > _META_MAX_LEN:
+        return False
+    prev = None
+    while prev != t:  # 迭代剥离所有元关键词（「好的，继续」等复合短语一次清干净）
+        prev = t
+        t = _META_RE.sub("", t).strip()
+    return not t.strip(_META_PARTICLES)
+
+
+def run_kb_retrieve(tech: str, question: str) -> list[dict]:
+    """确定性读路由：提问先查库，命中相关片段列表 [{path, snippet}]（无命中返回空）。
+
+    两级闸门：
+    - 廉价闸门（零成本）：明显过程/元问题（继续、现在到哪、路线对吗…）直接跳过，不查库；
+    - 质量闸门（相似度）：复用 qa 混合检索（限定 tech），相似度 ≥ ROUTE_KB_INJECT_SIM 的
+      取前 ROUTE_KB_SNIPPETS 条，片段截断到 QA_SNIPPET_CHARS。
+    检索异常（RAG 未索引 / Chroma 异常）优雅降级为空——模型用自己的知识正常回答。
+    """
+    question = (question or "").strip()
+    if not tech or not question:
+        return []
+    if _is_meta_question(question):
+        return []
+    try:
+        hits = _search_notes(question, config.QA_TOP_K, tech)
+    except Exception:  # noqa: BLE001 —— RAG 未索引 / Chroma 异常时降级为空
+        return []
+    out: list[dict] = []
+    for h in hits:
+        if (h.get("similarity") or 0.0) < config.ROUTE_KB_INJECT_SIM:
+            continue
+        snippet = (h.get("document") or "").strip()
+        if not snippet:
+            continue
+        out.append({"path": h.get("path") or "", "snippet": snippet[:config.QA_SNIPPET_CHARS]})
+        if len(out) >= config.ROUTE_KB_SNIPPETS:
+            break
+    return out
 
 
 def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:

@@ -20,7 +20,7 @@ from ..adapters.store import (
 )
 from ..config import config
 from ..domain.dedup import strip_note_header
-from ..domain.extraction import parse_entries
+from ..domain.extraction import parse_entries, parse_json_object
 
 
 # ============================================================
@@ -83,8 +83,15 @@ MERGE_SYSTEM_PROMPT = """你是一个知识管理助手。我会给你一份**�
 - 合并后逻辑清晰，不要出现两个标题相同的小节；代码示例保留完整。
 - 中文书写。
 
+## 矛盾处理（新旧对同一事实说法不一致时）
+- 对比新旧内容，识别是否存在**相互矛盾的陈述**（如旧说"默认端口 8080"、新说"3.x 起改为 8081"）。
+- 若存在矛盾：**以新内容为准**修正矛盾处（新内容是最新学习的），不要同时保留两个矛盾的旧说法。
+- 只是详略不同、或新旧讲不同版本且不否定彼此，不算矛盾，正常补充即可。
+
 ## 输出
-只输出合并后的笔记正文，**不含** `# 标题`、`> 日期`、`> 标签` 等头部信息；不要有任何解释或前后缀。
+只输出一个 JSON 对象，不要任何解释或 ```json 代码块标记：
+{"content": "合并后的笔记正文（不含 # 标题 / > 日期 / > 标签 等头部信息）",
+ "report": "矛盾处理报告（一句话说明发现了什么矛盾、改成了什么，如：发现 1 处矛盾：旧笔记说默认端口 8080，新内容说 3.x 起为 8081，已按新内容改为 8081；未发现矛盾时输出空字符串）"}
 """
 
 
@@ -247,25 +254,40 @@ def suggest_directions(tech: str, materials_path: str | None, existing_topics: l
     return suggestion.strip()
 
 
-def merge_notes(old_content: str, new_content: str, topic: str) -> str:
-    """LLM 差量合并：把新知识点并入已有笔记正文，去掉重复，返回合并后的正文。
+def merge_notes(old_content: str, new_content: str, topic: str) -> dict:
+    """LLM 差量合并：把新知识点并入已有笔记正文，去掉重复，返回合并后的正文 + 矛盾报告。
 
-    只合并正文（不含 # 标题 / > 日期 / > 标签 头部）；头部由 persist_note 拼回。
+    合并时识别新旧对同一事实的相互矛盾，**以新内容为准**修正矛盾处（新内容是最新学习的），
+    并在 report 中明确说明发现了什么矛盾、改成了什么（供用户复核）。
+
+    Args:
+        old_content: 已有笔记全文（含 # 标题 / > 日期 / > 标签 头部，合并时剥头）
+        new_content: 新提取的知识点正文
+        topic: 新知识点主题
+
+    Returns:
+        {"content": 合并后正文（不含头部），"report": 矛盾处理报告，无矛盾为空字符串}。
+        JSON 解析失败 / content 缺失 → 降级 content=原始输出、report=""（与旧行为一致，安全侧）。
     """
     old_body = strip_note_header(old_content)
     user_content = (
         f"===== 已有笔记正文 =====\n{old_body}\n\n"
         f"===== 新提取的知识点（主题：{topic}） =====\n{new_content}"
     )
-    merged = generate_text(MERGE_SYSTEM_PROMPT, user_content)
-    return merged.strip()
+    raw = generate_text(MERGE_SYSTEM_PROMPT, user_content).strip()
+    obj = parse_json_object(raw)
+    content = obj.get("content")
+    if not content or not str(content).strip():
+        content = raw  # 解析失败 / content 缺失 → 降级：整个输出当正文（与旧行为一致）
+    return {"content": str(content).strip(), "report": str(obj.get("report") or "").strip()}
 
 
 def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dict],
                    merge_indices: set[int]) -> dict:
     """交互确认后统一入库：new_points 全部新建；merge_candidates 按 merge_indices 合并。
 
-    合并候选用 LLM 差量合并（merge_notes）后再覆盖写入；未入选的候选跳过（不沉淀）。
+    合并候选用 LLM 差量合并（merge_notes，合并时识别矛盾、以新内容为准修正）后再覆盖写入；
+    未入选的候选跳过（不沉淀）。合并中发现的矛盾经 conflict_reports 透出给调用方展示。
 
     Args:
         tech: 技术名称
@@ -274,10 +296,12 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
         merge_indices: 要合并的候选 0-based 索引集合；空集表示全部跳过
 
     Returns:
-        {"results": [persist 结果...], "new_count": int, "merged_count": int}
+        {"results": [persist 结果...], "new_count": int, "merged_count": int,
+         "conflict_reports": [{path, topic, report}, ...]}（无矛盾为空列表）
     """
     new_count = merged_count = 0
     results: list[dict] = []
+    conflict_reports: list[dict] = []
     for np_ in new_points:
         r = persist_note(tech, np_["topic"], np_["content"], np_["tags"])
         results.append(r)
@@ -287,10 +311,14 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
         merged = merge_notes(c["old_content"], c["content"], c["topic"])
         # 合并保留旧笔记的标题（identity 属于被合并的旧笔记），标题/文件名/INDEX 保持一致；
         # 若用新点 topic 当标题，会篡改已有笔记的主题（文件名还是旧的，标题却变了）
-        r = persist_note(tech, c["old_topic"], merged, c["tags"], replace_path=c["old_path"])
+        r = persist_note(tech, c["old_topic"], merged["content"], c["tags"], replace_path=c["old_path"])
         results.append(r)
         merged_count += 1
-    return {"results": results, "new_count": new_count, "merged_count": merged_count}
+        if merged["report"]:
+            conflict_reports.append({"path": c["old_path"], "topic": c["topic"],
+                                     "report": merged["report"]})
+    return {"results": results, "new_count": new_count, "merged_count": merged_count,
+            "conflict_reports": conflict_reports}
 
 
 def format_merge_candidates(candidates: list[dict]) -> str:

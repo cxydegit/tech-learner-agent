@@ -76,6 +76,14 @@ class Config:
 
     # 工具调用通道失败时的回退开关：true → 去掉 tools 定义用纯文本再问一次（降级可用性）
     ROUTE_FALLBACK_TO_TEXT: bool = os.getenv("ROUTE_FALLBACK_TO_TEXT", "true").lower() == "true"
+    # 记忆系统 Step 1：coach 对话确定性写触发——自上次沉淀以来累计用户回合数 / 字符数
+    # 任一达到即把这段对话自动喂给 note 管道沉淀（同步执行，进度经 progress 回调透传）
+    ROUTE_MEMORY_SWEEP_TURNS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_TURNS", "6"))
+    ROUTE_MEMORY_SWEEP_CHARS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_CHARS", "2500"))
+    # 记忆系统 Step 2：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
+    # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
+    ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.5"))  # 注入相似度阈值（低于不注入）
+    ROUTE_KB_SNIPPETS: int = int(os.getenv("ROUTE_KB_SNIPPETS", "3"))  # 注入片段数上限
 
     # 用户画像 + 学习路线持久化目录（Markdown 是源，JSON 只存机器态）
     LEARNER_DIR: Path = BASE_DIR / "learner"

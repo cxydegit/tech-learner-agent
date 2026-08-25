@@ -36,7 +36,9 @@ from .pipelines.collect import collect_pipeline
 from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
-from .pipelines.route import COACH_TOOLS_BY_MODE, CoachCtx, coach_system_prompt, run_coach_tool, summarize_conversation
+from .pipelines.route import (COACH_TOOLS_BY_MODE, CoachCtx, coach_system_prompt,
+                              run_coach_tool, run_kb_retrieve, run_memory_sweep,
+                              summarize_conversation)
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
@@ -198,6 +200,12 @@ class LearnState(TypedDict):
     coach_note_pending: dict | None
     # collect/read 工具最近一次产出的文档 {path, type}；coach_human 把它附到对话记录（查看完整文档 chip），用后即清
     coach_doc: dict | None
+    # 记忆系统 Step 1：自上次沉淀以来的对话消息对 [{role, content}]（coach_human 填充，
+    # coach_memory_write 达阈值触发 note 沉淀后清空；checkpointer 持久化，中断恢复不丢）
+    memory_sweep_buffer: list
+    # 记忆系统 Step 2：确定性读路由——当前用户回合命中知识库的相关片段 [{path, snippet}]
+    # （coach_kb_retrieve 每用户回合覆盖；coaching 提示词注入作答上下文）
+    kb_context: list | None
 
 
 # ============================================================
@@ -297,6 +305,10 @@ def note_confirm_node(state: LearnState) -> dict:
         f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
         if persisted["results"] else "未沉淀任何知识点"
     )
+    # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给用户复核
+    conflict_reports = persisted.get("conflict_reports") or []
+    if conflict_reports:
+        summary += "\n" + "\n".join(f"⚠️ 合并发现矛盾：{c['report']}" for c in conflict_reports)
     return {"notes": persisted["results"], "noted_count": len(reports), "last_output": summary,
             "conversation": _conversation(state, summary, "note", decision=decision)}
 
@@ -483,6 +495,15 @@ def coach_human(state: LearnState) -> dict:
         assistant_rec,
         {"role": "user", "type": "chat", "content": reply, "ts": now},
     ]
+    # 记忆系统 Step 1：仅 coaching 模式且非待确认笔记流时，把本回合（assistant 讲解 + 用户回复）
+    # 压入沉淀缓冲（coach_memory_write 达阈值触发 note 沉淀后清空）
+    if state.get("mode") == "coaching" and not state.get("coach_note_pending"):
+        buf = list(state.get("memory_sweep_buffer") or [])
+        if content:
+            buf.append({"role": "assistant", "content": content})
+        if reply:
+            buf.append({"role": "user", "content": reply})
+        updates["memory_sweep_buffer"] = buf
     return updates
 
 
@@ -521,6 +542,57 @@ def coach_survey(state: LearnState) -> dict:
     if survey.is_survey_complete(answers):
         updates["mode"] = "planning"  # 问卷完成 → 确定性进入路线规划
     return updates
+
+
+def coach_memory_write(state: LearnState) -> dict:
+    """确定性写触发（记忆系统 Step 1）：coach 对话积累超阈值 → 自动沉淀学习内容进知识库。
+
+    仅 coaching 模式生效；agent 的 note 工具流进行中（coach_note_pending 非空）时跳过。
+    - 未达阈值 → 保留 memory_sweep_buffer 继续积累；
+    - 触发后清空 buffer：
+      - 无新内容 → 无动作（闲聊/过程消息被差量提取过滤）；
+      - 新知识点无候选 → 自动落库 + system 提示（agent 可自然提及）；
+      - 有相似候选 → 暂存 coach_note_pending，复用 note_commit 工具流由用户确认。
+
+    本节点只做编排，管道逻辑在 pipelines.route.run_memory_sweep。
+    """
+    if state.get("mode") != "coaching":
+        return {}
+    buffer = state.get("memory_sweep_buffer") or []
+    if not buffer or state.get("coach_note_pending"):
+        return {}
+    turns = sum(1 for m in buffer if m.get("role") == "user")
+    chars = sum(len(m.get("content") or "") for m in buffer)
+    if turns < config.ROUTE_MEMORY_SWEEP_TURNS and chars < config.ROUTE_MEMORY_SWEEP_CHARS:
+        return {}  # 未达阈值：保留 buffer 继续积累
+    sweep = run_memory_sweep(state.get("tech") or "", buffer, progress=_get_progress())
+    updates: dict = {"memory_sweep_buffer": []}  # 触发后清空，下一窗口重新积累
+    if sweep["action"] == "skip":
+        return updates
+    msgs = state.get("coach_messages") or []
+    updates["coach_messages"] = [*msgs, {"role": "system", "content": sweep["message"]}]
+    if sweep["action"] == "pending":
+        updates["coach_note_pending"] = sweep["pending"]
+    return updates
+
+
+def coach_kb_retrieve(state: LearnState) -> dict:
+    """确定性读路由（记忆系统 Step 2）：coach 用户每回合提问先查库，命中注入 kb_context。
+
+    仅 coaching 模式生效；取最后一条用户消息过两级闸门（廉价元问题闸门 + 质量相似度闸门），
+    命中片段写入 kb_context（coaching 提示词注入作答上下文），无命中 / 低于阈值 → 清空。
+    每用户回合覆盖（下轮问题自动替换）；检索异常在 run_kb_retrieve 内优雅降级为空。
+    """
+    if state.get("mode") != "coaching":
+        return {}
+    msgs = state.get("coach_messages") or []
+    question = ""
+    for m in reversed(msgs):
+        if m.get("role") == "user":
+            question = m.get("content") or ""
+            break
+    ctx = run_kb_retrieve(state.get("tech") or "", question)
+    return {"kb_context": ctx or None}
 
 
 # ---------- coach 路由 ----------
@@ -648,6 +720,8 @@ def build_graph(checkpointer):
     builder.add_node("coach_human", coach_human)
     builder.add_node("coach_survey", coach_survey)
     builder.add_node("coach_guard", coach_guard)
+    builder.add_node("coach_memory_write", coach_memory_write)
+    builder.add_node("coach_kb_retrieve", coach_kb_retrieve)
 
     builder.add_edge("coach_trim", "coach_llm")
     builder.add_conditional_edges("coach_llm", _route_coach, {
@@ -662,7 +736,11 @@ def build_graph(checkpointer):
         END: END,
     })
     builder.add_edge("coach_guard", "coach_human")
-    builder.add_edge("coach_survey", "coach_trim")
+    # 记忆系统 Step 1+2：用户回复后先走确定性写触发（coach_memory_write），
+    # 再走确定性读路由（coach_kb_retrieve，提问先查库、命中注入 kb_context），最后进 trim→llm
+    builder.add_edge("coach_survey", "coach_memory_write")
+    builder.add_edge("coach_memory_write", "coach_kb_retrieve")
+    builder.add_edge("coach_kb_retrieve", "coach_trim")
 
     return builder.compile(checkpointer=checkpointer)
 
