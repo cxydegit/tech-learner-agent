@@ -27,7 +27,7 @@ import chromadb
 
 from ..config import config
 from ..domain.chunking import _content_digest, chunk_markdown
-from ..domain.hybrid import build_bm25, rrf_fuse
+from ..domain.hybrid import build_bm25, lexical_rerank, rrf_fuse
 from .embedding import DashScopeEmbeddingFunction
 
 _COLLECTION_NAME = "knowledge_base"
@@ -331,10 +331,18 @@ def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None
         return []
 
     scores = build_bm25(docs).score(query)
-    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-    max_score = scores[order[0]] if order and scores[order[0]] > 0 else 0.0
+    # 只保留 BM25 分 > 0 的块（与查询至少共享一个词项）。0 分块是纯填充，
+    # 若放进 RRF 会按"填充排名"白拿融合分，把无关笔记抬高（教训：RoPE 查询里
+    # rag-架构模式 靠语义榜第 1 + 0 分填充的关键词榜"第 12 名"拿到 0.0303 排第一，
+    # 真正的 transformer 笔记只有关键词榜第 1 的 0.0164，掉出前 8）。
+    order = [i for i, s in enumerate(scores) if s > 0]
+    order.sort(key=lambda i: scores[i], reverse=True)
+    order = order[:top_k]
+    if not order:
+        return []
+    max_score = scores[order[0]]
     hits: list[dict] = []
-    for i in order[:top_k]:
+    for i in order:
         m = metas[i] if i < len(metas) else {}
         hits.append({
             "id": ids[i],
@@ -364,7 +372,14 @@ def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None)
         return sparse[:top_k]
     if not sparse:
         return dense[:top_k]
-    return rrf_fuse(dense, sparse, config.QA_RRF_K)[:top_k]
+    fused = rrf_fuse(dense, sparse, config.QA_RRF_K)
+    # 词法一致性软重排（P1.1）：仅当查询是「罕见词型」（BM25 正命中集中在 ≤ N 篇笔记）
+    # 才启用，纠正 dense 对裸缩写/专有名词的零词法重合噪声（RoPE → rag-架构模式
+    # 语义第1但通篇无 RoPE 的案例）。概念查询 BM25 命中散落各篇，不重排避免误伤语义排序
+    # （实测：命中≤3 篇时重排只改进/持平；≥4 篇时会造成回退）。
+    if config.QA_RERANK_LEXICAL and len({h.get("path") for h in sparse}) <= config.QA_RERANK_MIN_HITS:
+        fused = lexical_rerank(fused, query, w=config.QA_RERANK_LEXICAL_W)
+    return fused[:top_k]
 
 
 # ============================================================

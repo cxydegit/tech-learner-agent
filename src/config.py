@@ -82,7 +82,11 @@ class Config:
     ROUTE_MEMORY_SWEEP_CHARS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_CHARS", "2500"))
     # 记忆系统 Step 2：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
     # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
-    ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.5"))  # 注入相似度阈值（低于不注入）
+    # 注入阈值（可标定余弦，见 route.py::_hit_relevance）：hybrid 的归一化 similarity（top 恒 1.0）
+    # 不能当绝对门槛，run_kb_retrieve 用 dense 原始余弦过闸。标定依据 scripts/calibrate_inject_threshold.py：
+    # 正样本（coach 应注入）余弦 0.58~0.87，负样本（笔记里没有）top-1 余弦 0.45~0.62；0.65 时注入召回 90%、
+    # 误注入 0/6（0.5 时误注入 3/6——22 篇语料里 0.5 过松）。
+    ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.65"))
     ROUTE_KB_SNIPPETS: int = int(os.getenv("ROUTE_KB_SNIPPETS", "3"))  # 注入片段数上限
 
     # 用户画像 + 学习路线持久化目录（Markdown 是源，JSON 只存机器态）
@@ -103,6 +107,13 @@ class Config:
     # P1 混合检索（BM25 + RRF）：/ask 召回改走 hybrid_search_knowledge，可关回纯 dense
     QA_USE_HYBRID: bool = os.getenv("QA_USE_HYBRID", "true").lower() == "true"
     QA_RRF_K: int = int(os.getenv("QA_RRF_K", "60"))  # RRF 融合常数（名次倒数分母）
+    # P1.1 词法一致性软重排：RRF 融合后按「查询词在块中的覆盖率（mini-idf 加权）」加分。
+    # 仅当 BM25 正命中 ≤ QA_RERANK_MIN_HITS 篇笔记（罕见词型查询，dense 对专有名词
+    # 零词法重合噪声的失败场景）时启用；概念查询 BM25 命中散落，不重排避免误伤语义排序
+    # （实测分界：命中≤3 篇只改进/持平，≥4 篇会回退）。只加分不减分；w=0 等价纯 RRF。
+    QA_RERANK_LEXICAL: bool = os.getenv("QA_RERANK_LEXICAL", "true").lower() == "true"
+    QA_RERANK_LEXICAL_W: float = float(os.getenv("QA_RERANK_LEXICAL_W", "0.5"))
+    QA_RERANK_MIN_HITS: int = int(os.getenv("QA_RERANK_MIN_HITS", "3"))
 
     # Step 5 Part B 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
     QUALITY_DOMAIN_BONUS_OFFICIAL: int = int(os.getenv("QUALITY_DOMAIN_BONUS_OFFICIAL", "20"))

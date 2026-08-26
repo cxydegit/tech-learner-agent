@@ -540,13 +540,32 @@ def _is_meta_question(text: str) -> bool:
     return not t.strip(_META_PARTICLES)
 
 
+def _hit_relevance(h: dict) -> float | None:
+    """命中的「可标定相关度」：可用于绝对阈值比较的分数。
+
+    P1 起 hybrid 的 ``similarity`` 是归一化相对分（top 恒 1.0，见 rrf_fuse），
+    与 ROUTE_KB_INJECT_SIM 这类绝对阈值**不可比**；``dense_similarity`` 才是融合时
+    保留的原始余弦。优先级：
+    - hybrid 且进过 dense 榜单：dense_similarity（真实余弦）
+    - hybrid 的 BM25 独有命中：无标定分 → None（宁可不注入，不拿归一化分凑数）
+    - 纯 dense 路径（QA_USE_HYBRID 关闭）：similarity 即余弦
+    """
+    if h.get("dense_similarity") is not None:
+        return h["dense_similarity"]
+    if "bm25_score" in h:
+        return None
+    return h.get("similarity")
+
+
 def run_kb_retrieve(tech: str, question: str) -> list[dict]:
     """确定性读路由：提问先查库，命中相关片段列表 [{path, snippet}]（无命中返回空）。
 
     两级闸门：
     - 廉价闸门（零成本）：明显过程/元问题（继续、现在到哪、路线对吗…）直接跳过，不查库；
-    - 质量闸门（相似度）：复用 qa 混合检索（限定 tech），相似度 ≥ ROUTE_KB_INJECT_SIM 的
-      取前 ROUTE_KB_SNIPPETS 条，片段截断到 QA_SNIPPET_CHARS。
+    - 质量闸门（可标定相似度）：复用 qa 混合检索（限定 tech），按 _hit_relevance
+      （hybrid 用保留的 dense 原始余弦、BM25 独有命中不过闸）≥ ROUTE_KB_INJECT_SIM
+      取前 ROUTE_KB_SNIPPETS 条，片段截断到 QA_SNIPPET_CHARS。混合检索的归一化
+      similarity 不能当绝对门槛。
     检索异常（RAG 未索引 / Chroma 异常）优雅降级为空——模型用自己的知识正常回答。
     """
     question = (question or "").strip()
@@ -560,7 +579,8 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
         return []
     out: list[dict] = []
     for h in hits:
-        if (h.get("similarity") or 0.0) < config.ROUTE_KB_INJECT_SIM:
+        rel = _hit_relevance(h)
+        if rel is None or rel < config.ROUTE_KB_INJECT_SIM:
             continue
         snippet = (h.get("document") or "").strip()
         if not snippet:

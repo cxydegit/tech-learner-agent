@@ -9,7 +9,7 @@ from pathlib import Path
 # 保证 tests/ 下能 import src（pytest 无 src 布局配置时）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.domain.hybrid import build_bm25, rrf_fuse, tokenize
+from src.domain.hybrid import build_bm25, lexical_rerank, rrf_fuse, tokenize
 
 
 # ---------- tokenize ----------
@@ -20,12 +20,26 @@ def test_tokenize_english_and_chinese_char():
     assert {"缓", "存", "穿", "透"} <= set(toks)
 
 
-def test_tokenize_splits_punct_and_drops_stopwords():
+def test_tokenize_keeps_dotted_acronym_and_drops_stopwords():
+    """点号分隔缩写整体成一个 token（修复拆成 ft/search 后的 idf 稀释）；停用词照常丢弃。"""
     toks = tokenize("The FT.SEARCH 与 Redis")
     assert "the" not in toks
-    assert "ft" in toks and "search" in toks
+    assert "ft.search" in toks
+    assert "ft" not in toks and "search" not in toks
     assert "与" not in toks
     assert "redis" in toks
+
+
+def test_bm25_dotted_acronym_stays_single_token():
+    """含 FT.SEARCH 的文档应独占高分（点号不拆词后是罕见整词）；其余不含的文档为 0。"""
+    docs = [
+        "FT.SEARCH 是 Redis Stack 的全文搜索指令",
+        "全文搜索功能依赖倒排索引",
+        "VectorStore 语义检索",
+    ]
+    scores = build_bm25(docs).score("FT.SEARCH")
+    assert scores[0] > scores[1] and scores[0] > scores[2]
+    assert scores[1] == 0.0 and scores[2] == 0.0
 
 
 # ---------- BM25 ----------
@@ -107,3 +121,37 @@ def test_rrf_dedup_and_preserves_dense_sim():
     assert x["dense_similarity"] == 1.0
     assert y["dense_similarity"] is None
     assert y["bm25_score"] == 1.0
+
+
+# ---------- lexical_rerank ----------
+
+def _hit_doc(idx: int, path: str, doc: str, rrf: float = 0.0164) -> dict:
+    """带块文本与 rrf_score 的融合条目（模拟 rrf_fuse 输出）。"""
+    return {"id": f"{path}::{idx}", "path": path, "source": "knowledge", "tech": "t",
+            "topic": "t", "url": "", "similarity": 1.0, "document": doc, "rrf_score": rrf}
+
+
+def test_lexical_rerank_full_coverage_beats_zero():
+    """查询词满覆盖的块应排在零词法重合的块前面（纠正 dense 对专有名词的噪声）。"""
+    fused = [
+        _hit_doc(0, "a/rag-架构模式", "RAG 架构模式与 Pipeline"),
+        _hit_doc(1, "a/transformer", "RoPE 位置编码是 Transformer 组件"),
+    ]
+    out = lexical_rerank(fused, "RoPE", w=1.0)
+    assert out[0]["path"] == "a/transformer"
+    assert out[0]["lexical_coverage"] == 1.0
+    assert out[1]["lexical_coverage"] == 0.0
+
+
+def test_lexical_rerank_zero_weight_preserves_order():
+    """w=0 时等价纯 RRF 排序，顺序不变。"""
+    fused = [_hit_doc(0, "a/x", "RoPE 内容"), _hit_doc(1, "a/y", "RoPE 内容")]
+    out = lexical_rerank(fused, "RoPE", w=0.0)
+    assert [h["path"] for h in out] == ["a/x", "a/y"]
+
+
+def test_lexical_rerank_does_not_mutate_input():
+    fused = [_hit_doc(0, "a/x", "RoPE")]
+    original = list(fused)
+    lexical_rerank(fused, "RoPE", w=1.0)
+    assert fused == original

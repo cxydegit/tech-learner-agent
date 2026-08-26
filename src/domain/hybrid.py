@@ -6,8 +6,9 @@ RedisJSON / FT.SEARCH 这类专有名词时，embedding 模糊匹配失效。BM2
 榜单兜住，语义相近由 dense 榜单兜住。
 
 全部标准库自实现（不引 rank_bm25）：当前知识库规模小，内存打分即可。
-分词规则与 domain/dedup.py::_topics_overlap 保持一致（英文按词、中文按单字），
-保证与既有去重逻辑对"词"的理解一致。
+分词规则与 domain/dedup.py::_topics_overlap 同源（英文按词、中文按单字），
+但**点号不拆词**：FT.SEARCH / RedisJSON 这类点号分隔的缩写整体算一个 token——
+拆成 ft/search 会让罕见缩写被高频词稀释掉 idf，正是 P1 想修的精确词弱点的来源之一。
 """
 
 from __future__ import annotations
@@ -16,8 +17,8 @@ import math
 import re
 from collections import Counter
 
-# 与 domain/dedup.py::_topics_overlap 相同的切词粒度：英文单词 / 中文单字
-_WORD_RE = re.compile(r"[a-zA-Z0-9]+|[一-鿿]")
+# 英文单词（允许点号在词内，保住 FT.SEARCH 类缩写整体性）/ 中文单字
+_WORD_RE = re.compile(r"[a-zA-Z0-9]+(?:\.[a-zA-Z0-9]+)*|[一-鿿]")
 _STOPWORDS = frozenset({
     # 中文
     "的", "了", "和", "与", "在", "用", "是", "对", "个", "有", "这", "那",
@@ -29,7 +30,7 @@ _STOPWORDS = frozenset({
 def tokenize(text: str) -> list[str]:
     """分词：英文按词、中文按单字，小写、去停用词。
 
-    "FT.SEARCH" -> ["ft", "search"]；"Redis 缓存穿透" -> ["redis", "缓", "存", "穿", "透"]。
+    "FT.SEARCH" -> ["ft.search"]（点号不拆）；"Redis 缓存穿透" -> ["redis", "缓", "存", "穿", "透"]。
     """
     return [w for w in _WORD_RE.findall((text or "").lower()) if w not in _STOPWORDS]
 
@@ -135,3 +136,45 @@ def rrf_fuse(dense: list[dict], sparse: list[dict], k: int = 60) -> list[dict]:
     for d in ordered:
         d["similarity"] = d["rrf_score"] / max_score if max_score > 0 else 0.0
     return ordered
+
+
+def lexical_rerank(fused: list[dict], query: str, *, w: float) -> list[dict]:
+    """词法一致性软重排：RRF 融合后按「查询词在块中的覆盖率」加分，打破并列。
+
+    动机：纯 dense 对裸缩写 / 专有名词查询会检索到与查询**零词法重合**的块——
+    如 "RoPE" 把 rag-架构模式 排语义榜第 1（sim 0.541）但它通篇没有 RoPE；
+    RRF 无权重，导致这个噪声块与真正的关键词命中（transformer 笔记）打平。
+    覆盖率加分让「确实含查询词」的块胜出，纠正 dense 噪声。覆盖率只加分不减分，
+    常规语义查询（正确块同源词少）不会被惩罚，只是微调。
+
+    Args:
+        fused: rrf_fuse 的结果（每条含 document 块文本）
+        query: 原始查询
+        w: 覆盖率权重；w=0 等价纯 RRF 排序（可关回）
+
+    Returns:
+        按 rerank_score 降序的新列表（不改原列表），每条附加 lexical_coverage / rerank_score。
+    """
+    q_toks = set(tokenize(query))
+    if not q_toks:
+        return fused
+    # 覆盖率按词在候选集上的 mini-idf 加权：罕见词（redisjson/rope）权重大，
+    # 常见中文字（能/做/什/么，几乎每块都有）权重趋近 0。否则中文单字分词会让
+    # 覆盖率被烂大街字灌满，把真含关键术语的块反而压低（RedisJSON 案例教训）。
+    n = len(fused) or 1
+    df: Counter = Counter()
+    for h in fused:
+        df.update(set(tokenize(h.get("document") or "")))
+    idf = lambda t: math.log(n / df[t]) if df[t] else math.log(n)
+    denom = sum(idf(t) for t in q_toks) or 1.0
+
+    out: list[dict] = []
+    for h in fused:
+        doc_toks = set(tokenize(h.get("document") or ""))
+        cov = sum(idf(t) for t in q_toks & doc_toks) / denom
+        h = dict(h)
+        h["lexical_coverage"] = cov
+        h["rerank_score"] = h.get("rrf_score", 0.0) * (1.0 + w * cov)
+        out.append(h)
+    out.sort(key=lambda h: h["rerank_score"], reverse=True)
+    return out
