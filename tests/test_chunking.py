@@ -162,3 +162,54 @@ def test_real_corpus_no_cell_fragment():
         assert body and all(l.lstrip().startswith("|") for l in body), (
             f"表格被切开或夹带正文: …{c.text[:100]!r}"
         )
+
+
+# 12. 超大表格（> 硬上限）→ 按行二次切分：每块重复表头、无数据行丢失
+def test_oversize_table_split_with_repeated_header():
+    rows = ["| 列A | 列B | 列C |", "|---|---|---|"] + [f"| 行{i} | 数据值 {i} | 列C 内容 {i} |" for i in range(20)]
+    text = "# 标题\n\n" + "\n".join(rows)
+    chunks = chunk_markdown(text, hard_cap=200)
+    subs = [c for c in chunks if "| 行" in c.text]
+    assert len(subs) > 1, "超过硬上限的表格必须被二次切分"
+    prefix = "# 标题\n\n"
+    for c in subs:
+        assert c.section == "# 标题"
+        body = c.text[len(prefix):]
+        assert body.startswith("| 列A | 列B | 列C |"), "每个子块必须重复表头"
+        assert len(body) <= 200, f"子块超硬上限: {len(body)}"
+    all_rows = "\n".join(c.text[len(prefix):] for c in subs)
+    for i in range(20):
+        assert f"| 行{i} | 数据值 {i} | 列C 内容 {i} |" in all_rows, f"数据行 {i} 丢失"
+
+
+# 13. 超大代码围栏（> 硬上限）→ 按空行分组：每块都是完整闭合围栏、无代码丢失
+def test_oversize_fence_split_complete():
+    code = "```python\n" + "\n\n".join(f"# 段落{i}\nline{i} = {i}" for i in range(10)) + "\n```"
+    text = "# 标题\n\n" + code
+    chunks = chunk_markdown(text, hard_cap=120)
+    subs = [c for c in chunks if "line" in c.text]
+    assert len(subs) > 1, "超过硬上限的代码围栏必须被二次切分"
+    for c in subs:
+        assert c.text.count("```") == 2, "每个子块必须是完整闭合围栏"
+    all_code = "\n".join(c.text for c in subs)
+    for i in range(10):
+        assert f"line{i} = {i}" in all_code, f"代码行 {i} 丢失"
+
+
+# 14. 截断保底：单个超长行 / 段落即使单独也超硬上限 → 截断，不崩、不产超限块
+def test_oversize_single_unit_truncated():
+    row = "| " + "x" * 1000 + " |"
+    text = "# 标题\n\n| 表头 |\n|---|\n" + row
+    chunks = chunk_markdown(text, hard_cap=120)
+    assert chunks
+    prefix = "# 标题\n\n"
+    for c in chunks:
+        assert len(c.text[len(prefix):]) <= 120, f"截断后仍超硬上限: {len(c.text[len(prefix):])}"
+
+
+# 15. 未超硬上限的原子块仍整块保留（硬上限只拦病态超大块）
+def test_oversize_atomic_within_cap_stays_whole():
+    chunks = chunk_markdown("# 大表\n\n" + big_table(), hard_cap=2000)
+    tables = [c for c in chunks if "哨兵行" in c.text]
+    assert len(tables) == 1, "未超硬上限的表格应整块保留"
+    assert "| 哨兵行 SENTINEL | 完整保留 | 末尾 |" in tables[0].text

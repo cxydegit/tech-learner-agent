@@ -305,6 +305,11 @@ def note_confirm_node(state: LearnState) -> dict:
         f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
         if persisted["results"] else "未沉淀任何知识点"
     )
+    # P3.1：索引失败不阻断沉淀，但要在产出里可见（8-19 事故：静默失败留缺口 6 天）
+    index_failed = [r["topic"] for r in persisted["results"] if r.get("index_ok") is False]
+    if index_failed:
+        summary += (f"\n⚠️ RAG 索引更新失败：{'、'.join(index_failed)}"
+                    f"（笔记已保存，下次运行 index 自动补齐）")
     # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给用户复核
     conflict_reports = persisted.get("conflict_reports") or []
     if conflict_reports:

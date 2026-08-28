@@ -48,12 +48,18 @@ class Config:
     # 文档分块参数（字符数）
     RAG_CHUNK_SIZE: int = int(os.getenv("RAG_CHUNK_SIZE", "800"))
     RAG_CHUNK_OVERLAP: int = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
+    # 分块硬上限（字符）：超出它的表格 / 代码块不再整块原子保留，按逻辑结构二次切分
+    # （表格按行重复表头 / 代码按空行分组），防超大块超出 embedding 输入上限。仅拦截病态块。
+    RAG_CHUNK_HARD_CAP: int = int(os.getenv("RAG_CHUNK_HARD_CAP", "8192"))
     # P3 索引对账（孤儿分块清理）：磁盘文件删除 / 改名后自动清理 Chroma 残留分块。
     # index_paths 末尾与 /ask 惰性入口都受此开关控制。
     RAG_RECONCILE: bool = os.getenv("RAG_RECONCILE", "true").lower() == "true"
     # /ask 惰性对账节流间隔（秒）：只在此间隔内的首次 /ask 做一次元数据对账（毫秒级），
     # 避免每次提问都扫全库；index_paths 末尾的对账不走节流（写入路径自愈）。
     RAG_RECONCILE_INTERVAL: int = int(os.getenv("RAG_RECONCILE_INTERVAL", "300"))
+    # /ask 路径单次对账补缺失的文件数上限（P3.1）：提问时补缺失会触发 embedding 调用，
+    # 限量避免拖延迟；写路径（index_paths / 写笔记）不限，缺口随下次写入全量补齐。
+    RAG_RECONCILE_BACKFILL_MAX: int = int(os.getenv("RAG_RECONCILE_BACKFILL_MAX", "3"))
 
     # LangGraph checkpointer 持久化（SqliteSaver，跨会话/跨进程恢复）
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"

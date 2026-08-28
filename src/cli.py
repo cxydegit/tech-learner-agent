@@ -154,6 +154,9 @@ def note(tech: str, file_path: str = None, content: str = None):
     for r in persisted["results"]:
         label = "🆕 新增" if r["action"] == "new" else "🔗 合并"
         console.print(f"  {label} [bold]{r['topic']}[/bold] → knowledge/{r['path']}")
+        if r.get("index_ok") is False:
+            console.print(f"    [bold yellow]⚠️ RAG 索引更新失败（{r.get('index_error')}）："
+                          f"笔记已保存，下次运行 index 会自动补齐[/bold yellow]")
 
     console.print(Panel(Markdown(f"知识沉淀完成，共 {len(persisted['results'])} 个知识点已写入 `knowledge/`。"
                                   f"详见 knowledge/INDEX.md"), title="✅ 学习成果沉淀完成", style="green"))
@@ -178,6 +181,9 @@ def index(force: bool = False):
     orphans = result.get("orphans", 0)
     if orphans:
         console.print(f"🧹 清理 [bold]{orphans}[/bold] 个磁盘已删除文件的残留分块")
+    backfilled = result.get("backfilled", 0)
+    if backfilled:
+        console.print(f"🩹 对账补齐 [bold]{backfilled}[/bold] 个缺失文件（此前索引失败/未索引）")
     if result["errors"]:
         console.print("[yellow]部分文件索引失败：[/yellow]")
         for e in result["errors"]:

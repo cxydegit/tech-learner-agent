@@ -10,7 +10,8 @@
 - ``keyword_search_knowledge()``：词法 BM25 召回（P1，补纯 dense 漏精确词匹配）
 - ``hybrid_search_knowledge()``：dense + BM25 → RRF 融合召回（P1，Q&A 默认走这里）
 - ``check_read_cache()``：read 历史召回（命中已有解读则提示复用）
-- ``reconcile_orphans()``：索引对账（P3，孤儿分块清理；index_paths 末尾自动跑，/ask 节流跑）
+- ``reconcile_orphans()``：索引对账（P3 删孤儿 + P3.1 补缺失；index_paths 末尾自动跑，
+  /ask 节流跑且单次补齐限量）
 
 ⚠️ 本模块 import 时会加载 chromadb，必须保持 lazy 导入（见 CLI / store 的调用点），
 否则 `import src.cli` 会被拉起 chromadb（不变量 I1）。
@@ -104,6 +105,47 @@ def _doc_metadata(path: Path, content: str) -> dict[str, str]:
     return meta
 
 
+def _index_single_file(collection: Any, path: Path, force: bool) -> tuple[str, str | None]:
+    """索引单个文件（index_paths 与对账补缺失共用；错误不抛出，由调用方决定呈现方式）。
+
+    Returns:
+        ("indexed" | "skipped" | "error", 错误消息或 None)。
+        "indexed"=已嵌入新块；"skipped"=不存在/空内容/内容未变（省计费）；"error"=嵌入失败。
+    """
+    if not path.exists():
+        return "skipped", None
+    content = path.read_text(encoding="utf-8", errors="replace")
+    if not content.strip():
+        return "skipped", None
+    rel = path.relative_to(config.BASE_DIR).as_posix()
+    digest = _content_digest(content)
+
+    # 变更检测：该文件已有同 hash 的分块则跳过，避免重复计费（force 时忽略）
+    existing = collection.get(where={"path": rel}, include=["metadatas"])
+    ids = existing.get("ids", [])
+    metas = existing.get("metadatas", []) or []
+    if not force and any(m.get("content_hash") == digest for m in metas):
+        return "skipped", None
+
+    # 内容变更或新文件：删旧块 → 重新切块嵌入
+    if ids:
+        collection.delete(ids=ids)
+    chunks = chunk_markdown(content)
+    if not chunks:
+        return "skipped", None
+    meta = _doc_metadata(path, content)
+    doc_ids = [f"{rel}::{i}" for i in range(len(chunks))]
+    doc_metas = [
+        {**meta, "content_hash": digest, "chunk": i, "section": c.section}
+        for i, c in enumerate(chunks)
+    ]
+    try:
+        collection.add(ids=doc_ids, documents=[c.text for c in chunks], metadatas=doc_metas)
+        return "indexed", None
+    except Exception as e:  # noqa: BLE001 —— 单文件失败不应中断全量索引
+        return "error", f"{rel}: {e}"
+
+
 def index_paths(paths: list[Path], force: bool = False) -> dict:
     """增量索引指定文件；内容未变化则跳过（避免重复嵌入计费）。
 
@@ -112,53 +154,29 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
         force: 忽略变更检测，强制重新切块嵌入（分块器升级 / 参数调整后需要）
 
     Returns:
-        {"indexed": int, "skipped": int, "orphans": int, "errors": list[str]}
-        ``orphans`` 为本轮对账清理的孤儿分块数（P3；磁盘已删除文件的残留分块）。
+        {"indexed": int, "skipped": int, "orphans": int, "backfilled": int,
+         "errors": list[str]}
+        ``orphans`` 为对账清理的孤儿分块数（P3）；``backfilled`` 为对账补齐的
+        缺失文件数（P3.1，磁盘有而索引无的文件——写路径自愈，不限个数）。
     """
     collection = get_collection()
     indexed = skipped = 0
     errors: list[str] = []
 
     for path in paths:
-        if not path.exists():
-            continue
-        content = path.read_text(encoding="utf-8", errors="replace")
-        if not content.strip():
-            continue
-        rel = path.relative_to(config.BASE_DIR).as_posix()
-        digest = _content_digest(content)
-
-        # 变更检测：该文件已有同 hash 的分块则跳过，避免重复计费（force 时忽略）
-        existing = collection.get(where={"path": rel}, include=["metadatas"])
-        ids = existing.get("ids", [])
-        metas = existing.get("metadatas", []) or []
-        if not force and any(m.get("content_hash") == digest for m in metas):
-            skipped += 1
-            continue
-
-        # 内容变更或新文件：删旧块 → 重新切块嵌入
-        if ids:
-            collection.delete(ids=ids)
-        chunks = chunk_markdown(content)
-        if not chunks:
-            skipped += 1
-            continue
-        meta = _doc_metadata(path, content)
-        doc_ids = [f"{rel}::{i}" for i in range(len(chunks))]
-        doc_metas = [
-            {**meta, "content_hash": digest, "chunk": i, "section": c.section}
-            for i, c in enumerate(chunks)
-        ]
-        try:
-            collection.add(ids=doc_ids, documents=[c.text for c in chunks], metadatas=doc_metas)
+        status, err = _index_single_file(collection, path, force)
+        if status == "indexed":
             indexed += 1
-        except Exception as e:  # noqa: BLE001 —— 单文件失败不应中断全量索引
-            errors.append(f"{rel}: {e}")
+        elif status == "skipped":
+            skipped += 1
+        if err:
+            errors.append(err)
 
-    # P3 对账：以「磁盘现状」为准清理孤儿分块。手动 index / 每次写笔记都会经过这里，
-    # 删除/改名后的残留分块随下一次自然写入自愈，无需定期跑 index。
-    result = {"indexed": indexed, "skipped": skipped, "orphans": _reconcile_orphans(), "errors": errors}
-    return result
+    # P3/P3.1 对账：以「磁盘现状」为准修齐索引——删孤儿 + 补缺失。手动 index /
+    # 每次写笔记都会经过这里，缺口随下一次自然写入自愈，无需定期跑 index。
+    rec = _reconcile_index(backfill=True)
+    return {"indexed": indexed, "skipped": skipped,
+            "orphans": rec["orphans"], "backfilled": rec["backfilled"], "errors": errors}
 
 
 def index_documents(paths: list[Path] | None = None, force: bool = False) -> dict:
@@ -179,55 +197,74 @@ def index_documents(paths: list[Path] | None = None, force: bool = False) -> dic
 # 索引对账（P3：孤儿分块清理）
 # ============================================================
 
-def _reconcile_orphans() -> int:
-    """对账：删除磁盘上已不存在文件的残留分块（孤儿分块清理）。
+def _reconcile_index(*, backfill: bool, max_backfill: int | None = None) -> dict:
+    """对账：以「磁盘现状」为准修齐索引——删孤儿 + 补缺失。
 
-    磁盘文件删除 / 改名后，Chroma 仍残留旧分块，/ask 会召回并引用已不存在的笔记。
-    本函数以「磁盘现状」为准：取 collection 全部 path（只读 metadatas，不拉文档/向量），
-    与 _discover_files() 对比，删除 path 不在磁盘的分块。小库下开销毫秒级。
+    - 删孤儿（P3）：磁盘已不存在文件的残留分块，/ask 会召回并引用已不存在的笔记；
+    - 补缺失（P3.1，8-19 事故）：磁盘有而索引无任何分块的文件。笔记写盘成功但
+      索引静默失败时，缺口从这里自愈——digest 变更检测保证补齐幂等、不重复计费。
 
-    受 config.RAG_RECONCILE 控制（默认开）；Chroma 异常 / 索引未建时静默返回 0。
+    Args:
+        backfill: 是否补缺失（只读路径可关或限个数）
+        max_backfill: 单次补齐文件数上限（None 不限）。/ask 节流路径传 config 上限，
+            避免提问时突发多次 embedding 调用拖延迟；写路径（index_paths）不限。
 
     Returns:
-        删除的孤儿分块数
+        {"orphans": 删除的孤儿分块数, "backfilled": 补齐的文件数}
+
+    受 config.RAG_RECONCILE 控制（默认开）；Chroma 异常 / 索引未建时静默降级为 0。
     """
     if not config.RAG_RECONCILE:
-        return 0
+        return {"orphans": 0, "backfilled": 0}
     try:
         res = get_collection().get(include=["metadatas"])
     except Exception:  # noqa: BLE001 —— 索引未建 / Chroma 异常时静默降级
-        return 0
+        return {"orphans": 0, "backfilled": 0}
     ids = res.get("ids", [])
     metas = res.get("metadatas", []) or []
-    if not ids:
-        return 0
     disk_paths = {p.relative_to(config.BASE_DIR).as_posix() for p in _discover_files()}
+    indexed_paths = {m.get("path") for m in metas}
+
+    # 1) 删孤儿：path 不在磁盘的分块
+    orphans = 0
     orphan_ids = [doc_id for doc_id, m in zip(ids, metas) if m.get("path") not in disk_paths]
-    if not orphan_ids:
-        return 0
-    try:
-        get_collection().delete(ids=orphan_ids)
-    except Exception:  # noqa: BLE001 —— 删除失败不致命，下次对账再试
-        return 0
-    return len(orphan_ids)
+    if orphan_ids:
+        try:
+            get_collection().delete(ids=orphan_ids)
+            orphans = len(orphan_ids)
+        except Exception:  # noqa: BLE001 —— 删除失败不致命，下次对账再试
+            orphans = 0
+
+    # 2) 补缺失：磁盘有而索引无分块的文件（空文件补不进会随下次对账重试，无副作用）
+    backfilled = 0
+    if backfill:
+        missing = sorted(disk_paths - indexed_paths)
+        if max_backfill is not None:
+            missing = missing[:max_backfill]
+        collection = get_collection()
+        for rel in missing:
+            status, _err = _index_single_file(collection, config.BASE_DIR / rel, force=False)
+            if status == "indexed":
+                backfilled += 1
+    return {"orphans": orphans, "backfilled": backfilled}
 
 
-def reconcile_orphans(force: bool = False) -> int:
+def reconcile_orphans(force: bool = False) -> dict:
     """带节流的对账入口（/ask 惰性调用）：RAG_RECONCILE_INTERVAL 秒内只跑一次。
 
-    index_paths 末尾的对账不走节流（写入路径自愈）；此处节流避免每次提问都扫全库。
-    force=True 跳过节流强制对账（备用，当前无调用点）。
+    index_paths 末尾的对账不走节流（写入路径自愈、补齐不限量）；此处节流避免每次
+    提问都扫全库，且单次补齐文件数受 RAG_RECONCILE_BACKFILL_MAX 限制（提问时
+    突发大量 embedding 调用会拖延迟）。force=True 跳过节流强制对账。
 
     Returns:
-        本次实际删除的孤儿分块数（节流跳过 / 未启用时为 0）
+        {"orphans": int, "backfilled": int}（节流跳过 / 未启用时均为 0）
     """
     global _last_reconcile_at
     now = time.time()
     if not force and now - _last_reconcile_at < config.RAG_RECONCILE_INTERVAL:
-        return 0
-    n = _reconcile_orphans()
+        return {"orphans": 0, "backfilled": 0}
     _last_reconcile_at = now
-    return n
+    return _reconcile_index(backfill=True, max_backfill=config.RAG_RECONCILE_BACKFILL_MAX)
 
 
 # ============================================================
@@ -443,6 +480,8 @@ def main() -> None:
 
     result = index_documents(force=args.force)
     print(f"索引完成：新增 {result['indexed']} 个文件，跳过 {result['skipped']} 个未变化文件")
+    if result.get("backfilled"):
+        print(f"对账补齐 {result['backfilled']} 个缺失文件（此前索引失败 / 未索引）")
     if result["errors"]:
         print("错误：")
         for e in result["errors"]:

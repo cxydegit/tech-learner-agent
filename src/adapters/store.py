@@ -7,6 +7,7 @@ save_file_tool / read_file_tool / list_files_tool。
 """
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -138,13 +139,36 @@ def read_knowledge_note(rel_path: str) -> str:
     return p.read_text(encoding="utf-8") if p.exists() else ""
 
 
-def _update_rag_index(filepath: Path) -> None:
-    """笔记写库后增量更新 RAG 索引（失败静默，不影响主流程）。"""
-    try:
-        from .vector import index_paths
-        index_paths([filepath])
-    except Exception:  # noqa: BLE001 —— 索引失败不应阻断沉淀
-        pass
+# 索引瞬时失败的重试间隔（秒）：限流 / 网络抖动类失败立即重试一次即可兜住
+_INDEX_RETRY_DELAY_SECONDS = 1.5
+
+
+def _update_rag_index(filepath: Path) -> dict:
+    """笔记写库后增量更新 RAG 索引：失败不阻断沉淀，但状态必须返回给调用方呈现。
+
+    P3.1（8-19 事故复盘）：此前失败被 `except: pass` 静默吞掉——embedding API
+    一次抖动让 4 篇新笔记「保存成功但检索不到」，无日志无重试、对账只删不补，
+    缺口留存 6 天才被评估撞见。现在：瞬时失败立即重试一次（失败的调用不产生
+    embedding 计费）；仍失败则返回失败状态，由接口层（cli/graph/web）渲染警告。
+
+    Returns:
+        {"index_ok": True} 或 {"index_ok": False, "index_error": 原因}
+    """
+    last_err: str | None = None
+    for attempt in (1, 2):
+        try:
+            from .vector import index_paths
+            result = index_paths([filepath])
+            # index_paths 对单文件失败不抛异常而是记进 errors 列表——必须显式检查
+            if result.get("errors"):
+                last_err = "; ".join(result["errors"])
+            else:
+                return {"index_ok": True}
+        except Exception as e:  # noqa: BLE001 —— 索引失败不应阻断沉淀
+            last_err = f"{type(e).__name__}: {e}"
+        if attempt == 1:
+            time.sleep(_INDEX_RETRY_DELAY_SECONDS)
+    return {"index_ok": False, "index_error": last_err}
 
 
 def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None,
@@ -165,7 +189,9 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
         replace_path: 可选，要覆盖合并的已有笔记相对路径（knowledge/ 下）
 
     Returns:
-        {"action": "new"|"merged", "path": str（相对 knowledge/）, "topic": str}
+        {"action": "new"|"merged", "path": str（相对 knowledge/）, "topic": str,
+         "index_ok": bool, "index_error": str|None（仅失败时）}
+        索引失败不代表写盘失败——笔记已在磁盘，缺口由对账补缺失自愈。
     """
     ensure_knowledge_base()
     tech_dir = config.KNOWLEDGE_DIR / sanitize_filename(tech)
@@ -180,8 +206,9 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
             tag_str = " ".join(f"#{t}" for t in _merge_tags(old_tags, tags))
             header = f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n"
             filepath.write_text(header + content.lstrip(), encoding="utf-8")
-            _update_rag_index(filepath)
-            return {"action": "merged", "path": replace_path, "topic": topic}
+            result = {"action": "merged", "path": replace_path, "topic": topic}
+            result.update(_update_rag_index(filepath))
+            return result
 
     # 新建：dated 文件 + 更新索引
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -189,8 +216,9 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
     filepath = tech_dir / filename
     filepath.write_text(_with_header(topic, tags, content), encoding="utf-8")
     update_index(tech, topic, filepath)
-    _update_rag_index(filepath)
-    return {"action": "new", "path": filepath.relative_to(config.KNOWLEDGE_DIR).as_posix(), "topic": topic}
+    result = {"action": "new", "path": filepath.relative_to(config.KNOWLEDGE_DIR).as_posix(), "topic": topic}
+    result.update(_update_rag_index(filepath))
+    return result
 
 
 def _parse_header(content: str) -> tuple[str | None, list[str]]:

@@ -427,9 +427,25 @@ def _note(args: dict, ctx: CoachCtx) -> dict:
                 "message": format_merge_candidates(result["merge_candidates"]),
                 "note": "把上面的候选呈现给用户，让用户回复 all（全合并）/ 编号逐条（如 1,3）/ skip（跳过）；用户决定后调用 note_commit，decision 传用户原话。"}
     persisted = persist_points(tech, result["new_points"], [], set())
-    return {"status": "ok", "new_count": persisted["new_count"], "merged_count": 0,
-            "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
-                        for r in persisted["results"]]}
+    out = {"status": "ok", "new_count": persisted["new_count"], "merged_count": 0,
+           "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
+                       for r in persisted["results"]]}
+    warning = _index_warning(persisted)
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+def _index_warning(persisted: dict) -> str:
+    """索引失败提示（P3.1）：沉淀结果里有 index_ok=False 时生成给 agent 转述的警告。
+
+    索引失败不阻断沉淀（笔记已在磁盘），但必须可见——8-19 事故的教训：静默失败
+    让 4 篇笔记「保存成功但检索不到」，缺口留存 6 天。
+    """
+    failed = [r["topic"] for r in persisted.get("results", []) if r.get("index_ok") is False]
+    if not failed:
+        return ""
+    return f"⚠️ RAG 索引更新失败：{'、'.join(failed)}（笔记已保存，稍后运行 index 会自动补齐）"
 
 
 def _note_commit(args: dict, ctx: CoachCtx) -> dict:
@@ -443,10 +459,14 @@ def _note_commit(args: dict, ctx: CoachCtx) -> dict:
     ctx.updates["coach_note_pending"] = None  # 提交后清掉，避免重复提交
     # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给 agent 转述用户
     conflict_reports = persisted.get("conflict_reports") or []
-    return {"status": "ok", "new_count": persisted["new_count"], "merged_count": persisted["merged_count"],
-            "conflict_reports": conflict_reports,
-            "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
-                        for r in persisted["results"]]}
+    out = {"status": "ok", "new_count": persisted["new_count"], "merged_count": persisted["merged_count"],
+           "conflict_reports": conflict_reports,
+           "results": [{"topic": r["topic"], "path": r["path"], "action": r["action"]}
+                       for r in persisted["results"]]}
+    warning = _index_warning(persisted)
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 # ============================================================
@@ -504,6 +524,9 @@ def run_memory_sweep(tech: str, buffer: list[dict], progress=None) -> dict:
                 "pending": pending, "message": msg}
     persisted = persist_points(tech, result["new_points"], [], set())
     msg = f"（内部）已自动沉淀 {persisted['new_count']} 个新知识点。"
+    warning = _index_warning(persisted)
+    if warning:
+        msg += f" {warning}（请在回复中提醒用户）"
     return {"action": "persisted", "count": persisted["new_count"],
             "pending": None, "message": msg}
 
