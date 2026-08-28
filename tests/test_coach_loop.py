@@ -296,12 +296,15 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
 
 
 def test_coach_trim_compresses_over_threshold(monkeypatch):
-    """超阈值 → LLM 摘要写入 coach_summary，消息裁剪到最近 N 轮。"""
+    """超阈值 → 三舱记忆整理（LLM 增量），脉络舱写入，消息裁剪到最近 N 轮。"""
     msgs = [{"role": "user", "content": f"消息{i}"} for i in range(config.COACH_COMPRESS_AT + 5)]
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u: "【压缩摘要】")
+    monkeypatch.setattr(route_mod, "generate_text",
+                        lambda s, u: '{"facts_add": ["用户偏好类比"], "open_add": [], '
+                                     '"resolved": [], "context": "【压缩摘要】"}')
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     assert out["coach_summary"] == "【压缩摘要】"
+    assert out["coach_facts"] == ["用户偏好类比"]  # 事实舱同步积累
     assert len(out["coach_messages"]) <= config.COACH_HISTORY_KEEP * 2
 
 

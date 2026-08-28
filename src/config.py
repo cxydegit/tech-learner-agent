@@ -77,8 +77,11 @@ class Config:
     COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "10"))
     #消息数 超过 40 条 才触发压缩
     COACH_COMPRESS_AT: int = int(os.getenv("COACH_COMPRESS_AT", "40"))
-    #摘要输出不超过 800 Token，防止摘要膨胀
-    COACH_SUMMARY_MAX_TOKENS: int = int(os.getenv("COACH_SUMMARY_MAX_TOKENS", "800"))
+    # 记忆系统 Step 4：三舱记忆整理——LLM 只看新消息产增量，确定性代码管积累（防重写衰减）。
+    # 事实/未决舱永不被 LLM 重写，只有机械上限；脉络舱允许衰减（外部真相兜底）+字符上限。
+    COACH_FACTS_MAX: int = int(os.getenv("COACH_FACTS_MAX", "20"))  # 事实舱上限（超限丢最旧）
+    COACH_OPEN_MAX: int = int(os.getenv("COACH_OPEN_MAX", "8"))  # 未决舱上限（超限丢最旧）
+    COACH_SUMMARY_MAX_CHARS: int = int(os.getenv("COACH_SUMMARY_MAX_CHARS", "600"))  # 脉络舱机械上限
 
     # 工具调用通道失败时的回退开关：true → 去掉 tools 定义用纯文本再问一次（降级可用性）
     ROUTE_FALLBACK_TO_TEXT: bool = os.getenv("ROUTE_FALLBACK_TO_TEXT", "true").lower() == "true"

@@ -37,8 +37,8 @@ from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
 from .pipelines.route import (COACH_TOOLS_BY_MODE, CoachCtx, coach_system_prompt,
-                              run_coach_tool, run_kb_retrieve, run_memory_sweep,
-                              summarize_conversation)
+                              consolidate_memory, run_coach_tool, run_kb_retrieve,
+                              run_memory_sweep)
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
@@ -186,7 +186,11 @@ class LearnState(TypedDict):
     # 模型上下文消息（openai 兼容 dict 列表，有界、覆盖写）：与 conversation（展示用）分离——
     # conversation 无界保留完整对话供前端渲染，coach_messages 只留最近几轮 + 摘要。
     coach_messages: list
-    coach_summary: str  # 压缩摘要（后续阶段落地 LLM 摘要，当前为空字符串）
+    coach_summary: str  # 脉络舱：近期学习焦点摘要（允许衰减，真相在 roadmap/知识库，有字符上限）
+    # 记忆系统 Step 4：三舱记忆——事实舱（画像补充/偏好/纠正/决定，追加式，永不被 LLM 重写）
+    # 与未决舱（[{id, text}]，LLM 判定 resolved 编号、代码按 id 确定性淘汰）。checkpointer 持久化。
+    coach_facts: list
+    coach_open_items: list
     # 问卷状态：answers 见 domain/survey；survey_field 当前待收集字段，None 表示进入动态诊断题
     survey_answers: dict
     survey_field: str | None
@@ -368,8 +372,9 @@ def coach_trim(state: LearnState) -> dict:
 
     - 初始化：仅新线程兜底——mode 缺省置 survey、问卷起始字段置 self_level
       （跨会话恢复时两者已在 checkpoint 持久化，本节点不重复初始化）。
-    - 压缩：消息总量超 COACH_COMPRESS_AT 时，旧消息经 LLM 摘要进 coach_summary，
-      只保留最近 COACH_HISTORY_KEEP 轮。摘要失败降级为直接丢弃旧消息（保上下文有界）。
+    - 压缩：消息总量超 COACH_COMPRESS_AT 时，旧消息经三舱记忆整理（consolidate_memory）
+      增量进 facts / open_items / summary 三舱，只保留最近 COACH_HISTORY_KEEP 轮。
+      LLM 失败时三舱原样保留、消息照常裁剪（保上下文有界）。
 
     ⚠️ 初始化判断要用「带 survey 默认值的有效 mode」，不能用裸 state.mode：
     新线程时它是 None；且本节点写入的 mode 要等返回后才生效。
@@ -382,11 +387,18 @@ def coach_trim(state: LearnState) -> dict:
     if mode == "survey" and not state.get("survey_field") and not state.get("survey_answers"):
         updates["survey_field"] = survey.SURVEY_FIELDS[0]  # 从第一问开始
 
-    # 上下文压缩：超阈值 → 旧消息摘要压缩进 coach_summary，只留最近 N 轮
+    # 上下文压缩：超阈值 → 三舱记忆增量整理（LLM 只看旧消息产增量，既有积累不过 LLM），
+    # 只留最近 N 轮
     if len(msgs) > config.COACH_COMPRESS_AT:
         old, recent = msgs[:-keep], msgs[-keep:]
-        updates["coach_summary"] = summarize_conversation(
-            state.get("coach_summary") or "", old, state.get("tech") or "")
+        mem = consolidate_memory(
+            {"facts": state.get("coach_facts") or [],
+             "open_items": state.get("coach_open_items") or [],
+             "summary": state.get("coach_summary") or ""},
+            old, state.get("tech") or "")
+        updates["coach_facts"] = mem["facts"]
+        updates["coach_open_items"] = mem["open_items"]
+        updates["coach_summary"] = mem["summary"]
         updates["coach_messages"] = recent
     return updates
 

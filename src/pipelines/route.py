@@ -16,6 +16,7 @@ from ..adapters import learner
 from ..adapters.llm import generate_text
 from ..domain import roadmap as roadmap_domain
 from ..domain import survey
+from ..domain.extraction import parse_json_object
 from .collect import collect_pipeline
 from .note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
 from .qa import _search_notes, qa_pipeline
@@ -96,6 +97,18 @@ def _coaching_prompt(state, tech: str) -> str:
     prog = ""
     if roadmap:
         prog = "\n\n当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap)
+    # 记忆系统 Step 4：画像直注（修复 coaching 模式不注入画像的缺口，画像与摘要解耦）+ 三舱注入
+    profile = state.get("learner_profile") or {}
+    profile_block = f"用户画像：{survey.profile_summary(profile)}\n" if profile else ""
+    facts = state.get("coach_facts") or []
+    facts_block = ""
+    if facts:
+        facts_block = "已确认的事实与偏好：\n" + "\n".join(f"- {f}" for f in facts) + "\n"
+    open_items = state.get("coach_open_items") or []
+    open_block = ""
+    if open_items:
+        open_block = ("未决事项（待跟进，解决后移除）：\n"
+                      + "\n".join(f"- [{it['id']}] {it['text']}" for it in open_items) + "\n")
     conv = (state.get("coach_summary") or "").strip()
     conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
     # 记忆系统 Step 2：确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
@@ -109,7 +122,8 @@ def _coaching_prompt(state, tech: str) -> str:
                     "优先依据上述片段作答，引用时标注来源；片段未覆盖的部分可用你自己的知识补充，"
                     "但必须明确区分「来自你笔记的内容」与「基于经验的讲解」。")
     return (
-        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}{conv_block}{kb_block}\n\n"
+        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}\n"
+        f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ note（沉淀笔记）/ "
         "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）。"
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
@@ -659,48 +673,103 @@ def run_coach_tool(name: str, args: dict, ctx: CoachCtx) -> dict:
 
 
 # ============================================================
-# 上下文压缩：会话摘要（Step 4 落地，提示词待用户审核）
+# 记忆系统 Step 4：三舱记忆整理（事实/未决/脉络）
+# 核心原则：LLM 只看新消息产增量；已积累的记忆永不再过 LLM 的手（衰减结构性归零）。
+# 提示词已提交用户审核并确认。
 # ============================================================
 
-SUMMARIZE_COACH_PROMPT = """你是一个学习会话的摘要助手。把一段较长的对话压缩成一条精炼摘要，供后续对话继续使用（作为长期上下文）。
+CONSOLIDATE_MEMORY_PROMPT = """你是学习会话的记忆整理助手。我会给你：现有「稳定事实」列表、现有「未决事项」列表（带编号）、以及一批刚发生的对话。请为长期记忆做一次增量整理。
 
-## 必须保留
-- 用户的身份信息与学习偏好（技术水平、目标、时间预算）
-- 学习进度（已学内容、已完成里程碑、当前阶段）
-- 未解决的问题 / 待办事项 / 用户明确提出的问题
-- 已做出的决定（如路线确认、笔记合并决策）
+## 输出
+只输出一个 JSON 对象，不要任何解释或 ```json 代码块标记：
+{"facts_add": ["新稳定事实，每条一句话"],
+ "open_add": ["新未决事项，每条一句话"],
+ "resolved": [已解决的未决事项编号，如 2],
+ "context": "最近学习进展的一段话（150 字以内）"}
 
-## 必须丢弃
-- 寒暄、重复、与学习无关的闲聊、工具执行的内部细节
+## 判定标准
+- facts_add（稳定事实=整个会话都该记住的）：用户画像的变化（水平/目标/时间预算）、学习偏好（如「喜欢类比」「少贴长代码」）、对陪练的纠正（如「不要用英文术语」）、重要决定（如「先跳过 Maven 直接学 Gradle」）。与「现有稳定事实」重复或同义的不输出；寒暄、过程性内容、普通问答不输出。
+- open_add（未决事项=仍开放的问题/承诺/待确认）：用户提出但还没解决的问题、陪练答应之后要讲的主题、待用户确认的事。
+- resolved：现有未决事项中，已被新对话回答/完成/用户明确不再关心的编号。没有则输出 []。
+- context：只写最近学了什么、当前焦点、下一步意向；画像、决定、未决事项不要写进来（它们有独立位置，写进 context 会被反复重写）。
 
-## 要求
-- 只输出一段纯文本，不要标题、不要列表符号、不要"摘要："前缀
-- 信息密度高，控制在 200 字以内"""
+## 正例
+- 用户说「这个类比好懂，后面多举例子」→ facts_add: ["用户反馈类比讲解效果好，希望多用类比"]
+- 陪练讲完了「[2] 待讲：事务传播」→ resolved: [2]
+- 用户问「AOP 切面执行顺序还没搞懂」→ open_add: ["AOP 切面执行顺序还没搞懂"]
+
+## 反例（不要这样做）
+- 把「用户问了 X」塞进 facts_add——已回答的普通问答不是事实
+- 在 context 里复述画像或决定
+- 输出解释文字、markdown 或编造未给出的编号
+"""
 
 
-def summarize_conversation(existing_summary: str, messages: list[dict], tech: str) -> str:
-    """把旧对话消息压缩成摘要（叠加既有摘要），供 coach 长期上下文使用。
+def consolidate_memory(existing: dict, messages: list[dict], tech: str) -> dict:
+    """三舱记忆增量整理：LLM 提取增量 → 确定性应用（去重追加 / 按 id 淘汰 / 机械上限）。
 
     Args:
-        existing_summary: 上一轮的摘要（可为空）
-        messages: 待压缩的消息（只取 user/assistant 文本，工具结果机器态不入摘要）
+        existing: 现有三舱 {"facts": [str], "open_items": [{"id": int, "text": str}],
+                  "summary": str}
+        messages: 本次被压缩掉的旧消息（只取 user/assistant 文本，工具机器态不入）
         tech: 技术名
 
     Returns:
-        新摘要（非空）；LLM 失败时降级为既有摘要（调用方决定是否丢弃旧消息）。
+        应用增量后的完整三舱 {"facts", "open_items", "summary"}。
+        LLM 失败 / JSON 解析失败 → 三舱原样返回（宁可少记一窗增量，不拿既有积累冒险）。
     """
+    facts = list(existing.get("facts") or [])
+    open_items = list(existing.get("open_items") or [])
+    old_summary = existing.get("summary") or ""
+
     parts = []
     for m in messages:
         if m.get("role") in ("user", "assistant") and m.get("content"):
             parts.append(f"{m['role']}：{m['content']}")
-    block = "\n".join(parts[-50:])  # 单次压缩输入封顶，防止摘要调用过长
+    block = "\n".join(parts[-50:])  # 单次整理输入封顶
     if not block.strip():
-        return existing_summary
-    user_content = (f"技术：{tech}\n"
-                    f"已有摘要：{existing_summary or '（无）'}\n"
-                    f"===== 待压缩对话 =====\n{block}")
+        return {"facts": facts, "open_items": open_items, "summary": old_summary}
+
+    facts_txt = "\n".join(f"- {f}" for f in facts) or "（无）"
+    open_txt = "\n".join(f"- [{it['id']}] {it['text']}" for it in open_items) or "（无）"
+    user_content = (f"技术：{tech}\n\n"
+                    f"===== 现有稳定事实 =====\n{facts_txt}\n"
+                    f"===== 现有未决事项 =====\n{open_txt}\n"
+                    f"===== 刚发生的对话 =====\n{block}")
     try:
-        text = generate_text(SUMMARIZE_COACH_PROMPT, user_content).strip()
-        return text or existing_summary
-    except Exception:  # noqa: BLE001 —— LLM 不可用时保留旧摘要
-        return existing_summary
+        raw = generate_text(CONSOLIDATE_MEMORY_PROMPT, user_content)
+    except Exception:  # noqa: BLE001 —— LLM 不可用时三舱原样保留
+        return {"facts": facts, "open_items": open_items, "summary": old_summary}
+    obj = parse_json_object(raw)
+    if not obj:
+        return {"facts": facts, "open_items": open_items, "summary": old_summary}
+
+    # 确定性应用：facts 去重追加
+    known = {f.strip() for f in facts}
+    for f in obj.get("facts_add") or []:
+        f = str(f).strip()
+        if f and f not in known:
+            facts.append(f)
+            known.add(f)
+    # open 追加（id 全局递增）
+    next_id = max((it.get("id") or 0) for it in open_items) if open_items else 0
+    for t in obj.get("open_add") or []:
+        t = str(t).strip()
+        if t:
+            next_id += 1
+            open_items.append({"id": next_id, "text": t})
+    # resolved 按 id 确定性淘汰（不存在的 id 忽略）
+    resolved: set[int] = set()
+    for r in obj.get("resolved") or []:
+        try:
+            resolved.add(int(r))
+        except (TypeError, ValueError):
+            continue
+    open_items = [it for it in open_items if it.get("id") not in resolved]
+
+    # 机械上限：facts / open 超限丢最旧；脉络舱字符上限兜底（防膨胀，原死配置补上机械约束）
+    facts = facts[-config.COACH_FACTS_MAX:]
+    open_items = sorted(open_items, key=lambda it: it.get("id") or 0)[-config.COACH_OPEN_MAX:]
+    ctx = str(obj.get("context") or "").strip()
+    summary = ctx[:config.COACH_SUMMARY_MAX_CHARS] if ctx else old_summary
+    return {"facts": facts, "open_items": open_items, "summary": summary}
