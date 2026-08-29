@@ -29,9 +29,12 @@ def test_related_parse():
 
 
 def test_goal_parse():
-    assert sv.parse_answer_for_field("goal", "想快速上手跑个最小项目")[0] == sv.GOAL_MIN_PROJECT
-    assert sv.parse_answer_for_field("goal", "想深入原理看源码")[0] == sv.GOAL_DEEP
-    v, e = sv.parse_answer_for_field("goal", "随便看看")
+    """goal 自由文本：原样保存用户原话，仅校验非空。"""
+    raw = "熟悉python语法，基本看懂python项目里面的代码逻辑"
+    assert sv.parse_answer_for_field("goal", raw) == (raw, None)
+    assert sv.parse_answer_for_field("goal", "想深入原理看源码") == ("想深入原理看源码", None)
+    assert sv.parse_answer_for_field("goal", "随便看看") == ("随便看看", None)
+    v, e = sv.parse_answer_for_field("goal", "   ")
     assert v is None and e
 
 
@@ -81,16 +84,25 @@ def test_derive_profile_buckets():
 
 
 def test_derive_profile_carries_fields():
-    p = sv.derive_profile({"self_level": 8, "related": "Java", "goal": sv.GOAL_DEEP,
+    p = sv.derive_profile({"self_level": 8, "related": "Java", "goal": "能看懂项目代码",
                            "time_budget": 2.0, "diagnostics": ["a"]}, "Spring")
     assert p["related"] == "Java"
+    assert p["goal"] == "能看懂项目代码"
     assert p["diagnostics"] == ["a"]
 
 
 def test_profile_summary():
-    p = sv.derive_profile({"self_level": 8, "related": "Java", "goal": sv.GOAL_DEEP,
+    p = sv.derive_profile({"self_level": 8, "related": "Java", "goal": "能独立写个小工具",
                            "time_budget": 2.0}, "Spring Boot")
     s = sv.profile_summary(p)
     assert "Spring Boot" in s
     assert "开发者" in s
-    assert "深入原理" in s
+    assert "目标：能独立写个小工具" in s
+
+
+def test_profile_summary_legacy_enum_goal():
+    """旧 profile.json / checkpoint 残留的枚举 goal 兼容渲染为可读文案。"""
+    p = sv.derive_profile({"self_level": 8, "goal": sv.GOAL_DEEP}, "X")
+    assert "目标：深入原理" in sv.profile_summary(p)
+    p2 = sv.derive_profile({"self_level": 8, "goal": sv.GOAL_MIN_PROJECT}, "X")
+    assert "目标：快速上手跑通最小项目" in sv.profile_summary(p2)

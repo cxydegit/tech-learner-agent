@@ -35,7 +35,7 @@ _FIELD_LABELS = {
 _FIELD_HINTS = {
     "self_level": "0-10 之间的数字",
     "related": "自由文本（没有就填「无」）",
-    "goal": "「快速上手跑通最小项目」或「深入原理」",
+    "goal": "自由文本：学完后想做到什么（一句话，越具体越好，原样记录用户原话）",
     "time_budget": "每天小时数（如 2）",
 }
 
@@ -124,8 +124,9 @@ def _coaching_prompt(state, tech: str) -> str:
     return (
         f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}\n"
         f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}\n\n"
-        "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ note（沉淀笔记）/ "
+        "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ "
         "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）。"
+        "学习内容会自动沉淀进知识库（系统后台处理），无需调用 note 工具。"
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
         "不要原样堆砌。里程碑完成时用 update_roadmap 勾选。"
     )
@@ -274,7 +275,9 @@ UPDATE_ROADMAP_SCHEMA = {
 COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
     "survey": [],
     "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA, GET_ROADMAP_SCHEMA],
-    "coaching": [COLLECT_SCHEMA, READ_SCHEMA, NOTE_SCHEMA, NOTE_COMMIT_SCHEMA, ASK_SCHEMA,
+    # coaching 不再暴露 note/note_commit：学习内容由自动沉淀（记忆系统 Step 1 v2，后台线程）
+    # 确定性落库 + 候选确定性确认，agent 手动 note 会同步阻塞对话（note_pipeline 耗时长）
+    "coaching": [COLLECT_SCHEMA, READ_SCHEMA, ASK_SCHEMA,
                  GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA],
 }
 

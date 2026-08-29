@@ -188,7 +188,8 @@ export async function selectSession(id) {
       coachPayload = detail.pending_coach;
       setState({ running: false, coachPending: { ...getState().coachPending, [id]: detail.pending_coach } });
       renderChat();
-      appendAiMessage(detail.pending_coach.message || "");
+      appendAiMessage(detail.pending_coach.message || "",
+        detail.pending_coach.doc, detail.pending_coach.doc_type);
       showCoachReplyInput();
       return;
     }
@@ -411,7 +412,8 @@ function onInterrupt(e) {
       running: false, // worker 已退出（interrupt 暂停），其他会话可继续用
     });
     renderInputZone();
-    appendAiMessage((e.payload && e.payload.message) || ""); // 陪练问题即时上屏
+    appendAiMessage((e.payload && e.payload.message) || "", // 陪练问题即时上屏
+      e.payload && e.payload.doc, e.payload && e.payload.doc_type);
     showCoachReplyInput();
     return;
   }
@@ -525,8 +527,9 @@ function showInterrupt(payload) {
   });
 }
 
-/* 把陪练问题作为 AI 气泡追加到聊天区（coach 问答即时上屏；final 时由权威状态整体重渲染，无重复） */
-function appendAiMessage(content) {
+/* 把陪练问题作为 AI 气泡追加到聊天区（coach 问答即时上屏；final 时由权威状态整体重渲染，无重复）。
+   doc/docType 来自 coach_question 负载：collect/read 产出文档时实时渲染「查看完整文档」chip。 */
+function appendAiMessage(content, doc, docType) {
   const body = $("#chatBody");
   let stream = body.querySelector(".chat-stream");
   if (!stream) {
@@ -537,22 +540,42 @@ function appendAiMessage(content) {
   }
   const div = document.createElement("div");
   div.className = "msg-ai";
+  let chip = "";
+  if (doc) {
+    chip = `<button class="doc-chip" data-doc="${escapeHtml(doc)}">` +
+      `📄 ${CHIP_LABEL[docType] || "阅读全文"} ↗</button>`;
+  }
   div.innerHTML = `<div class="bubble"><div class="msg-meta"><span class="msg-role">AI 学习助手</span>` +
     `<span>${escapeHtml(fmtTime(new Date().toISOString()))}</span></div>` +
-    `<div class="md-body">${mdToHtml(content)}</div></div>`;
+    `<div class="md-body">${mdToHtml(content)}</div>${chip}</div>`;
   stream.appendChild(div);
+  if (chip) {
+    div.querySelector(".doc-chip").addEventListener("click", () =>
+      openDoc(div.querySelector(".doc-chip").getAttribute("data-doc")));
+  }
   scrollChatBottom();
 }
 
-/* coach 问答输入框：问题已作为气泡上屏，这里只放回复输入（发送时把用户回复先上屏再 resume） */
+/* coach 问答输入框：问题已作为气泡上屏，这里只放回复输入（发送时把用户回复先上屏再 resume）。
+   保留已有进度行（如"已自动沉淀"通知）不覆盖——只在进度下方追加输入区，避免通知被瞬间抹掉。 */
 function showCoachReplyInput() {
   const el = runStatusEl();
-  el.innerHTML =
+  const inputHtml =
     `<div class="interrupt-panel coach-panel">` +
     `<div class="interrupt-custom coach-reply">` +
     `<input id="coachReply" type="text" placeholder="回复陪练…（输入 结束 可退出）" />` +
     `<button class="btn-primary" data-coach-send type="button">发送</button>` +
     `</div></div>`;
+  const progress = el.querySelector(".run-progress");
+  if (progress) {
+    const title = el.querySelector(".run-title");
+    if (title) title.textContent = "⌨️ 等你回复";
+    const panel = document.createElement("div");
+    panel.innerHTML = inputHtml;
+    el.appendChild(panel.firstChild);
+  } else {
+    el.innerHTML = inputHtml;
+  }
   el.hidden = false;
   scrollChatBottom();
   const input = el.querySelector("#coachReply");
@@ -608,7 +631,8 @@ async function refreshActive() {
       coachPayload = detail.pending_coach;
       setState({ running: false, coachPending: { ...getState().coachPending, [activeId]: detail.pending_coach } });
       renderChat();
-      appendAiMessage(detail.pending_coach.message || "");
+      appendAiMessage(detail.pending_coach.message || "",
+        detail.pending_coach.doc, detail.pending_coach.doc_type);
       showCoachReplyInput();
       return;
     }

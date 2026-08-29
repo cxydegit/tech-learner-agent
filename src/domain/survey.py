@@ -5,8 +5,11 @@
 自由文本回答）数量有界，算问卷最后一环。
 
 answers 结构：
-    {"self_level": int | None, "related": str, "goal": "min_project"|"deep",
+    {"self_level": int | None, "related": str, "goal": str,
      "time_budget": str | float, "diagnostics": [str, ...]}
+
+goal 存用户原话（自由文本）：个性化目标直接注入 planning / coaching 提示词，
+比枚举二选一信息量更大；旧数据的枚举值经 _LEGACY_GOAL_LABEL 兼容渲染。
 """
 
 import re
@@ -17,11 +20,15 @@ SURVEY_FIELDS = ("self_level", "related", "goal", "time_budget")
 # 动态诊断题数量上界（问卷最后一环，由模型逐轮出题，避免无限追问）
 DIAGNOSTIC_QUESTIONS_MAX = 2
 
+# legacy 枚举值：goal 曾是「二选一」枚举，旧 profile.json / 进行中 checkpoint 可能残留，
+# 仅用于渲染兼容；新收集一律存用户原话（自由文本）。
 GOAL_MIN_PROJECT = "min_project"
 GOAL_DEEP = "deep"
 
-_GOAL_MIN_KEYWORDS = ("最小项目", "上手", "跑通", "能跑", "会用", "快速")
-_GOAL_DEEP_KEYWORDS = ("深入", "原理", "源码", "底层", "精通")
+_LEGACY_GOAL_LABEL = {
+    GOAL_MIN_PROJECT: "快速上手跑通最小项目",
+    GOAL_DEEP: "深入原理",
+}
 
 _BUCKET_LABEL = {
     "beginner": "技术小白（少用术语、多类比、拆小步、主动补前置知识）",
@@ -33,7 +40,8 @@ _BUCKET_LABEL = {
 FIELD_QUESTIONS = {
     "self_level": "0-10 数字自评对该技术的熟悉程度",
     "related": "熟悉哪些相关技术（自由文本，没有就填「无」）",
-    "goal": "学习目标：想快速上手跑通最小项目，还是深入原理？",
+    "goal": "这次学习的主要目标是什么（自由描述学完后想做到什么，越具体越好，"
+            "如「能看懂项目代码并做小改动」「能独立写个小工具」）",
     "time_budget": "每天大概能投入多少小时学习",
 }
 
@@ -59,11 +67,10 @@ def parse_answer_for_field(field: str, reply: str) -> tuple[object | None, str |
             return None, "请简单说下你熟悉的相关技术（没有就填「无」）"
         return text, None
     if field == "goal":
-        if any(k in text for k in _GOAL_DEEP_KEYWORDS):
-            return GOAL_DEEP, None
-        if any(k in text for k in _GOAL_MIN_KEYWORDS):
-            return GOAL_MIN_PROJECT, None
-        return None, "请选一个：想快速上手跑通最小项目，还是想深入原理？"
+        # 自由文本：原样保存用户的目标原话（同 related 的非空校验），不做枚举归类
+        if not text:
+            return None, "请用自己的话说下这次学习的目标（学完后你想做到什么）"
+        return text, None
     if field == "time_budget":
         m = re.search(r"(\d+(?:\.\d+)?)\s*小时", text)
         if m:
@@ -138,10 +145,9 @@ def profile_summary(profile: dict) -> str:
     ]
     if profile.get("related"):
         parts.append(f"相关技术：{profile['related']}")
-    if profile.get("goal") == GOAL_MIN_PROJECT:
-        parts.append("目标：快速上手跑通最小项目")
-    elif profile.get("goal") == GOAL_DEEP:
-        parts.append("目标：深入原理")
+    goal = profile.get("goal")
+    if goal:
+        parts.append(f"目标：{_LEGACY_GOAL_LABEL.get(goal, goal)}")
     if profile.get("time_budget") is not None:
         parts.append(f"时间预算：{profile['time_budget']}")
     return "；".join(parts)

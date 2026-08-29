@@ -50,6 +50,12 @@ warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel i
 _progress_registry: dict[str, Callable[[str], None]] = {}
 _progress_lock = threading.Lock()
 
+# 并行沉淀（v2）侧信道：thread_id → run_memory_sweep 结果（后台 daemon 线程写、coach_memory_write
+# 排水读后弹出）。用进程内内存 dict 而非文件：满足"后台线程绝不写持久化状态"的硬约束
+# （进程退出无害丢失；重启靠 memory_sweep_inflight 快照同步兜底）。单次赋值原子，锁仅作保险。
+_sweep_results: dict[str, dict] = {}
+_sweep_results_lock = threading.Lock()
+
 
 @contextmanager
 def web_progress(thread_id: str, progress: Callable[[str], None] | None):
@@ -207,6 +213,9 @@ class LearnState(TypedDict):
     # 记忆系统 Step 1：自上次沉淀以来的对话消息对 [{role, content}]（coach_human 填充，
     # coach_memory_write 达阈值触发 note 沉淀后清空；checkpointer 持久化，中断恢复不丢）
     memory_sweep_buffer: list
+    # 并行沉淀（v2）在途请求：{tech, buffer(触发时快照), fired_at} —— fire 时写入、排水后清空。
+    # 存 buffer 快照是为了后台线程失败 / 进程重启时能同步兜底重跑（不丢沉淀内容）。
+    memory_sweep_inflight: dict | None
     # 记忆系统 Step 2：确定性读路由——当前用户回合命中知识库的相关片段 [{path, snippet}]
     # （coach_kb_retrieve 每用户回合覆盖；coaching 提示词注入作答上下文）
     kb_context: list | None
@@ -485,11 +494,15 @@ def coach_human(state: LearnState) -> dict:
     """
     msgs = state.get("coach_messages") or []
     content = (msgs[-1].get("content") or "") if msgs else ""
+    doc = state.get("coach_doc")
+    rel = _rel_doc(doc.get("path")) if doc else None  # 本回合 collect/read 产出文档 → 前端 chip
     reply = interrupt({
         "type": "coach_question",
         "mode": state.get("mode"),
         "tech": state.get("tech") or "",
         "message": content,
+        "doc": rel,                                     # 前端实时渲染"查看完整文档"chip
+        "doc_type": (doc.get("type") or "read") if doc else None,
     })
     reply = (reply or "").strip()
     now = datetime.now().isoformat(timespec="seconds")
@@ -501,13 +514,10 @@ def coach_human(state: LearnState) -> dict:
     }
     # collect/read 工具产出文档时，给本条 assistant 记录附上 doc chip（相对路径，前端白名单读取）
     assistant_rec: dict = {"role": "assistant", "type": "coach", "content": content, "ts": now}
-    doc = state.get("coach_doc")
-    if doc:
-        rel = _rel_doc(doc.get("path"))
-        if rel:
-            assistant_rec["doc"] = rel
-            assistant_rec["doc_type"] = doc.get("type") or "read"
-        updates["coach_doc"] = None  # 只附着一次，避免给后续普通消息误挂 chip
+    if rel:
+        assistant_rec["doc"] = rel
+        assistant_rec["doc_type"] = doc.get("type") or "read"
+    updates["coach_doc"] = None  # 只附着一次，避免给后续普通消息误挂 chip
     updates["conversation"] = [
         assistant_rec,
         {"role": "user", "type": "chat", "content": reply, "ts": now},
@@ -561,36 +571,144 @@ def coach_survey(state: LearnState) -> dict:
     return updates
 
 
+def _sweep_fired_stale(inflight: dict) -> bool:
+    """后台沉淀请求是否超时（后台线程死 / 进程重启 → 需要同步兜底重跑）。"""
+    fired_at = inflight.get("fired_at") or ""
+    try:
+        fired = datetime.fromisoformat(fired_at)
+    except Exception:  # noqa: BLE001 —— 非法时间戳按超时处理
+        return True
+    return (datetime.now() - fired).total_seconds() > config.ROUTE_MEMORY_SWEEP_TIMEOUT
+
+
+def _threshold_met(buffer: list[dict]) -> bool:
+    """沉淀触发阈值：自上次沉淀以来累计用户回合数 / 字符数（任一达标即触发）。"""
+    turns = sum(1 for m in buffer if m.get("role") == "user")
+    chars = sum(len(m.get("content") or "") for m in buffer)
+    return turns >= config.ROUTE_MEMORY_SWEEP_TURNS or chars >= config.ROUTE_MEMORY_SWEEP_CHARS
+
+
+def _emit_sweep_feedback(message: str) -> None:
+    """向 Web 推送确定性沉淀反馈（SSE 进度事件，不经过 agent）；CLI 无 progress 注册时静默。"""
+    progress = _get_progress()
+    if progress:
+        progress(message)
+
+
+def _apply_sweep_result(updates: dict, state: LearnState, sweep: dict) -> None:
+    """把同步路径（ASYNC=false）的沉淀结果写进节点更新：
+    persisted → SSE 反馈 + system 提示；pending → 暂存候选（图路由到确定性确认节点）。"""
+    if sweep.get("action") == "skip":
+        return
+    if sweep.get("action") == "persisted":
+        _emit_sweep_feedback(f"🗂️ 已自动沉淀 {sweep.get('count', 0)} 个新知识点")
+        msgs = state.get("coach_messages") or []
+        updates["coach_messages"] = [*msgs, {"role": "system", "content": sweep["message"]}]
+    elif sweep.get("action") == "pending":
+        updates["coach_note_pending"] = sweep["pending"]  # 图路由到 coach_candidate_confirm 确定性确认
+
+
+def _start_sweep_thread(tech: str, buffer: list[dict], tid: str) -> None:
+    """fire 后台沉淀线程：纯读 + LLM（run_memory_sweep，progress=None 后台静默），
+    结果写入进程内侧信道 _sweep_results。daemon 硬约束：绝不写文件 / Chroma / 图状态。"""
+    def worker():
+        try:
+            result = run_memory_sweep(tech, buffer)
+        except Exception as e:  # noqa: BLE001 —— 后台失败记 error，排水时同步兜底重跑
+            result = {"action": "error", "error": f"{type(e).__name__}: {e}"}
+        with _sweep_results_lock:
+            _sweep_results[tid] = result
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def coach_memory_write(state: LearnState) -> dict:
     """确定性写触发（记忆系统 Step 1）：coach 对话积累超阈值 → 自动沉淀学习内容进知识库。
 
     仅 coaching 模式生效；agent 的 note 工具流进行中（coach_note_pending 非空）时跳过。
-    - 未达阈值 → 保留 memory_sweep_buffer 继续积累；
-    - 触发后清空 buffer：
-      - 无新内容 → 无动作（闲聊/过程消息被差量提取过滤）；
-      - 新知识点无候选 → 自动落库 + system 提示（agent 可自然提及）；
-      - 有相似候选 → 暂存 coach_note_pending，复用 note_commit 工具流由用户确认。
+    单节点双阶段：
+    - **排水**：上一回合 fire 的后台沉淀结果就绪 → 应用：
+      persisted → SSE 反馈"已沉淀 N 个"（确定性，不经过 agent）；
+      pending → 暂存候选（图路由到 coach_candidate_confirm 确定性确认）；
+      skip → 只清在途。
+      后台线程仍在跑（未超时）→ 本回合不阻塞、不重复 fire；
+      超时 / 线程失败 / 进程重启 → **把快照并回 buffer**（不重跑不阻塞），交给未来正常 fire 重扫。
+    - **fire**：无在途请求且 buffer 达阈值 → 快照 buffer 交给后台线程（ASYNC=true 并行），
+      或同步执行（ASYNC=false，v1 逃生舱）。
 
     本节点只做编排，管道逻辑在 pipelines.route.run_memory_sweep。
     """
     if state.get("mode") != "coaching":
         return {}
+    tid = _coach_thread_id() or "local"
+    tech = state.get("tech") or ""
+
+    # 阶段 1 · 排水：处理上一回合 fire 的后台沉淀结果
+    inflight = state.get("memory_sweep_inflight")
+    if inflight:
+        result = _sweep_results.pop(tid, None)
+        if result is None and not _sweep_fired_stale(inflight):
+            return {}  # 后台线程仍在跑：不阻塞、不重复 fire，保留 inflight 等下一回合
+        if result is None or result.get("action") == "error":
+            # 线程失败 / 超时 / 进程重启：不重跑不阻塞——快照并回 buffer，未来正常 fire 重扫
+            return {"memory_sweep_buffer": (inflight.get("buffer") or []) + (state.get("memory_sweep_buffer") or []),
+                    "memory_sweep_inflight": None}
+        updates: dict = {"memory_sweep_inflight": None}
+        if result.get("action") == "persisted":
+            _emit_sweep_feedback(f"🗂️ 已自动沉淀 {result.get('count', 0)} 个新知识点")
+            msgs = state.get("coach_messages") or []
+            updates["coach_messages"] = [*msgs, {"role": "system", "content": result["message"]}]
+        elif result.get("action") == "pending" and result.get("pending"):
+            updates["coach_note_pending"] = result["pending"]  # 图路由到 coach_candidate_confirm 确定性确认
+        return updates  # 排水后本回合不再 fire（buffer 下回合再判）
+
+    # 阶段 2 · fire：达阈值 → 并行（后台线程）或同步（v1 逃生舱）
     buffer = state.get("memory_sweep_buffer") or []
     if not buffer or state.get("coach_note_pending"):
         return {}
-    turns = sum(1 for m in buffer if m.get("role") == "user")
-    chars = sum(len(m.get("content") or "") for m in buffer)
-    if turns < config.ROUTE_MEMORY_SWEEP_TURNS and chars < config.ROUTE_MEMORY_SWEEP_CHARS:
+    if not _threshold_met(buffer):
         return {}  # 未达阈值：保留 buffer 继续积累
-    sweep = run_memory_sweep(state.get("tech") or "", buffer, progress=_get_progress())
-    updates: dict = {"memory_sweep_buffer": []}  # 触发后清空，下一窗口重新积累
-    if sweep["action"] == "skip":
+    if config.ROUTE_MEMORY_SWEEP_ASYNC:
+        snapshot = list(buffer)
+        updates: dict = {
+            "memory_sweep_inflight": {"tech": tech, "buffer": snapshot,
+                                      "fired_at": datetime.now().isoformat(timespec="seconds")},
+            "memory_sweep_buffer": [],
+        }
+        _start_sweep_thread(tech, snapshot, tid)
         return updates
-    msgs = state.get("coach_messages") or []
-    updates["coach_messages"] = [*msgs, {"role": "system", "content": sweep["message"]}]
-    if sweep["action"] == "pending":
-        updates["coach_note_pending"] = sweep["pending"]
+    sweep = run_memory_sweep(tech, buffer, progress=_get_progress())
+    updates: dict = {"memory_sweep_buffer": []}  # 触发后清空，下一窗口重新积累
+    _apply_sweep_result(updates, state, sweep)
     return updates
+
+
+def coach_candidate_confirm(state: LearnState) -> dict:
+    """确定性候选确认（记忆系统 Step 1 v2）：sweep 产出的相似候选直接 interrupt 用户确认，
+    不经过 agent。用户回复后确定性解析（all / 编号 / skip）落库，清空 pending。
+    复用现有 format_merge_candidates / parse_merge_decision / persist_points。
+    """
+    pending = state.get("coach_note_pending") or {}
+    candidates = pending.get("merge_candidates") or []
+    decision = interrupt(format_merge_candidates(candidates))
+    decision = (decision or "").strip()
+    indices = parse_merge_decision(decision, len(candidates))
+    persisted = persist_points(pending.get("_tech") or state.get("tech") or "",
+                               pending.get("new_points") or [], candidates, indices)
+    _emit_sweep_feedback(f"🗂️ 已按你的决定沉淀：新建 {persisted['new_count']}、合并 {persisted['merged_count']}")
+    return {"coach_note_pending": None}
+
+
+def _route_after_memory_write(state: LearnState) -> str:
+    """coach_memory_write 条件边：存在候选待确认 → 确定性确认节点；否则正常读路由。
+
+    任何 coach_note_pending 都路由到确认节点（不限于 sweep 的 _auto）：
+    旧 note 工具流遗留的 pending（无 _auto）若只靠 agent 的 note_commit 解决，在
+    note 工具移除后会永久卡死（阻塞 buffer 积累与 sweep fire）——统一走确定性确认，
+    下一条用户消息即弹出候选、由用户拍板解决，杜绝卡死。
+    """
+    if state.get("coach_note_pending"):
+        return "coach_candidate_confirm"
+    return "coach_kb_retrieve"
 
 
 def coach_kb_retrieve(state: LearnState) -> dict:
@@ -738,6 +856,7 @@ def build_graph(checkpointer):
     builder.add_node("coach_survey", coach_survey)
     builder.add_node("coach_guard", coach_guard)
     builder.add_node("coach_memory_write", coach_memory_write)
+    builder.add_node("coach_candidate_confirm", coach_candidate_confirm)
     builder.add_node("coach_kb_retrieve", coach_kb_retrieve)
 
     builder.add_edge("coach_trim", "coach_llm")
@@ -756,7 +875,12 @@ def build_graph(checkpointer):
     # 记忆系统 Step 1+2：用户回复后先走确定性写触发（coach_memory_write），
     # 再走确定性读路由（coach_kb_retrieve，提问先查库、命中注入 kb_context），最后进 trim→llm
     builder.add_edge("coach_survey", "coach_memory_write")
-    builder.add_edge("coach_memory_write", "coach_kb_retrieve")
+    # 记忆系统 Step 1 v2：sweep 候选待确认 → 确定性确认节点（不经过 agent）；否则正常读路由
+    builder.add_conditional_edges("coach_memory_write", _route_after_memory_write, {
+        "coach_candidate_confirm": "coach_candidate_confirm",
+        "coach_kb_retrieve": "coach_kb_retrieve",
+    })
+    builder.add_edge("coach_candidate_confirm", "coach_kb_retrieve")
     builder.add_edge("coach_kb_retrieve", "coach_trim")
 
     return builder.compile(checkpointer=checkpointer)

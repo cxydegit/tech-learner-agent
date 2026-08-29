@@ -86,9 +86,15 @@ class Config:
     # 工具调用通道失败时的回退开关：true → 去掉 tools 定义用纯文本再问一次（降级可用性）
     ROUTE_FALLBACK_TO_TEXT: bool = os.getenv("ROUTE_FALLBACK_TO_TEXT", "true").lower() == "true"
     # 记忆系统 Step 1：coach 对话确定性写触发——自上次沉淀以来累计用户回合数 / 字符数
-    # 任一达到即把这段对话自动喂给 note 管道沉淀（同步执行，进度经 progress 回调透传）
+    # 任一达到即把这段对话自动喂给 note 管道沉淀。
     ROUTE_MEMORY_SWEEP_TURNS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_TURNS", "6"))
     ROUTE_MEMORY_SWEEP_CHARS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_CHARS", "2500"))
+    # 并行沉淀（v2）：true → 后台 daemon 线程跑纯管道（只读+LLM），结果经进程内内存侧信道，
+    # 下一用户回合排水落库，沉淀耗时不再阻塞对话；false → 退回 v1 同步路径（逃生舱）。
+    ROUTE_MEMORY_SWEEP_ASYNC: bool = os.getenv("ROUTE_MEMORY_SWEEP_ASYNC", "true").lower() == "true"
+    # 后台沉淀线程超时（秒）：note 提取可能耗时几十秒，阈值取远高于正常耗时；
+    # 超过仍未出结果（线程死/进程重启）→ 把 inflight 快照并回 buffer，交给未来正常 fire 重扫
+    ROUTE_MEMORY_SWEEP_TIMEOUT: float = float(os.getenv("ROUTE_MEMORY_SWEEP_TIMEOUT", "300"))
     # 记忆系统 Step 2：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
     # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
     # 注入阈值（可标定余弦，见 route.py::_hit_relevance）：hybrid 的归一化 similarity（top 恒 1.0）

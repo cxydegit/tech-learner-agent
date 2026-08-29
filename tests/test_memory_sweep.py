@@ -132,6 +132,8 @@ def test_write_below_threshold_preserves_buffer(monkeypatch):
 
 
 def test_write_triggers_on_turns_and_clears(monkeypatch):
+    # pinned 到 ASYNC=false：v1 同步路径（逃生舱），触发即应用
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 10000)
     seen = {}
@@ -152,6 +154,8 @@ def test_write_triggers_on_turns_and_clears(monkeypatch):
 
 
 def test_write_triggers_on_chars(monkeypatch):
+    # pinned 到 ASYNC=false：v1 同步路径（逃生舱）
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 100)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 5)  # buffer 必然超
     called = {}
@@ -165,6 +169,8 @@ def test_write_triggers_on_chars(monkeypatch):
 
 
 def test_write_pending_sets_state(monkeypatch):
+    # pinned 到 ASYNC=false：v1 同步路径（逃生舱）
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 10000)
     pending = {"merge_candidates": [{"x": 1}], "_tech": "X", "_auto": True}
@@ -231,9 +237,11 @@ def _run(graph, gconfig, payload, replies, *, max_iters=60):
 
 
 def test_e2e_coaching_sweep_auto_persist(monkeypatch, tmp_path):
-    """coaching 连续 2 回合（阈值调低）→ 确定性触发自动沉淀，buffer 清空。"""
+    """coaching 连续 2 回合（阈值调低）→ 确定性触发自动沉淀，buffer 清空。
+    pinned 到 ASYNC=false：v1 同步路径（逃生舱）的确定性 e2e。"""
     monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
     monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 100000)
     monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_sweep_chat)
@@ -260,40 +268,30 @@ def test_e2e_coaching_sweep_auto_persist(monkeypatch, tmp_path):
 
 
 def test_e2e_coaching_sweep_candidates_need_user(monkeypatch, tmp_path):
-    """sweep 产出相似候选 → 不自动落库 → 用户决定后经 note_commit 落库。"""
+    """sweep 产出相似候选 → 确定性确认节点 interrupt 用户 → 决定后落库（不经过 agent）。
+    pinned 到 ASYNC=false：v1 同步路径（逃生舱）的确定性 e2e。"""
     monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
     monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 100000)
 
-    def scripted(system_prompt, messages, tools):
-        if "执行陪练" in system_prompt:
-            has_cand_note = any(("检测到" in (m.get("content") or "") and "候选" in (m.get("content") or ""))
-                                for m in messages)
-            last = messages[-1] if messages else None
-            if has_cand_note and last and last.get("role") == "user":
-                # 用户已决定 → 提交 note_commit（decision 传用户原话，与 note 工具流一致）
-                return {"content": None, "tool_calls": [
-                    {"id": "cc", "name": "note_commit",
-                     "arguments": {"decision": last["content"]}}]}
-            if has_cand_note:
-                return {"content": "沉淀时发现候选，如何处置？(all / 编号 / skip)", "tool_calls": []}
-            return {"content": "知识点讲解：Spring 的核心是依赖注入。", "tool_calls": []}
-        return _scripted_sweep_chat(system_prompt, messages, tools)
-
-    monkeypatch.setattr(graph_mod, "chat_with_tools", scripted)
+    monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_sweep_chat)
     monkeypatch.setattr(route_mod, "note_pipeline", lambda tech, text, **k: dict(_CAND))
 
+    # coach_candidate_confirm（graph 节点）调用 graph_mod.persist_points
     commits = []
-    monkeypatch.setattr(route_mod, "persist_points",
+    monkeypatch.setattr(graph_mod, "persist_points",
                         lambda tech, np_, mc, idx: (commits.append((len(mc), set(idx))) or
                                                     {"new_count": 0, "merged_count": len(mc), "results": []}))
 
     graph = build_graph(InMemorySaver())
     gconfig = {"configurable": {"thread_id": "test-sweep-cand"}}
     replies = ["5", "Java", "跑通最小项目", "2小时", "答1", "答2", "可以", "嗯", "明白了", "all", "结束"]
-    final, _ = _run(graph, gconfig, {"command": "route", "tech": "X"}, replies)
+    final, interrupts = _run(graph, gconfig, {"command": "route", "tech": "X"}, replies)
 
-    # 候选经 note_commit 一次落库（合并 1 条），pending 已清空
+    # 候选经确定性确认节点 interrupt（用户回 all → 合并 1 条），pending 已清空
     assert commits == [(1, {0})]
     assert final["coach_note_pending"] is None
+    # 确认 interrupt 出现（候选列表文本）
+    assert any("相似" in (i if isinstance(i, str) else str(i)) for i in interrupts)

@@ -73,7 +73,7 @@ def test_survey_flow_to_planning(monkeypatch):
     answers = final["survey_answers"]
     assert answers["self_level"] == 5
     assert answers["related"] == "Java Maven"
-    assert answers["goal"] == "min_project"
+    assert answers["goal"] == "跑通最小项目"  # 自由文本：原样保存用户回答
     assert answers["time_budget"] == 2.0
     assert answers["diagnostics"] == ["答1", "答2"]
     assert final["learner_profile"]["bucket"] == "intermediate"  # 自评 5
@@ -293,6 +293,9 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
                 if m.get("role") == "assistant" and m.get("doc_type") == "collect"]
     assert doc_recs, "collect 结果应带 doc_type=collect 的对话记录"
     assert doc_recs[0]["doc"].startswith("materials/")
+    # interrupt 负载也带 doc/doc_type：前端实时渲染 chip（不依赖会话重渲染）
+    assert interrupts[7].get("doc_type") == "collect"
+    assert (interrupts[7].get("doc") or "").startswith("materials/")
 
 
 def test_coach_trim_compresses_over_threshold(monkeypatch):
@@ -327,73 +330,7 @@ def test_coach_trim_initializes_survey():
 
 # ---------- Step 4：note → 合并确认 → note_commit 端到端 ----------
 
-def _scripted_note_chat(system_prompt, messages, tools):
-    """coaching 里 agent 调 note（有相似候选）→ 呈现 → 用户决定 → note_commit。"""
-    if "水平探测助手" in system_prompt:
-        return _scripted_survey_chat(system_prompt, messages, tools)
-    if "路线规划助手" in system_prompt:
-        last = messages[-1] if messages else None
-        generated = any(m.get("role") == "tool" and "路线已保存" in (m.get("content") or "")
-                        for m in messages)
-        if generated and last and last.get("role") == "user":
-            return {"content": None,
-                    "tool_calls": [{"id": "c_cf", "name": "confirm_roadmap", "arguments": {}}]}
-        if last and last.get("role") == "tool":
-            return {"content": "路线已生成，请确认", "tool_calls": []}
-        return {"content": None,
-                "tool_calls": [{"id": "c_rm", "name": "generate_roadmap", "arguments": {
-                    "goal": "能跑通最小项目", "total_hours": 12, "revision": "",
-                    "stages": [{"name": "环境搭建", "goal": "跑通 hello", "est_hours": 4,
-                                "milestones": [{"desc": "安装完成"}]}]}}]}
-    if "执行陪练" in system_prompt:
-        last = messages[-1] if messages else None
-        if last and last.get("role") == "tool":
-            content = last.get("content") or ""
-            if "needs_decision" in content:
-                try:
-                    msg = json.loads(content).get("message", content)
-                except Exception:  # noqa: BLE001
-                    msg = content
-                return {"content": msg, "tool_calls": []}
-            if "new_count" in content or "merged_count" in content:
-                return {"content": "笔记已沉淀完成。", "tool_calls": []}
-        if last and last.get("role") == "user":
-            return {"content": None,
-                    "tool_calls": [{"id": "c_nc", "name": "note_commit",
-                                    "arguments": {"decision": last.get("content")}}]}
-        return {"content": None,
-                "tool_calls": [{"id": "c_n", "name": "note",
-                                "arguments": {"tech": "X", "content": "刚学到的内容"}}]}
-    return {"content": "（默认回复）", "tool_calls": []}
-
-
-def test_coaching_note_merge_confirm_end_to_end(monkeypatch, tmp_path):
-    """note 工具产生相似候选 → 呈现用户 → 决定 → note_commit 提交，pending 清空。"""
-    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
-    monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
-    monkeypatch.setattr(route_mod, "note_pipeline",
-                        lambda tech, log, materials_path=None, progress=None: {
-                            "new_points": [],
-                            "merge_candidates": [{"old_path": "a.md", "old_topic": "A",
-                                                  "old_content": "o", "similarity": 0.9,
-                                                  "reason": "同一主题", "topic": "T",
-                                                  "tags": [], "content": "n"}],
-                            "empty_reason": None, "summary": "s", "raw": "r",
-                            "new_count": 0, "merged_count": 1})
-    captured = {}
-    monkeypatch.setattr(route_mod, "persist_points",
-                        lambda tech, np, mc, mi: captured.update(mi=mi) or
-                            {"results": [{"topic": "A", "path": "a.md", "action": "merged"}],
-                             "new_count": 0, "merged_count": 1})
-    monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_note_chat)
-    graph = build_graph(InMemorySaver())
-    gconfig = {"configurable": {"thread_id": "test-note-1"}}
-    replies = ["5", "Java Maven", "跑通最小项目", "2小时", "答1", "答2", "可以", "全部合并", "结束"]
-    final, interrupts = _run(graph, gconfig, {"command": "route", "tech": "X"}, replies)
-
-    assert final["mode"] == "coaching"
-    assert final["coach_note_pending"] is None  # 提交后清空
-    assert captured["mi"] == {0}  # 「全部合并」→ 合并索引 0
-    # interrupts：6 问卷 + 1 planning 呈现 + 1 相似候选呈现 + 1 沉淀完成
-    assert len(interrupts) == 9
-    assert "发现 1 条" in interrupts[7]["message"]
+# （已移除）coaching 不再暴露 note/note_commit 工具：学习内容由自动沉淀（Step 1 v2 后台线程 +
+# 确定性候选确认 coach_candidate_confirm）覆盖，agent 手动 note 会同步阻塞对话。
+# 候选确认 e2e 见 test_memory_sweep.py::test_e2e_coaching_sweep_candidates_need_user 与
+# test_memory_sweep_async.py::test_candidate_confirm_node。
