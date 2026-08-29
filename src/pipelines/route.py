@@ -125,10 +125,12 @@ def _coaching_prompt(state, tech: str) -> str:
         f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}\n"
         f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ "
-        "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）。"
+        "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）/ "
+        "revise_roadmap（按用户要求调整路线，保留已完成进度）。"
         "学习内容会自动沉淀进知识库（系统后台处理），无需调用 note 工具。"
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
-        "不要原样堆砌。里程碑完成时用 update_roadmap 勾选。"
+        "不要原样堆砌。里程碑完成时用 update_roadmap 勾选；用户要求调整路线时，"
+        "先确认改动点再调用 revise_roadmap，改完把新路线完整呈现给用户。"
     )
 
 
@@ -272,13 +274,51 @@ UPDATE_ROADMAP_SCHEMA = {
     },
 }
 
+REVISE_ROADMAP_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "revise_roadmap",
+        "description": "按用户要求修订当前学习路线（增删/调整阶段、改总目标、调时长）。修订保留已完成里程碑的进度。调用前先跟用户确认要改哪些；改完把新路线完整呈现给用户。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "学习总目标（一句话，修订时按用户最新要求更新）"},
+                "total_hours": {"type": "integer", "description": "预估总学习时长（小时）"},
+                "revision": {"type": "string", "description": "修订说明（用户的要求 + 本次改动点）"},
+                "stages": {
+                    "type": "array",
+                    "description": "修订后的完整学习阶段列表（3-5 个，按依赖排序；描述不变的里程碑自动保留完成进度）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "阶段名（如 环境搭建 / 核心概念 / 实战项目 / 进阶调优）"},
+                            "goal": {"type": "string", "description": "本阶段目标"},
+                            "materials": {"type": "string", "description": "推荐资料（可留空由后续 collect 补充）"},
+                            "est_hours": {"type": "integer", "description": "本阶段预估小时数"},
+                            "milestones": {
+                                "type": "array",
+                                "description": "可检验的里程碑（描述保持与原来一致的会自动保留完成进度）",
+                                "items": {"type": "object",
+                                          "properties": {"desc": {"type": "string"}},
+                                          "required": ["desc"]},
+                            },
+                        },
+                        "required": ["name", "goal", "est_hours", "milestones"],
+                    },
+                },
+            },
+            "required": ["goal", "total_hours", "stages"],
+        },
+    },
+}
+
 COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
     "survey": [],
     "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA, GET_ROADMAP_SCHEMA],
     # coaching 不再暴露 note/note_commit：学习内容由自动沉淀（记忆系统 Step 1 v2，后台线程）
     # 确定性落库 + 候选确定性确认，agent 手动 note 会同步阻塞对话（note_pipeline 耗时长）
     "coaching": [COLLECT_SCHEMA, READ_SCHEMA, ASK_SCHEMA,
-                 GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA],
+                 GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA, REVISE_ROADMAP_SCHEMA],
 }
 
 
@@ -654,6 +694,45 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
             "roadmap_status": updated.get("status")}
 
 
+def _revise_roadmap(args: dict, ctx: CoachCtx) -> dict:
+    """修订当前学习路线：校验 → build_roadmap 重建结构 → merge_progress 保留已完成进度 → 落盘。
+
+    与 _generate_roadmap 的区别：只允许在已有路线上升级（无路线报错）；build 后必须走
+    merge_progress 合并旧进度，避免把已勾选里程碑清零（build_roadmap 是全量重建）。
+    """
+    old = ctx.roadmap
+    if not old:
+        return {"status": "error", "error": "还没有路线，请先走问卷 + 路线规划"}
+    goal = str(args.get("goal") or "").strip()
+    total_hours = args.get("total_hours")
+    stages = args.get("stages") or []
+    if not goal or not isinstance(total_hours, int) or total_hours <= 0 or not stages:
+        return {"status": "error", "error": "缺少 goal / total_hours / stages",
+                "hint": "请按 revise_roadmap 的 schema 补全后重试"}
+    norm, errors = roadmap_domain.normalize_stages(stages)
+    if not norm:
+        return {"status": "error", "errors": errors or ["没有合法阶段"],
+                "hint": "请修正阶段结构（每阶段至少 1 个里程碑）后重新调用 revise_roadmap"}
+    new = roadmap_domain.build_roadmap(ctx.tech, goal, total_hours, norm)
+    merged = roadmap_domain.merge_progress(old, new)
+    if ctx.thread_id:
+        merged["session_thread_id"] = ctx.thread_id
+    jp = learner.save_roadmap(merged)
+    ctx.updates["roadmap"] = merged
+    ctx.updates["roadmap_path"] = str(jp)
+    kept = sum(1 for s in (merged.get("stages") or [])
+               for m in (s.get("milestones") or []) if m.get("done"))
+    return {
+        "status": "ok", "roadmap_path": str(jp),
+        "stages": [{"id": s["id"], "name": s["name"], "est_hours": s["est_hours"]}
+                   for s in merged["stages"]],
+        "current_stage": merged["current_stage"],
+        "total_hours": merged["total_hours"],
+        "kept_done": kept,
+        "note": "路线已修订，已完成里程碑进度已保留。请把新路线完整呈现给用户。",
+    }
+
+
 _TOOL_IMPL = {
     "generate_roadmap": _generate_roadmap,
     "confirm_roadmap": _confirm_roadmap,
@@ -664,6 +743,7 @@ _TOOL_IMPL = {
     "note": _note,
     "note_commit": _note_commit,
     "update_roadmap": _update_roadmap,
+    "revise_roadmap": _revise_roadmap,
 }
 
 

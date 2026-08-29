@@ -277,3 +277,46 @@ def test_update_roadmap_unknown_milestone(monkeypatch):
 def test_update_roadmap_without_roadmap():
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1"}, _ctx())
     assert out["status"] == "error"
+
+
+# ---------- coaching 工具：revise_roadmap（修订保留进度） ----------
+
+def test_revise_roadmap_without_roadmap_is_error():
+    ctx = _ctx()
+    out = run_coach_tool("revise_roadmap", _gen_args(), ctx)
+    assert out["status"] == "error"
+    assert not ctx.updates  # 无路线：不落盘、不写状态
+
+
+def test_revise_roadmap_keeps_progress_and_saves(tmp_path, monkeypatch):
+    """修订保留已勾选里程碑（按 desc 匹配）、更新 goal/时长并落盘 JSON+MD。"""
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    old = rm.complete_milestone(_roadmap(), "s1-m1")  # 「安装完成」已勾选
+    ctx = CoachCtx({"tech": "t", "roadmap": old})
+    args = _gen_args()
+    args["goal"] = "能独立做一个小工具"
+    args["total_hours"] = 20
+    out = run_coach_tool("revise_roadmap", args, ctx)
+    assert out["status"] == "ok"
+    assert out["kept_done"] == 1
+    assert out["current_stage"] == "s1"
+    merged = ctx.updates["roadmap"]
+    assert merged["goal"] == "能独立做一个小工具"
+    assert merged["total_hours"] == 20
+    # desc 匹配的里程碑保留完成进度，未匹配的不保留
+    assert merged["stages"][0]["milestones"][0]["done"] is True
+    assert merged["stages"][0]["milestones"][1]["done"] is False
+    assert (tmp_path / "roadmaps" / "t.json").exists()
+    assert (tmp_path / "roadmaps" / "t-roadmap.md").exists()
+
+
+def test_revise_roadmap_bad_stages_is_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    old = rm.complete_milestone(_roadmap(), "s1-m1")
+    ctx = CoachCtx({"tech": "t", "roadmap": old})
+    args = _gen_args()
+    args["stages"] = [{"name": "", "goal": "x", "est_hours": 1, "milestones": [{"desc": "d"}]}]
+    out = run_coach_tool("revise_roadmap", args, ctx)
+    assert out["status"] == "error"
+    assert out["errors"]
+    assert not ctx.updates

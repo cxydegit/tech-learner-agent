@@ -158,3 +158,56 @@ def test_validate_roadmap_ok_and_bad():
     bad = dict(r)
     bad["stages"] = []
     assert rm.validate_roadmap(bad)
+
+
+# ---------- merge_progress（修订保留进度） ----------
+
+def test_merge_progress_keeps_done_by_desc():
+    old = rm.complete_milestone(_build(), "s1-m1")  # s1-m1「安装完成」已勾选
+    new = _build()  # 结构相同
+    merged = rm.merge_progress(old, new)
+    assert merged["stages"][0]["milestones"][0]["done"] is True  # desc 匹配 → 保留
+    assert merged["stages"][0]["milestones"][1]["done"] is False
+    assert merged["status"] == "active"
+
+
+def test_merge_progress_ignores_removed_stage():
+    old = rm.complete_milestone(_build(), "s1-m1")  # 阶段1 的「安装完成」已勾选
+    # 新路线删掉阶段1，只剩阶段2（其里程碑描述不在旧勾选集）
+    stages, _ = rm.normalize_stages([_stages()[1]])
+    new = rm.build_roadmap("t", "goal", 8, stages)
+    merged = rm.merge_progress(old, new)
+    assert all(not m["done"] for s in merged["stages"] for m in s["milestones"])
+    assert merged["current_stage"] == "s1"
+
+
+def test_merge_progress_advances_to_first_unfinished():
+    old = rm.complete_milestone(_build(), "s1-m1")
+    old = rm.complete_milestone(old, "s1-m2")  # s1 全完成，推进到 s2
+    new = _build()
+    merged = rm.merge_progress(old, new)
+    # s1 的两个里程碑描述匹配保留 done → s1 仍全完成 → current_stage 校正到 s2
+    assert merged["stages"][0]["milestones"][0]["done"] is True
+    assert merged["stages"][0]["milestones"][1]["done"] is True
+    assert merged["current_stage"] == "s2"
+    assert merged["status"] == "active"
+
+
+def test_merge_progress_all_done_completed():
+    old = _build()
+    old = rm.complete_milestone(old, "s1-m1")
+    old = rm.complete_milestone(old, "s1-m2")
+    old = rm.complete_milestone(old, "s2-m1")  # 全部完成
+    new = _build()
+    merged = rm.merge_progress(old, new)
+    assert merged["status"] == "completed"
+    assert all(m["done"] for s in merged["stages"] for m in s["milestones"])
+
+
+def test_merge_progress_does_not_mutate_inputs():
+    old = rm.complete_milestone(_build(), "s1-m1")
+    new = _build()
+    merged = rm.merge_progress(old, new)
+    assert old["stages"][0]["milestones"][0]["done"] is True  # 旧路线勾选保持
+    assert new["stages"][0]["milestones"][0]["done"] is False  # 新路线未被改
+    assert merged is not new

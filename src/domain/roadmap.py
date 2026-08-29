@@ -221,6 +221,43 @@ def complete_milestone(roadmap: dict, milestone_id: str, done: bool = True) -> d
     return updated
 
 
+def merge_progress(old: dict, new: dict) -> dict:
+    """把旧路线已完成的里程碑进度合并进新路线（修订保留进度）。
+
+    里程碑无唯一键（normalize_stages 只产 id/desc/done），故**按 desc（描述）完全匹配**：
+    新路线中描述相同的里程碑继承旧勾选状态——阶段增删、改名、调时长都不影响已完成进度。
+    合并后 current_stage 校正为第一个有未完成里程碑的阶段（全部完成 → status=completed）。
+
+    Args:
+        old: 旧路线（只读）
+        new: 新路线（build_roadmap 产出，里程碑全 done=False、current_stage=s1）
+
+    Returns:
+        合并后的新路线副本（不修改入参）
+    """
+    result = _deepcopy(new)
+    old_done = {
+        m.get("desc")
+        for s in (old.get("stages") or [])
+        for m in (s.get("milestones") or [])
+        if m.get("done")
+    }
+    for stage in result.get("stages") or []:
+        for m in stage.get("milestones") or []:
+            if m.get("desc") in old_done:
+                m["done"] = True
+    # 校正当前阶段到第一个未完成阶段（build 已置 s1；全完成则保持首阶段但 status=completed）
+    first_unfinished = next((s["id"] for s in (result.get("stages") or [])
+                             if not stage_done(result, s)), None)
+    if first_unfinished:
+        result["current_stage"] = first_unfinished
+        result["status"] = "active"
+    else:
+        result["status"] = "completed"
+    result["updated_at"] = _now()
+    return result
+
+
 def stage_progress(roadmap: dict, stage_id: str | None = None) -> dict:
     """统计某阶段（默认当前阶段）的里程碑完成进度。
 
