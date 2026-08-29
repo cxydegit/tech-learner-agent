@@ -494,6 +494,11 @@ def coach_human(state: LearnState) -> dict:
     """
     msgs = state.get("coach_messages") or []
     content = (msgs[-1].get("content") or "") if msgs else ""
+    # 动态诊断题（survey 且固定字段收齐后）：模型在题目末尾内嵌「【答案】X」标准答案，
+    # 这里剥离后才展示给用户（用户看不到答案）；coach_survey 随后从原消息重新解析判定。
+    # 只影响展示与对话记录（content 之后用于 interrupt + assistant_rec），不篡改 coach_messages。
+    if state.get("mode") == "survey" and state.get("survey_field") is None and content:
+        content, _ = survey.extract_diag_answer(content)
     doc = state.get("coach_doc")
     rel = _rel_doc(doc.get("path")) if doc else None  # 本回合 collect/read 产出文档 → 前端 chip
     reply = interrupt({
@@ -559,14 +564,25 @@ def coach_survey(state: LearnState) -> dict:
         updates["survey_answers"] = answers
         updates["survey_field"] = survey.next_field(answers)
     else:
-        # 动态诊断题阶段：自由文本，直接收集
+        # 动态诊断题阶段：从模型出题消息解析题目 + 标准答案（【答案】X，展示前已剥离），
+        # 收集用户回答后由代码比对选项字母确定性判定对/错（零 LLM 调用；无法判定 → None 不误判）。
+        msgs = state.get("coach_messages") or []
+        raw_question = ((msgs[-2].get("content") or "")
+                        if len(msgs) >= 2 and msgs[-2].get("role") == "assistant" else "")
+        question, correct = survey.extract_diag_answer(raw_question)
+        choice = survey.parse_diag_choice(reply)
+        grade = None
+        if correct is not None and choice is not None:
+            grade = survey.GRADE_RIGHT if choice == correct else survey.GRADE_WRONG
         diagnostics = list(answers.get("diagnostics") or [])
-        diagnostics.append(reply)
+        diagnostics.append({"question": question, "answer": reply, "correct": correct, "grade": grade})
         answers["diagnostics"] = diagnostics
         updates["survey_answers"] = answers
     if survey.is_fixed_done(answers) and not state.get("learner_profile"):
         updates["learner_profile"] = survey.derive_profile(answers, state.get("tech") or "")
     if survey.is_survey_complete(answers):
+        # 诊断题已收齐：重推导画像（含每题的判定，profile_summary 渲染「诊断自测」），再确定性进入路线规划
+        updates["learner_profile"] = survey.derive_profile(answers, state.get("tech") or "")
         updates["mode"] = "planning"  # 问卷完成 → 确定性进入路线规划
     return updates
 

@@ -106,3 +106,55 @@ def test_profile_summary_legacy_enum_goal():
     assert "目标：深入原理" in sv.profile_summary(p)
     p2 = sv.derive_profile({"self_level": 8, "goal": sv.GOAL_MIN_PROJECT}, "X")
     assert "目标：快速上手跑通最小项目" in sv.profile_summary(p2)
+
+
+# ---------- 诊断题：标准答案解析 / 选项提取 / 自测渲染 ----------
+
+def test_extract_diag_answer_normal():
+    """模型内嵌「【答案】X」：剥离答案行，返回题目 + 大写答案。"""
+    q = "单选：Spring Boot 自动配置基于什么机制？\nA. 手写配置\nB. 条件装配\nC. XML\nD. 注解扫描\n请直接回复选项字母。\n【答案】B"
+    cleaned, correct = sv.extract_diag_answer(q)
+    assert correct == "B"
+    assert "【答案】" not in cleaned  # 已剥离
+    assert cleaned.startswith("单选：Spring Boot")
+    assert cleaned.endswith("请直接回复选项字母。")  # 引导语保留
+
+
+def test_extract_diag_answer_variants():
+    """小写答案、无标记、题干无引导语。"""
+    assert sv.extract_diag_answer("题A 题B 【答案】a") == ("题A 题B", "A")
+    assert sv.extract_diag_answer("普通问题，没有答案") == ("普通问题，没有答案", None)
+    assert sv.extract_diag_answer("") == ("", None)
+
+
+def test_parse_diag_choice():
+    """用户回答提取选项字母（容忍变体），提取不到 → None（不误判为错）。"""
+    assert sv.parse_diag_choice("B") == "B"
+    assert sv.parse_diag_choice("选B") == "B"
+    assert sv.parse_diag_choice("答案是 b") == "B"
+    assert sv.parse_diag_choice("我不确定，随便猜一个") is None
+    assert sv.parse_diag_choice("") is None
+
+
+def test_profile_summary_diag_grades():
+    """有判定的诊断题 → 渲染「诊断自测」统计（内部信号，进 planning/coaching 提示词）。"""
+    diag = [
+        {"question": "q1", "answer": "B", "correct": "B", "grade": sv.GRADE_RIGHT},
+        {"question": "q2", "answer": "C", "correct": "B", "grade": sv.GRADE_WRONG},
+    ]
+    p = sv.derive_profile({"self_level": 8, "diagnostics": diag}, "Spring Boot")
+    s = sv.profile_summary(p)
+    assert "诊断自测：2题中1对、1错" in s
+    assert "第1题对" in s and "第2题错" in s
+
+
+def test_profile_summary_diag_not_graded_skipped():
+    """未判定（correct/choice 缺失 → grade None）或旧 [str] 条目：不渲染、不误报统计。"""
+    diag = [
+        {"question": "q1", "answer": "B", "correct": None, "grade": None},
+        "旧格式回答字符串",  # 兼容旧 checkpoint / 旧 profile.json
+    ]
+    p = sv.derive_profile({"self_level": 8, "diagnostics": diag}, "X")
+    s = sv.profile_summary(p)
+    assert "诊断自测" not in s  # 无判定则不渲染
+    assert "技术：X" in s

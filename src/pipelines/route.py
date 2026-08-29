@@ -64,8 +64,8 @@ def _survey_prompt(state, tech: str) -> str:
         lines.append(f"2. 该字段用户需要回答成：{_FIELD_HINTS.get(field)}。")
         lines.append("3. 只输出问题本身，不要编号、解释或寒暄；根据画像调整语气（小白少用术语、多类比）。")
     else:
-        lines.append(f"2. 固定字段已收齐，进入动态出题：基于画像出 1 道与「{tech}」相关的小诊断题（概念题/选择题），检验前置知识；还需 {diag_remaining} 道。")
-        lines.append("3. 只输出题目本身；根据画像调整难度与语气。")
+        lines.append(f"2. 固定字段已收齐，进入动态出题：出 1 道与「{tech}」相关的单选选择题（4 个选项、只有一个正确答案），检验前置知识；还需 {diag_remaining} 道。")
+        lines.append("3. 只输出题目本身：题干 + 4 个选项（A/B/C/D），末尾单独一行「【答案】X」标注正确答案（X 为 A/B/C/D 之一，该行仅供系统读取、不会展示给用户），并在题干末尾引导用户「请直接回复选项字母（如 B）」；根据画像调整难度与语气，不要编号、解释或寒暄。")
     lines.append("4. 若收到一条【问卷校验】内部提示，说明用户上一条回答格式不对，请按提示重新问同一个字段。")
     return "\n".join(lines)
 

@@ -2,14 +2,21 @@
 
 零 I/O、零框架依赖。固定字段（确定性收集、代码校验）按固定顺序逐个收集，
 模型只负责把「当前该问的问题」问得友好、贴合画像；动态诊断题（LLM 生成、
-自由文本回答）数量有界，算问卷最后一环。
+用户作答）数量有界，算问卷最后一环。
 
 answers 结构：
     {"self_level": int | None, "related": str, "goal": str,
-     "time_budget": str | float, "diagnostics": [str, ...]}
+     "time_budget": str | float,
+     "diagnostics": [{"question": str, "answer": str,
+                      "correct": str | None, "grade": None | "right" | "wrong"}, ...]}
 
 goal 存用户原话（自由文本）：个性化目标直接注入 planning / coaching 提示词，
 比枚举二选一信息量更大；旧数据的枚举值经 _LEGACY_GOAL_LABEL 兼容渲染。
+
+诊断题判定（确定性，零 LLM 调用）：模型出**单选选择题**并在题目末尾内嵌标准答案
+「【答案】X」，graph 展示前剥离该行（用户看不到答案），用户回复选项字母后由代码
+比对正确性，判 right/wrong 二值。正确性直接注入 planning/coaching 提示词，校准
+「自评 vs 实际水平」。旧数据 diagnostics 为字符串列表时跳过判定，不误报。
 """
 
 import re
@@ -19,6 +26,36 @@ SURVEY_FIELDS = ("self_level", "related", "goal", "time_budget")
 
 # 动态诊断题数量上界（问卷最后一环，由模型逐轮出题，避免无限追问）
 DIAGNOSTIC_QUESTIONS_MAX = 2
+
+# 诊断题判定（二值）：模型出单选选择题并内嵌标准答案，代码剥离后展示、比对用户回复的
+# 选项字母，确定性判对/错——不需要 LLM 再判一次（模型出题时已知道答案，代码只需比对）。
+GRADE_RIGHT = "right"
+GRADE_WRONG = "wrong"
+
+# 题目中标准答案的内嵌标记（模型出题时必须附带，graph 展示前剥离，用户看不到）
+_DIAG_ANSWER_RE = re.compile(r"【答案】\s*([A-Da-d])")
+
+
+def extract_diag_answer(text: str) -> tuple[str, str | None]:
+    """从模型出的诊断题文本解析内嵌标准答案，返回 (剥离答案后的题目, 答案字母大写|None)。
+
+    模型出题须在末尾写「【答案】X」（X 为 A/B/C/D 之一）。该行仅供系统读取：graph 展示前
+    用本函数剥离，用户看不到答案；coach_survey 再用它从原消息解析题目+答案做判定。
+    未内嵌标记 → 原样返回 + None（该题无法判定，降级不误判）。纯函数、幂等。
+    """
+    m = _DIAG_ANSWER_RE.search(text or "")
+    if not m:
+        return (text or "").strip(), None
+    return _DIAG_ANSWER_RE.sub("", text or "").strip(), m.group(1).upper()
+
+
+def parse_diag_choice(reply: str) -> str | None:
+    """从用户对诊断题的回答中提取选项字母（A-D 大写）。容忍「选B」「答案是B」等变体。
+
+    提取不到字母（空答 / 答非所问 / 未按格式回）→ None，判定为「无法判定」而非「错」。
+    """
+    m = re.search(r"[A-Da-d]", reply or "")
+    return m.group(0).upper() if m else None
 
 # legacy 枚举值：goal 曾是「二选一」枚举，旧 profile.json / 进行中 checkpoint 可能残留，
 # 仅用于渲染兼容；新收集一律存用户原话（自由文本）。
@@ -135,6 +172,11 @@ def derive_profile(answers: dict, tech: str) -> dict:
     }
 
 
+def _graded_diagnostics(diagnostics) -> list[dict]:
+    """过滤出有判定的诊断题条目（dict 且 grade 非空）。兼容旧 [str] 数据：字符串条目跳过。"""
+    return [d for d in (diagnostics or []) if isinstance(d, dict) and d.get("grade")]
+
+
 def profile_summary(profile: dict) -> str:
     """把画像渲染成一句话摘要（注入 coach / planning 提示词）。"""
     level = profile.get("self_level")
@@ -150,4 +192,13 @@ def profile_summary(profile: dict) -> str:
         parts.append(f"目标：{_LEGACY_GOAL_LABEL.get(goal, goal)}")
     if profile.get("time_budget") is not None:
         parts.append(f"时间预算：{profile['time_budget']}")
+    # 诊断自测（仅内部信号）：让 planning/coaching 看到「自评 vs 实际答对几题」的反差，
+    # 据以校准路线粒度。旧 [str] 条目 / 未判定的条目不渲染、不误报。
+    graded = _graded_diagnostics(profile.get("diagnostics"))
+    if graded:
+        right = sum(1 for d in graded if d["grade"] == GRADE_RIGHT)
+        marks = "、".join(
+            f"第{i + 1}题{'对' if d['grade'] == GRADE_RIGHT else '错'}"
+            for i, d in enumerate(graded))
+        parts.append(f"诊断自测：{len(graded)}题中{right}对、{len(graded) - right}错（{marks}）")
     return "；".join(parts)

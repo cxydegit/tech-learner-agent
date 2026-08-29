@@ -18,6 +18,7 @@ import src.graph as graph_mod
 import src.pipelines.route as route_mod
 from src.adapters import learner as le
 from src.config import config
+from src.domain import survey as sv
 from src.graph import build_graph
 
 
@@ -54,7 +55,10 @@ def _scripted_survey_chat(system_prompt, messages, tools):
     if "正在收集字段：时间预算" in system_prompt:
         return {"content": "每天大概能投入多少小时？", "tool_calls": []}
     if "动态诊断题" in system_prompt:
-        return {"content": "来一道小诊断题：什么是依赖注入？", "tool_calls": []}
+        # 强制单选选择题 + 内嵌标准答案（【答案】B）：graph 展示前剥离答案行，代码比对判定
+        return {"content": "单选：Spring Boot 自动配置基于什么机制？\n"
+                "A. 手写配置\nB. 条件装配\nC. XML 配置\nD. 注解扫描\n"
+                "请直接回复选项字母。\n【答案】B", "tool_calls": []}
     return {"content": "（默认回复）", "tool_calls": []}
 
 
@@ -65,7 +69,7 @@ def test_survey_flow_to_planning(monkeypatch):
     monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_survey_chat)
     graph = build_graph(InMemorySaver())
     gconfig = {"configurable": {"thread_id": "test-survey-1"}}
-    replies = ["5", "Java Maven", "跑通最小项目", "2小时", "答1", "答2", "结束"]
+    replies = ["5", "Java Maven", "跑通最小项目", "2小时", "B", "C", "结束"]
     final, interrupts = _run(graph, gconfig, {"command": "route", "tech": "Spring Boot"}, replies)
 
     assert final["mode"] == "planning"
@@ -75,7 +79,16 @@ def test_survey_flow_to_planning(monkeypatch):
     assert answers["related"] == "Java Maven"
     assert answers["goal"] == "跑通最小项目"  # 自由文本：原样保存用户回答
     assert answers["time_budget"] == 2.0
-    assert answers["diagnostics"] == ["答1", "答2"]
+    diag = answers["diagnostics"]
+    assert len(diag) == 2
+    assert diag[0]["answer"] == "B" and diag[0]["correct"] == "B"
+    assert diag[0]["grade"] == "right"  # 答 B，标准答案 B
+    assert diag[1]["answer"] == "C"
+    assert diag[1]["grade"] == "wrong"  # 答 C，标准答案仍 B
+    assert "【答案】" not in diag[0]["question"]  # 展示 / 存储均已剥离答案行
+    assert diag[0]["question"].startswith("单选：Spring Boot")
+    # 画像含诊断自测（内部信号，planning 提示词可见）
+    assert "诊断自测" in sv.profile_summary(final["learner_profile"])
     assert final["learner_profile"]["bucket"] == "intermediate"  # 自评 5
     # interrupt 序列：4 固定字段 + 2 诊断 + 1 planning 呈现
     assert len(interrupts) == 7
