@@ -250,8 +250,12 @@ def read_node(state: LearnState) -> dict:
         out = f"❌ {result['error']}"
         return {"last_output": out, "conversation": _conversation(state, out, "read")}
     report = result["report"]
-    return {"visited": [url], "notes": result["notes"], "last_output": report,
-            "conversation": _conversation(state, report, "read", doc=_rel_doc(result["report_path"]))}
+    out = report
+    if result.get("index_ok") is False:
+        out += (f"\n\n⚠️ RAG 索引更新失败（{result.get('index_error')}）：报告已保存，"
+                f"read 缓存命中暂时不可用，下次 note/index 对账自动补齐")
+    return {"visited": [url], "notes": result["notes"], "last_output": out,
+            "conversation": _conversation(state, out, "read", doc=_rel_doc(result["report_path"]))}
 
 
 def note_extract_node(state: LearnState) -> dict:

@@ -91,6 +91,10 @@ def read(url: str = None):
         console.print(f"[red]❌ {result['error']}[/red]")
         return
     console.print(f"├  保存报告: [bold]{result['report_path']}[/bold]")
+    if result.get("index_ok") is False:
+        console.print(f"[yellow]⚠️ 报告已保存，但 RAG 索引未更新"
+                      f"（{result.get('index_error')}），read 缓存命中暂时不可用，"
+                      f"下次 note/index 对账自动补齐[/yellow]")
     console.print(Panel(Markdown(result["report"]), title="✅ 文档解读完成", style="green"))
 
 

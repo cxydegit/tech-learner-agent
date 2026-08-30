@@ -171,6 +171,15 @@ def _update_rag_index(filepath: Path) -> dict:
     return {"index_ok": False, "index_error": last_err}
 
 
+def index_file_lazy(filepath: str | Path) -> dict:
+    """写盘后增量索引单个文件（read / note 共用）：失败不阻断，状态返回给调用方。
+
+    read 报告保存后立即调用，保证 read 缓存命中即时生效；瞬时失败内部重试一次，
+    仍失败则缺口留给 index_paths 末尾对账 / /ask 惰性对账自动补齐。
+    """
+    return _update_rag_index(Path(filepath))
+
+
 def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = None,
                  *, replace_path: str | None = None) -> dict:
     """持久化一条知识笔记：新建 dated 文件，或覆盖合并进已有文件。

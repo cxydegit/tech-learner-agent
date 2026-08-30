@@ -10,7 +10,7 @@ from typing import Callable
 
 from ..adapters.fetch import fetch_tool
 from ..adapters.llm import current_time_label, generate_text, replace_time_line
-from ..adapters.store import save_file_tool
+from ..adapters.store import index_file_lazy, save_file_tool
 from ..domain.dedup import sanitize_filename
 from ..domain.extraction import parse_classify
 
@@ -138,15 +138,18 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
         progress: 可选回调，接收进度消息；None 则静默
 
     Returns:
-        {"report": str, "title": str, "report_path": str, "notes": list[dict], "error": str}
+        {"report": str, "title": str, "report_path": str, "notes": list[dict], "error": str,
+         "index_ok": bool, "index_error": str | None（仅失败时）}
         - error 为空表示成功；error 非空表示失败 / 非技术文档（此时 report 为空）
         - notes 形如 [{"url", "title", "report"}]，供 LangGraph 状态累积
+        - index_ok 表示报告是否已写入 RAG 索引（失败不阻断保存，缺口由对账补齐）
     """
     # 1. 抓取文档内容
     fetched = fetch_tool(url)
     if not fetched.get("markdown"):
         err = fetched.get("error") or "抓取文档内容失败，请检查 URL 是否有效。"
-        return {"report": "", "title": "", "report_path": "", "notes": [], "error": f"抓取失败：{err}"}
+        return {"report": "", "title": "", "report_path": "", "notes": [], "error": f"抓取失败：{err}",
+                "index_ok": True, "index_error": None}
     if progress:
         progress(f"✅ 抓取成功，内容 {len(fetched['markdown'])} 字符"
                  f"{'（已截断，仅截取片段）' if fetched.get('truncated') else ''}")
@@ -159,6 +162,7 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
         return {
             "report": "", "title": fetched.get("title") or "", "report_path": "", "notes": [],
             "error": f"该文档似乎不是技术文档，跳过解读（{reason or '未提供原因'}）",
+            "index_ok": True, "index_error": None,
         }
 
     # 2. 生成解读报告（单次 LLM 调用）
@@ -175,15 +179,18 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
     )
     report = replace_time_line(report, "解读时间", now)
 
-    # 3. 保存报告
+    # 3. 保存报告 + 写后单文件立即索引（read 缓存命中即时生效；失败不阻断，对账兜底）
     title = fetched.get("title") or "文档"
     filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().strftime('%Y%m%d')}-解读.md"
     save_result = save_file_tool(f"reports/{filename}", report)
+    index_status = index_file_lazy(save_result["path"])
 
     return {
         "report": report,
         "title": title,
         "report_path": save_result["path"],
         "notes": [{"url": url, "title": title, "report": report}],
+        "index_ok": index_status.get("index_ok", True),
+        "index_error": index_status.get("index_error"),
         "error": "",
     }
