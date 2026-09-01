@@ -289,6 +289,8 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
     monkeypatch.setattr(route_mod, "collect_pipeline",
                         lambda tech, focus=None, progress=None: {
                             "urls": ["u1"], "report": "## 官方文档\n...", "materials_path": "materials/x.md"})
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
     monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_coaching_chat)
     graph = build_graph(InMemorySaver())
     gconfig = {"configurable": {"thread_id": "test-coach-1"}}
@@ -309,6 +311,58 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
     # interrupt 负载也带 doc/doc_type：前端实时渲染 chip（不依赖会话重渲染）
     assert interrupts[7].get("doc_type") == "collect"
     assert (interrupts[7].get("doc") or "").startswith("materials/")
+
+
+# ---------- 里程碑推进把关（勾选后停下询问，用户确认后才推进） ----------
+
+def test_coaching_prompt_injects_milestone_pending_block():
+    """coaching 提示词：有 coach_milestone_pending → 注入「尚未获得用户推进确认」强制块。"""
+    state = {"mode": "coaching", "roadmap": None, "coach_milestone_pending": "s1-m1"}
+    prompt = route_mod._coaching_prompt(state, "Spring")
+    assert "尚未获得用户推进确认" in prompt
+    assert "s1-m1" in prompt
+    assert "在用户明确同意前，不要开始下一里程碑的内容" in prompt
+    # 无 pending 时不注入
+    prompt2 = route_mod._coaching_prompt({"mode": "coaching", "roadmap": None}, "Spring")
+    assert "尚未获得用户推进确认" not in prompt2
+
+
+def test_coach_human_clears_milestone_pending(monkeypatch):
+    """用户回复后清空待确认标记（一次性闸门）+ 验收拒绝计数清零（节流只限本回合）。"""
+    monkeypatch.setattr(graph_mod, "interrupt", lambda x: "可以")
+    out = graph_mod.coach_human({"mode": "coaching",
+                                 "coach_messages": [{"role": "assistant", "content": "总结"}],
+                                 "coach_milestone_pending": "s1-m1",
+                                 "coach_verify_rejects": 2})
+    assert out["coach_milestone_pending"] is None
+    assert out["coach_verify_rejects"] == 0
+
+
+def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
+    """端到端：勾选里程碑后提示词注入「待确认」块（强制停下询问）；用户回复后闸门清除。"""
+    seen_prompts = []
+
+    def scripted(system_prompt, messages, tools):
+        seen_prompts.append(system_prompt)
+        return _scripted_coaching_chat(system_prompt, messages, tools)
+
+    monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
+    monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
+    monkeypatch.setattr(route_mod, "collect_pipeline",
+                        lambda tech, focus=None, progress=None: {
+                            "urls": ["u1"], "report": "## 官方文档\n...", "materials_path": "materials/x.md"})
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+    monkeypatch.setattr(graph_mod, "chat_with_tools", scripted)
+    graph = build_graph(InMemorySaver())
+    gconfig = {"configurable": {"thread_id": "test-coach-gate"}}
+    final, _ = _run(graph, gconfig, {"command": "route", "tech": "X"},
+                    ["5", "Java Maven", "跑通最小项目", "2小时", "答1", "答2", "可以", "好的", "结束"])
+    # 勾选里程碑后的提示词必须注入待确认块（用户未确认前不自行推进）
+    blocking = [p for p in seen_prompts if "尚未获得用户推进确认" in p]
+    assert blocking, "勾选里程碑后的提示词应注入待确认块"
+    # 用户最终回复后闸门清除（一次性）
+    assert final.get("coach_milestone_pending") is None
 
 
 def test_coach_trim_compresses_over_threshold(monkeypatch):

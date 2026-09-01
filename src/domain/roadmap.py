@@ -217,6 +217,13 @@ def complete_milestone(roadmap: dict, milestone_id: str, done: bool = True) -> d
             updated["current_stage"] = stages[si + 1]["id"]
         else:
             updated["status"] = "completed"
+    # 取消勾选时若路线已标 completed（勾满后又被取消），回退状态并指回第一个未完成阶段——
+    # 否则状态与进度不一致（真实事故：显示「✅ 已完成」但 s2 里程碑未勾，误导 coaching）
+    if not done and updated.get("status") == "completed":
+        updated["status"] = "active"
+        first_unfinished = next((s["id"] for s in stages if not stage_done(updated, s)), None)
+        if first_unfinished:
+            updated["current_stage"] = first_unfinished
     updated["updated_at"] = _now()
     return updated
 

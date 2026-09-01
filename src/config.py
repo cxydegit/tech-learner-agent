@@ -103,6 +103,11 @@ class Config:
     # 误注入 0/6（0.5 时误注入 3/6——22 篇语料里 0.5 过松）。
     ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.65"))
     ROUTE_KB_SNIPPETS: int = int(os.getenv("ROUTE_KB_SNIPPETS", "3"))  # 注入片段数上限
+    # 里程碑验收闸门：勾选里程碑时核对「完成证据是否真实出现在对话里」（双层：引用 substring
+    # 确定性校验 + LLM 验收语义覆盖）。提示词自觉被证伪（Agent 未完成待办即宣布完成），必须代码强制。
+    ROUTE_MILESTONE_VERIFY: bool = os.getenv("ROUTE_MILESTONE_VERIFY", "true").lower() == "true"
+    # 验收时送审的对话记录尾部字符上限（conversation 无界，截最近部分控成本）
+    ROUTE_VERIFY_TRANSCRIPT_CHARS: int = int(os.getenv("ROUTE_VERIFY_TRANSCRIPT_CHARS", "6000"))
 
     # 用户画像 + 学习路线持久化目录（Markdown 是源，JSON 只存机器态）
     LEARNER_DIR: Path = BASE_DIR / "learner"

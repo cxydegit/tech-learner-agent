@@ -128,6 +128,23 @@ def test_uncheck_does_not_roll_back_stage():
     assert r["current_stage"] == "s2"
 
 
+def test_uncheck_completed_resets_status():
+    """勾满标 completed 后再取消勾选 → 状态回退 active + 当前阶段指回未完成阶段。
+
+    （真实事故：取消勾选后 status 仍是 completed，coaching 提示词显示「✅ 已完成」
+    但里程碑未勾满，误导 Agent 判断。）
+    """
+    r = _build()
+    for mid in ("s1-m1", "s1-m2", "s2-m1"):
+        r = rm.complete_milestone(r, mid)
+    assert r["status"] == "completed"
+    r2 = rm.complete_milestone(r, "s2-m1", done=False)
+    assert r2["status"] == "active"
+    assert r2["current_stage"] == "s2"
+    # 未取消的 s1 里程碑保持完成
+    assert r2["stages"][0]["milestones"][0]["done"] is True
+
+
 def test_milestone_update_does_not_mutate_input():
     r = _build()
     r2 = rm.complete_milestone(r, "s1-m1")

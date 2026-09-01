@@ -14,6 +14,7 @@ import re
 from ..config import config
 from ..adapters import learner
 from ..adapters.llm import generate_text
+from ..domain import exit_intent
 from ..domain import roadmap as roadmap_domain
 from ..domain import survey
 from ..domain.extraction import parse_json_object
@@ -85,7 +86,8 @@ def _planning_prompt(state, tech: str) -> str:
         "3. 用户确认后调用 confirm_roadmap 进入执行阶段；用户提出修改时，带上修改意见重新调用 generate_roadmap。\n"
         "规则：\n"
         "- 路线必须贴合用户水平：技术小白从环境搭建和最小 demo 起步、拆小步；开发者可跳过基础直达要点。\n"
-        "- 里程碑必须是可检验的动作（如「本地跑通 hello world」「能用 XX 完成一个接口」），不要空洞目标。\n"
+        "- 里程碑必须是可检验的动作（如「本地跑通 hello world」「能用 XX 完成一个接口」），不要空洞目标；"
+        "尽量写成对话内可检验的形式（在对话中能给出讲解/回答/结论/代码），便于后续验收勾选。\n"
         "- 阶段按依赖排序，每阶段给出预估小时数。\n"
         "- materials 可引用已收集的资料或留空（留空由后续 collect 补充）。\n"
         "- 不要编造资料链接；没有的信息写「待收集」。"
@@ -121,9 +123,17 @@ def _coaching_prompt(state, tech: str) -> str:
                     + "\n===== 片段结束 =====\n"
                     "优先依据上述片段作答，引用时标注来源；片段未覆盖的部分可用你自己的知识补充，"
                     "但必须明确区分「来自你笔记的内容」与「基于经验的讲解」。")
+    # 里程碑推进卡点：刚勾选了一个里程碑、尚未获得用户推进确认 → 强制停下总结 + 询问。
+    # 结构保证（代码设置、用户回复后清除）：Agent 勾选后不会自行开始下一里程碑。
+    pending = state.get("coach_milestone_pending")
+    pending_block = ""
+    if pending:
+        pending_block = (f"\n你刚勾选了里程碑「{pending}」，尚未获得用户推进确认。\n"
+                         "请向用户总结该里程碑成果，并询问是否进入下一里程碑/阶段；\n"
+                         "在用户明确同意前，不要开始下一里程碑的内容。")
     return (
         f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}\n"
-        f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}\n\n"
+        f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}{pending_block}\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ "
         "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）/ "
         "revise_roadmap（按用户要求调整路线，保留已完成进度）。"
@@ -131,6 +141,12 @@ def _coaching_prompt(state, tech: str) -> str:
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
         "不要原样堆砌。里程碑完成时用 update_roadmap 勾选；用户要求调整路线时，"
         "先确认改动点再调用 revise_roadmap，改完把新路线完整呈现给用户。"
+        "\n里程碑推进规则："
+        "\n- 勾选里程碑前，逐项核对该里程碑的所有待办是否真实完成；有任何未完成就先完成它，不要勾选、不要推进。"
+        "\n- 勾选（done=true）由系统自动核对对话记录验收：待办内容必须实质出现在对话里才算完成，"
+        "仅宣布完成、布置了没人做的任务会被拒绝。不要为凑证据重复输出已讲过的内容；被拒后按提示先补内容再勾选。"
+        "\n- 一轮只能勾选一个里程碑；勾选后停下来向用户总结成果，并询问是否进入下一里程碑/阶段；未经用户明确同意不要开始下一里程碑内容。"
+        "\n- 例外：用户上一轮已明确指令「直接进入下一步/下一阶段/不用再问」时，勾选后直接推进，不再询问。"
     )
 
 
@@ -266,7 +282,9 @@ UPDATE_ROADMAP_SCHEMA = {
     "type": "function",
     "function": {
         "name": "update_roadmap",
-        "description": "勾选/取消勾选一个里程碑（完成一个可检验的动作后调用），自动推进当前阶段。",
+        "description": "勾选/取消勾选一个里程碑（完成一个可检验的动作后调用），自动推进当前阶段。"
+                       "勾选（done=true）由系统自动核对对话记录验收：内容没有实质出现在对话里"
+                       "会被拒绝，无需也不能自行提交证据。",
         "parameters": {"type": "object", "properties": {
             "milestone_id": {"type": "string", "description": "里程碑 id（如 s1-m1）"},
             "done": {"type": "boolean", "description": "true 勾选 / false 取消"},
@@ -671,6 +689,66 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
     return out
 
 
+def _recent_user_text(msgs) -> str:
+    """取 coach_messages 中最近一条 user 消息文本（推进授权判定用）。"""
+    for m in reversed(msgs or []):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return ""
+
+
+# ============================================================
+# 里程碑验收闸门（独立 LLM 验收员 + 确定性护栏：批量/节流/豁免）
+# 提示词自觉被证伪（Agent 未完成待办即宣布完成），勾选必须经代码强制验收。
+# 验收员只看「里程碑标准 + 对话记录」：模型无注入通道，想通过只能真把内容讲进对话。
+# ============================================================
+
+VERIFY_MILESTONE_PROMPT = """你是学习路线的里程碑验收员。根据对话记录判断：该里程碑是否已被实质完成。
+
+里程碑（验收标准）：
+{milestone}
+
+判定规则：
+- 对话中必须实际出现完成该里程碑所需的产出（讲解、回答、结论、代码、操作结果等实质内容）；
+- 仅「宣布完成/鼓励/日程性总结」不算；布置了任务但没人完成不算；任务被转交但对方没回应不算；
+- 有任何一部分未覆盖就判不通过。宁可误拦，不可放过。
+
+只输出一个 JSON 对象，不要 ```json 围栏、不要解释：
+{{"verified": true 或 false, "missing": ["未覆盖的部分，每条一句话"], "reason": "一句话结论"}}
+
+对话记录（截取最近部分）：
+{transcript}"""
+
+
+def _transcript_text(conversation, char_limit: int) -> str:
+    """取 conversation（无界完整对话记录）尾部拼成送审文本（角色：内容），总长截到 char_limit。"""
+    parts = [f"{m.get('role', '')}：{m.get('content', '')}"
+             for m in (conversation or [])
+             if m.get("role") in ("user", "assistant") and m.get("content")]
+    text = "\n".join(parts)
+    return text[-char_limit:] if char_limit and len(text) > char_limit else text
+
+
+def verify_milestone(milestone_desc: str, transcript: str) -> dict:
+    """LLM 验收：对话记录是否足以证明里程碑完成（独立调用，只看事实不看模型自述）。
+
+    Returns:
+        {"verified": bool|None, "missing": [str], "reason": str}；
+        verified=None 表示验收器自身异常/解析失败 → 调用方降级放行（不卡死流程）。
+    """
+    payload = VERIFY_MILESTONE_PROMPT.format(milestone=milestone_desc, transcript=transcript)
+    try:
+        raw = generate_text(payload, "请按要求只输出 JSON。")
+    except Exception:  # noqa: BLE001 —— 验收器故障降级放行
+        return {"verified": None, "missing": [], "reason": "验收器异常，本次跳过验收"}
+    obj = parse_json_object(raw)
+    if not obj or not isinstance(obj.get("verified"), bool):
+        return {"verified": None, "missing": [], "reason": "验收输出无法解析，本次跳过验收"}
+    missing = [str(m)[:100] for m in (obj.get("missing") or []) if str(m).strip()]
+    return {"verified": obj["verified"], "missing": missing,
+            "reason": str(obj.get("reason") or "")[:200]}
+
+
 def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
     r = ctx.roadmap
     if not r:
@@ -685,13 +763,73 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
         ids = [m["id"] for s in (r.get("stages") or [])
                for m in (s.get("milestones") or [])]
         return {"status": "error", "error": f"未知里程碑 {milestone_id}", "available": ids}
+
+    if done:
+        # 闸 1（确定性）：批量勾选护栏——已有待确认里程碑时拒绝再勾（截图事故：Agent 一轮
+        # 把所有里程碑勾满，确认闸门被架空）。同批多个 tool_call 靠 updates 读到前一次的标记。
+        pending_now = ctx.updates.get("coach_milestone_pending",
+                                      ctx.state.get("coach_milestone_pending"))
+        if pending_now:
+            return {"status": "rejected",
+                    "error": f"里程碑「{pending_now}」刚勾选、尚在等用户确认推进，"
+                             f"一轮只能勾一个。请先等用户确认后再勾选下一个。"}
+        # 闸 2（确定性）豁免：用户明确声明完成（对话外完成的动作）或验收开关关闭 → 跳过验收
+        latest_user = _recent_user_text(ctx.state.get("coach_messages"))
+        verify_enabled = config.ROUTE_MILESTONE_VERIFY and not exit_intent.is_completion_claim(latest_user)
+        if verify_enabled:
+            # 闸 3（确定性）拒绝节流：本回合 update_roadmap 已被验收拒绝 ≥2 次 → 不再受理。
+            # 真实事故：验收拒绝后模型换措辞无限重试，两回合烧光全部工具预算（连续两次
+            # "已达上限"），用户的问题始终没被回答——确定性封锁重试循环，把剩余预算
+            # 留给"直接回复用户补内容"。
+            rejects = int(ctx.updates.get("coach_verify_rejects",
+                                          ctx.state.get("coach_verify_rejects") or 0))
+            if rejects >= 2:
+                return {"status": "blocked",
+                        "error": "本回合 update_roadmap 已被验收拒绝 2 次，不再受理。",
+                        "instruction": "停止调用 update_roadmap。立刻把缺失的内容作为回复完整讲给用户"
+                                       "（内容只有发到对话里才算数）；下一轮用户回复后再勾选。"}
+            # 闸 4（语义）LLM 验收：独立验收员只看「里程碑标准 + 对话记录」——宣布完成/布置未做/
+            # 转交无回应都不算完成。模型无注入通道（无 evidence 参数），想通过只能真把内容讲进对话。
+            if ctx.progress:
+                ctx.progress("🔍 正在核对里程碑完成情况...")
+            verdict = verify_milestone(_milestone_desc(updated, milestone_id),
+                                       _transcript_text(ctx.state.get("conversation"),
+                                                        config.ROUTE_VERIFY_TRANSCRIPT_CHARS))
+            if verdict["verified"] is False:
+                ctx.updates["coach_verify_rejects"] = rejects + 1
+                return {"status": "rejected", "missing": verdict["missing"],
+                        "reason": verdict["reason"],
+                        "action": "teach_then_recheck",
+                        "note": "验收未通过：以上内容在对话里没有实质完成证据。停止重试本工具；"
+                                "先把缺失内容作为回复完整讲给用户，下一轮再勾选。"}
+
     learner.save_roadmap(updated)
     ctx.updates["roadmap"] = updated
     prog = roadmap_domain.stage_progress(updated, updated["current_stage"])
+    # 里程碑推进卡点：勾选（done=True）后，若用户上一条回复不是明确推进指令，
+    # 设置待确认标记 → 提示词强制停下总结 + 询问（用户回复后由 coach_human 清空）。
+    # 用户上一轮明确「直接推进/不用再问」→ 免确认直接推进，不设卡点。
+    if done:
+        if not exit_intent.is_advance_directive(_recent_user_text(ctx.state.get("coach_messages"))):
+            ctx.updates["coach_milestone_pending"] = milestone_id
+        note = ("该里程碑已勾选（已通过验收）。请向用户总结本里程碑成果并询问是否进入下一里程碑/阶段；"
+                "在用户明确同意前不要开始下一里程碑的内容。")
+    else:
+        note = "已取消勾选该里程碑。"
     return {"status": "ok", "milestone_id": milestone_id, "done": done,
             "current_stage": updated["current_stage"],
             "progress": f"{prog['done']}/{prog['total']}",
-            "roadmap_status": updated.get("status")}
+            "roadmap_status": updated.get("status"),
+            "note": note}
+
+
+def _milestone_desc(roadmap: dict, milestone_id: str) -> str:
+    """按 id 取里程碑描述（验收标准），找不到返回 id 本身兜底。"""
+    loc = roadmap_domain.find_milestone(roadmap, milestone_id)
+    if not loc:
+        return milestone_id
+    si, mi = loc
+    return (roadmap["stages"][si]["milestones"][mi].get("desc") or milestone_id)
 
 
 def _revise_roadmap(args: dict, ctx: CoachCtx) -> dict:

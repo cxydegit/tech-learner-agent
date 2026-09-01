@@ -210,6 +210,12 @@ class LearnState(TypedDict):
     coach_note_pending: dict | None
     # collect/read 工具最近一次产出的文档 {path, type}；coach_human 把它附到对话记录（查看完整文档 chip），用后即清
     coach_doc: dict | None
+    # 里程碑推进卡点：刚勾选、待用户确认的里程碑 id（update_roadmap 勾选后设置，用户回复后
+    # 由 coach_human 清空）。非空时 coaching 提示词强制 Agent 停下总结 + 询问，不自行推进。
+    coach_milestone_pending: str | None
+    # 里程碑验收拒绝节流：本回合 update_roadmap 已被验收拒绝的次数（≥2 后不再受理，
+    # 防重试循环烧光工具预算；coach_human 每用户回合清零）
+    coach_verify_rejects: int
     # 记忆系统 Step 1：自上次沉淀以来的对话消息对 [{role, content}]（coach_human 填充，
     # coach_memory_write 达阈值触发 note 沉淀后清空；checkpointer 持久化，中断恢复不丢）
     memory_sweep_buffer: list
@@ -519,8 +525,13 @@ def coach_human(state: LearnState) -> dict:
         "coach_messages": [*msgs, {"role": "user", "content": reply}],
         "coach_turn_tool_count": 0,
         "last_tool_signatures": [],
+        "coach_verify_rejects": 0,  # 里程碑验收拒绝计数每回合清零（节流只限本回合）
         "last_output": "",
     }
+    # 里程碑推进卡点：一次性闸门——勾选里程碑后提示词强制停下总结 + 询问，
+    # 用户回复后清空待确认标记（Agent 下一轮据回复自然判断是否推进，不再被卡）。
+    if state.get("coach_milestone_pending"):
+        updates["coach_milestone_pending"] = None
     # collect/read 工具产出文档时，给本条 assistant 记录附上 doc chip（相对路径，前端白名单读取）
     assistant_rec: dict = {"role": "assistant", "type": "coach", "content": content, "ts": now}
     if rel:

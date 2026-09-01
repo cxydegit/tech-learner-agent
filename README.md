@@ -1,15 +1,68 @@
 # Tech Learner Agent
 
-技术学习陪练 Agent —— 帮你省时间的资料收集 + 文档解读 + 笔记整理工具。
+> 一个**自带记忆**的技术学习陪练 Agent：收集资料 → 解读文档 → 沉淀笔记 → 问自己的笔记，再由一个 Coach Agent 串成「问卷 → 规划 → 陪练」的完整学习闭环。
 
-核心流程：**Collect（资料收集）→ Read（文档解读）→ Note（知识沉淀）**。
+它不再是一个只会执行单条命令的工具箱，而是一个**记得住、想得起、会长大**的学习伙伴：每一次对话中产生的知识点都会自动沉淀进知识库（后台执行、不打断对话），下一次提问时它会把相关的旧笔记主动翻出来结合回答；新旧知识冲突时它自动以新内容为准修正并报告；聊得足够久时它还会把历史压缩成「事实 / 未决 / 脉络」三舱记忆，让长期陪练既不忘事、也不爆上下文。
 
-项目提供**两种访问方式**，共用同一套图状态与知识库，行为一致：
+## 特性
 
-| 方式 | 入口 | 适合场景                                         |
-|------|------|----------------------------------------------|
-| **CLI 命令行** | `python -m src.cli <命令>` | 单步快速执行（收集 / 解读 / 沉淀 / 建索引），或 `learn` 交互学习 / `route` 定制学习路线 |
-| **Web 前端** | `python -m src.web.server` 后浏览器访问 | 图形界面：会话管理、对话流、文档阅读器、资料库浏览、一键知识沉淀             |
+- 🧭 **Coach Agent（route）**——项目核心：问卷摸清你的水平 → 生成分阶段可检验的学习路线 → 进入陪练模式，全程对话驱动，自主编排调用基础能力
+- 📚 **Collect**——资料收集：搜索去重 + 并发抓取 + 质量预筛（官方域名 / GitHub 星数分级加分），生成结构化学习清单
+- 📖 **Read**——文档解读：抓取 → 技术文档分类 → LLM 结构化解读报告，读过的文档自动复用
+- 📝 **Note**——知识沉淀：差量提取新知识点，与已有笔记语义比对，自动入库或交你确认合并
+- 💬 **Ask**——问自己的笔记：跨笔记联想检索（dense + BM25 混合），答案内联标注来源
+- 🧠 **记忆系统**——项目最大亮点：确定性沉淀写入（不阻塞）、确定性检索注入、冲突解决、三舱摘要自我整理、跨会话恢复
+- 🛡️ **工程化护栏**——工具调用预算、图级递归上限、纯文本降级、可恢复会话（LangGraph checkpointer）
+
+---
+
+## 目录
+
+- [整体架构](#整体架构)
+- [快速开始](#快速开始)
+- [四个基础能力](#四个基础能力)
+- [Coach Agent（核心）](#coach-agent)
+- [记忆系统（亮点）](#记忆系统)
+- [Web 界面](#web-界面)
+- [项目结构](#项目结构)
+- [配置](#配置)
+- [测试](#测试)
+- [技术栈](#技术栈)
+
+---
+
+## 整体架构
+
+```
+              ┌─────────────────────────────────────────────────────┐
+              │              Coach Agent (route)                    │
+              │   问卷 → 规划 → 陪练，项目的中枢大脑                  │
+              │   负责编排 / 记忆 / 上下文 / 护栏                    │
+              └───────┬──────────────┬──────────────┬───────────────┘
+                      │              │              │
+         ┌────────────┘              │              └────────────┐
+         ▼                           ▼                           ▼
+   ┌───────────┐              ┌───────────┐               ┌───────────┐
+   │  collect  │              │   read    │               │    ask    │
+   │  资料收集  │              │  文档解读  │               │ 问我的笔记 │
+   └───────────┘              └───────────┘               └───────────┘
+                                    │ 记忆系统（note / ask 确定性接入）
+                                    ▼
+   ┌───────────┐   ┌──────────────────────────────┐   ┌───────────┐
+   │   note    │◄──┤   ① 确定性沉淀写入（后台，不阻塞）├──►  知识库    │
+   │  知识沉淀  │   │   ② 确定性检索注入（提问先查库） │   knowledge/ │
+   └───────────┘   │   ③ 冲突解决（以新为准 + 报告）  │   + .chroma/ │
+                   │   ④ 三舱摘要自我整理            │   └───────────┘
+                   └──────────────┬────────────────┘
+                                  ▼
+                   ┌───────────────┴───┐   ┌──────────────────┐
+                   │  画像 + 学习路线    │   │ 对话历史 / 会话状态 │
+                   │  learner/roadmaps │   │ .graph/          │
+                   └───────────────────┘   │ checkpoints.sqlite│
+                                           └──────────────────┘
+```
+
+**角色分工**：`collect` / `read` / `note` / `ask` 是四个**确定性、可独立使用**的基础能力；`route`（Coach Agent）是项目的**编排中枢**，它像一位真正的教练——先了解你（问卷），再为你定制学习路线（规划），然后陪你一步步执行（陪练），并在过程中把 `collect`、`read`、`ask` 作为自己的工具来调度，同时通过记忆系统持续读写你的知识库。
 
 ---
 
@@ -18,12 +71,10 @@
 ### 1. 安装依赖
 
 ```bash
-# 创建虚拟环境
 python -m venv venv
-venv\Scripts\activate  # Windows
-# source venv/bin/activate  # macOS/Linux
+venv\Scripts\activate      # Windows
+# source venv/bin/activate # macOS/Linux
 
-# 安装依赖
 pip install -r requirements.txt
 ```
 
@@ -33,194 +84,302 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-编辑 `.env`，填入你的 API Keys：
-- `OPENAI_API_KEY` — 阿里云百炼 DashScope API Key（[bailian.console.aliyun.com](https://bailian.console.aliyun.com)）
-- `OPENAI_BASE_URL` — DashScope OpenAI 兼容端点（`https://dashscope.aliyuncs.com/compatible-mode/v1`）
-- `MODEL_NAME` — 百炼模型名（如 `glm-5`）
-- `TAVILY_API_KEY` — 从 [tavily.com](https://tavily.com) 获取
-- `FIRECRAWL_API_KEY` — 从 [firecrawl.dev](https://firecrawl.dev) 获取
-- `GITHUB_TOKEN` — **可选**，GitHub Personal Access Token（collect 质量预筛查 star 数用，不填自动跳过；[github.com/settings/tokens](https://github.com/settings/tokens) 获取）
+编辑 `.env` 填入：
 
-> 说明：本项目底层大模型走**阿里云百炼（DashScope）的 OpenAI 兼容接口**（`openai` 库），不使用 Anthropic 官方 API。
-
----
-
-## 使用方式一：CLI 命令行
-
-```bash
-# 收集学习资料（可选关注点，多词直接拼）
-python -m src.cli collect "Spring Boot 3"
-python -m src.cli collect FastAPI 异步编程
-
-# 解读技术文档
-python -m src.cli read "https://docs.spring.io/spring-boot/documentation/"
-
-# 整理学习笔记
-note 有三种输入方式：
-1. -f 文件 — 从本地文件读取；
-python -m src.cli note "Spring Boot" -f materials/spring-boot-3-materials.md
-2. -t 文本 — 直接给文本；
-3. 都没有 → 从 stdin 读取，如：
-cat conversation.txt | python -m src.cli note "FastAPI"
-这条命令把 conversation.txt 的内容通过管道喂给 CLI 的 note 命令，作为「学习内容」进行知识沉淀。(conversation.txt 通常是一段学习对话/笔记文本,比如和 AI 的问答记录、复制粘贴的讲解）
-
-# 建立 / 增量更新 RAG 语义索引
-python -m src.cli index
-
-# 进入交互式学习会话（LangGraph 图驱动，中断可恢复）
-python -m src.cli learn
-
-# 定制化学习路线（问卷 → 生成路线 → 陪练执行，agent 多轮对话，中断可恢复）
-python -m src.cli route "Spring Boot"
-# 继续上次的陪练会话；已有路线时也会提示「继续 / 重新规划」
-python -m src.cli route --resume
-```
-
-| 命令 | 功能 | 输出 |
+| 变量 | 来源 | 说明 |
 |------|------|------|
-| `collect <技术名> [关注点]` | 搜索并筛选学习资料（质量预筛 + GitHub star 加分，有关注点则聚焦生成） | `materials/<技术>-materials-<时间>.md` |
-| `read <URL>` | 解读技术文档（含 RAG 缓存复用） | `reports/<标题>-解读.md` |
-| `note <技术名> [-f 文件\|-t 文本]` | 提取知识点到知识库（语义去重，相似笔记交你确认合并/跳过） | `knowledge/<技术>/<日期>-<主题>.md` |
-| `index [--force]` | 建立 / 增量更新 RAG 索引（含孤儿分块对账） | `.chroma/` 向量库 |
-| `learn [会话ID]` | 交互式学习会话：`collect` / `read` / `note` / `ask` 全流程，中断可恢复 | `.graph/` 状态持久化 |
-| `route <技术名> [--resume]` | 定制化学习路线：问卷收集画像 → 生成分阶段路线 → 陪练执行（agent 自主调 collect / read / note / update_roadmap），中断可恢复 | `learner/profile.json` 画像 + `roadmaps/<技术>-roadmap.md` 路线 |
+| `OPENAI_API_KEY` | [阿里云百炼](https://bailian.console.aliyun.com) | DashScope API Key（本项目走百炼的 OpenAI 兼容接口） |
+| `OPENAI_BASE_URL` | 固定值 | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `MODEL_NAME` | 百炼控制台 | 大模型名（如 `glm-5`） |
+| `TAVILY_API_KEY` | [tavily.com](https://tavily.com) | 网页搜索 |
+| `FIRECRAWL_API_KEY` | [firecrawl.dev](https://firecrawl.dev) | 网页抓取 |
+| `GITHUB_TOKEN` | [GitHub Settings](https://github.com/settings/tokens) | **可选**，collect 质量预筛查星数用，不填自动跳过 |
 
----
-
-## 使用方式二：Web 前端
+### 3. 两种使用方式
 
 ```bash
-python -m src.web.server
-# 打开浏览器访问 http://127.0.0.1:8000 （默认只绑本机，个人工具不进局域网/公网）
+# —— CLI 命令行 ——
+python -m src.cli collect "Spring Boot 3"            # 收集学习资料
+python -m src.cli read "https://docs.spring.io/..."   # 解读一篇文档
+python -m src.cli note "Spring Boot" -f materials/xxx.md   # 沉淀笔记（-f 文件 / -t 文本 / stdin）
+python -m src.cli index                              # 建立/增量更新语义索引
+python -m src.cli learn                              # 交互式学习会话（含 /ask）
+python -m src.cli route "Spring Boot"                # 开始 Coach 定制路线
+python -m src.cli route --list / --resume            # 找回 / 恢复陪练会话
+
+# —— Web 界面 ——
+python -m src.web.server                             # 打开 http://127.0.0.1:8000
 ```
-
-### 功能
-
-- **会话管理**：左侧会话列表，支持新建 / 切换 / 删除；历史会话经 LangGraph checkpointer 持久化，关闭刷新不丢。
-- **对话流**：中间对话区 + 四张场景卡片——
-  - 📚 **学习新技术**（collect）：填写技术名与关注点，收集资料清单；
-  - 📖 **解读文档**（read）：粘贴链接，生成解读报告，消息里带「阅读全文」chip；
-  - 💬 **问我的笔记**（ask）：跨笔记联想检索，答案内联标注来源笔记；
-  - 🧭 **定制路线**（route）：填技术名开始，agent 多轮问卷收集画像 → 生成分阶段学习路线 → 陪练执行（自主 collect / read / note 推进学习计划）。
-- **实时进度**：collect / read 长任务经 SSE 推送流式进度，对话区实时展示执行过程。
-- **一键沉淀（note）**：read 完成提醒区出现「📝 一键沉淀」入口；遇到与已有笔记相似的候选，弹出决策面板（**全部合并 / 输入编号逐条 / 全部跳过**），确认后差量合并入库。
-- **后台任务不阻塞**：切走会话不会中断正在跑的任务；note 待确认的合并决策跨会话 / 刷新保留，切回来恢复决策面板继续确认。
-- **资料库浏览**：顶部入口按 `materials`（资料）/ `reports`（解读报告）/ `knowledge`（知识笔记）三类浏览全部文档。
-- **文档阅读器**：点击「阅读全文」或资料库条目打开右侧阅读器（Markdown 渲染），打开时左侧会话栏自动隐藏、对话与阅读器 1:1 分栏。
-- **防误关**：有任务在跑 / 有待确认沉淀时关闭或刷新页面会弹系统确认框。
 
 ---
 
-## 定制化学习路线（route）
+## 四个基础能力
 
-agentic 多轮学习陪练：问卷收集画像 → 生成个性化学习路线 → 陪练执行，全程对话驱动，把 collect / read / note / ask 作为 agent 工具，由模型自主编排调用。
+四个能力都可独立通过 CLI 或 Web 使用，彼此解耦、确定性执行，是 Coach Agent 的「四件套」工具箱。
 
-### 整体流程（单图三模式）
+### 📚 collect — 资料收集
+
+搜索指定技术的学习资料：搜索去重 → 并发抓取 → **质量预筛**（官方域名加分、GitHub 星数分级加分、内容农场降权）→ LLM 合成一份「按阅读顺序排列、核心必读 + 扩展阅读 + 示例项目 + 学习路线建议」的结构化清单，保存到 `materials/`。支持可选关注点，生成围绕关注点聚焦的深度资料。
+
+### 📖 read — 文档解读
+
+给定一个文档 URL：抓取 → **技术文档分类**（判断是否是技术文档）→ LLM 产出结构化解读报告（概要 / 核心术语 / 逐节解读），保存到 `reports/`。解读过的文档会被语义召回并提示复用，避免重复解读。
+
+### 📝 note — 知识沉淀
+
+把一段学习内容提炼为知识笔记：**差量提取**（对比知识库已有笔记，只提取真正的新知识点）→ 与已有笔记做**语义相似匹配** → 结果分派：
+
+- **全新知识点** → 自动新建入库（`knowledge/`）；
+- **与已有笔记相似** → 列出候选，交你决定「全部合并 / 按编号逐条合并 / 跳过」，确认后**差量合并**入库；
+- **无新内容** → 基于已有资料给出延伸学习方向的轻量推荐。
+
+合并时自动识别新旧内容对同一事实的矛盾（见 [记忆冲突解决](#记忆冲突解决)）。
+
+### 💬 ask — 问我的笔记
+
+跨笔记**联想检索**问答：用混合检索（语义向量 + BM25 词法 → RRF 融合 → 词法软重排）召回相关片段，按来源笔记分组，LLM 综合回答并**逐条内联标注来源**（笔记里没有的信息会明确说「笔记里没有记录」）。不依赖固定技术主题，问「我之前笔记里提到过哪些 X？」这类问题最拿手。检索前自动对账清理已删除文件的孤儿分块。
+
+---
+
+## Coach Agent
+
+`route` 是整个项目的**中枢与最大亮点**：一个三阶段生命周期的 agentic 学习陪练。它把四个基础能力当作自己的工具，由模型自主决定何时调用，同时承担记忆、上下文与护栏的全部责任。
 
 ```
-问卷(survey) → 路线规划(planning) → 陪练执行(coaching)
+┌────────────┐    ┌────────────┐    ┌──────────────┐
+│  问卷阶段    │ →  │  规划阶段   │ →  │   陪练阶段    │
+│  survey     │    │  planning  │    │   coaching   │
+│  了解你      │    │  定制路线   │    │   陪你执行    │
+└────────────┘    └────────────┘    └──────────────┘
 ```
 
-- **问卷（survey）**：确定性收集四类字段（自评 0-10 / 相关技术 / 学习目标 / 时间预算，格式错自动重问）+ 基于画像动态出 2-3 道诊断题，完成后推导用户画像（小白 / 开发者）。
-- **路线规划（planning）**：模型调 `generate_roadmap` 生成 3-5 个阶段、每阶段含可检验里程碑的路线 → 落盘 → 呈现给你确认 / 提出修改 → 确认后进入执行。
-- **陪练执行（coaching）**：agent 自主选择工具推进：collect（收集资料）/ read（解读）/ note（沉淀笔记）/ ask（问已学笔记）/ update_roadmap（勾选里程碑）；你随时可说「停 / 结束」退出。
+### 三阶段生命周期
 
-模式切换由**确定性代码**判定（问卷完成 → planning；用户确认路线 → coaching），模型的自由度只在「对话 + 选工具」。
+| 阶段 | 做什么 | 暴露的工具 | 产物 |
+|------|--------|-----------|------|
+| **问卷 survey** | 确定性收集画像：自评水平（0-10）、相关技术背景、学习目标、时间预算，并基于画像动态追问诊断题 | 无 | `learner/profile.json` 用户画像（按技术归档） |
+| **规划 planning** | 基于画像生成 3-5 个阶段的学习路线，每阶段含目标、推荐资料、预估时长、**可检验里程碑**；呈现给你确认或提出修改 | `generate_roadmap` / `confirm_roadmap` / `get_roadmap` | `roadmaps/` 学习路线（Markdown 给人看 + JSON 存机器态） |
+| **陪练 coaching** | 陪你按里程碑一步步执行：勾选完成自动推进阶段、随时可修订路线；对话中产生的内容自动沉淀进知识库 | `collect` / `read` / `ask` / `get_roadmap` / `update_roadmap` / `revise_roadmap` | 知识库持续增长 + 路线进度推进 |
+
+**设计要点**：模式切换全部由**确定性代码**判定（问卷完成 → 规划；用户确认路线 → 陪练），模型的自由度只在「对话 + 选工具」。陪练模式下不再向模型暴露 `note` 工具——学习内容沉淀改由记忆系统**确定性自动触发**（见下），避免依赖模型自觉、也不阻塞对话。
+
+### 上下文管理
+
+- **有界上下文**：每次模型调用只带最近 **10 轮**对话 + 画像 / 路线上下文块；
+- **自动压缩**：消息数超过 **40 条**时触发压缩——旧消息经「三舱记忆整理」（见 [记忆系统](#记忆系统)）吸收后丢弃，只保留最近 10 轮；
+- **工具结果天然短**：工具只回传 `{status, ...}` 加路径 / 摘要等轻量字段，大内容全部写文件，模型从不接触大文本。
+
+### 护栏与容错
+
+| 机制 | 行为 |
+|------|------|
+| 工具调用预算 | 每个用户回合最多 **8 次**连续工具调用，超限强制 interrupt 找你确认方向（防死循环） |
+| 图级递归上限 | LangGraph recursion_limit **50**，防止 agent 失控打转 |
+| 纯文本降级 | 工具调用通道持续失败时，去掉 tools 用纯文本再问一次（可开关） |
+| 异常回喂 | 工具执行异常错误回喂模型自行修正重试 |
+| 随时退出 | 说「停 / 结束」确定性退出；standalone 的 collect / read / note 始终可用 |
 
 ### 持久化与恢复
 
 | 数据 | 位置 | 说明 |
 |------|------|------|
-| 用户画像 | `learner/profile.json` | 按技术归档：自评 / 目标 / 时间预算 / 画像分桶 / 路线路径 |
-| 学习路线 | `roadmaps/<技术>-roadmap.md` + `.json` | Markdown 给人看可编辑，JSON 存机器态（当前阶段 / 里程碑完成） |
-| 会话状态 | `.graph/checkpoints.sqlite` | 模式、画像、路线、消息全量快照，中断 / 刷新 / 重启可恢复 |
+| 用户画像 | `learner/profile.json` | 按技术归档：自评 / 背景 / 目标 / 时间预算 / 分桶 |
+| 学习路线 | `roadmaps/*.json` + Markdown | JSON 存机器态（阶段 / 里程碑进度），MD 给人看可编辑 |
+| 会话状态 | `.graph/checkpoints.sqlite` | 模式、画像、路线、消息全量快照（LangGraph SqliteSaver） |
 
-- **恢复**：`route --resume` 直接回到上次线程；新开路线时检测到已有路线，会提示「继续上次陪练 / 重新规划」。
-- agent 每轮看到的路线来自**状态**（checkpointer 还原）；文件是外部归档，两者同步写入。
+`route --resume` 直接回到上次线程继续陪练（自动带上技术名）；Web 端会话列表可一键恢复。中断 / 刷新 / 重启都不丢状态。
 
-### 上下文管理
+---
 
-- 模型上下文有界：每次调用只带最近 10 轮 + 画像 / 路线上下文块。
-- 消息超 40 条触发压缩：旧消息经 LLM 摘要进 `coach_summary`（叠加既有摘要），只留最近 10 轮；摘要失败降级为直接丢弃（保上下文有界）。
-- 工具结果天然短（`{status, path, summary}`），大内容全部写文件，模型从不接触大文本。
+## 记忆系统
 
-### 出错恢复（六层防御）
+这是 Coach Agent 的**灵魂**，也是项目区别于普通 agent 玩具的关键。设计理念一句话：**「模型只负责产出，系统负责确定性」**——记忆的写入触发、检索路由、候选确认、冲突落库、三舱应用全部由确定性代码完成，LLM 只在被允许的位置做提取与合并，从而不依赖模型自觉、不会漏写、也不会重写衰减。
 
-1. 工具执行异常 → 错误回喂模型自行修正重试；
-2. LLM 调用瞬时故障 → 静默重试 3 次；
-3. 工具调用通道持续失败 → 去掉 tools 纯文本降级；
-4. 持续失败 → interrupt 问用户方向；
-5. 死循环护栏：每回合工具预算 8 次 / 连续 2 次相同调用强制打断 / 图级 recursion_limit 50；
-6. 你随时可说「停 / 结束」确定性退出；standalone 的 collect / read / note 始终可用。
+系统共维护五类记忆：
 
-### 相关配置（环境变量）
+| 记忆 | 载体 | 生命周期 |
+|------|------|---------|
+| 工作记忆 | 最近 10 轮对话 | 随对话滚动 |
+| 情境记忆 | 三舱摘要（事实 / 未决 / 脉络） | 压缩时增量更新 |
+| 用户记忆 | `learner/profile.json` | 每次问卷更新 |
+| 任务状态 | `roadmaps/` + checkpointer | 随里程碑推进 |
+| 语义记忆 | 知识库 `knowledge/` + 向量索引 `.chroma/` | 持续沉淀、冲突修正 |
+
+### ① 确定性沉淀写入（note 后台执行，不阻塞）
+
+对话中产生的学习内容**不需要**模型自觉调工具——系统自动完成：
+
+- 每次对话轮次被压入一个**沉淀缓冲**；
+- 缓冲累计到 **≥6 个用户回合** 或 **≥2500 字**（任一达到）即触发一次沉淀；
+- 触发后**后台线程**执行纯 note 管道（只读知识库 + LLM 差量提取），**对话完全不阻塞**；结果经进程内内存侧信道交回，在下一个用户回合「排水」落库；
+- 线程失败 / 超时 / 进程重启 → 快照自动回滚到缓冲，交给未来正常触发重扫，**不丢不重**；
+- 结果确定性分派：
+  - **无新内容**（闲聊 / 过程消息）→ 天然被差量提取过滤，清空缓冲无动作；
+  - **有新知识点且无相似候选** → 自动落库，agent 可自然提及「已沉淀 N 个新知识点」；
+  - **有相似候选** → 走**确定性确认节点**（不经过 agent 转述）：暂停问你「合并 / 跳过」，解析你的决定后落库；
+- 反馈通过 SSE 进度事件实时展示（Web 端），`ROUTE_MEMORY_SWEEP_ASYNC=false` 可退回同步路径（逃生舱）。
+
+> 效果：聊着聊着，知识就自动进了笔记库。沉淀耗时是「后台的」，对话是「即时的」。
+
+### ② 确定性检索（ask）
+
+每次用户提问，模型**不会直接凭记忆作答**——系统先做确定性检索路由：
+
+- **廉价闸门**（零成本）：「继续 / 现在到哪了 / 路线对吗」这类过程 / 元问题直接跳过查库；
+- **质量闸门**：复用 ask 的混合检索（限定当前技术），只有命中片段与问题相似度达到阈值（余弦 **0.65**）才注入上下文，最多注入 **3 条**片段；
+- **优雅降级**：检索异常（未索引 / 向量库不可用）返回空，模型用自己的知识正常回答，绝不让检索失败拖垮对话。
+
+> 效果：教练回答你的问题时，会主动「翻旧笔记」结合你的历史沉淀作答，而不是只靠模型原生知识。
+
+### ③ 记忆冲突解决
+
+沉淀新知识点与已有笔记相似时，自动做**差量合并**：LLM 对比新旧内容，识别对同一事实的**相互矛盾**，**以新内容为准**修正矛盾处（因为新内容是最新学到的），并产出一份**矛盾处理报告**（发现了什么矛盾、改成了什么），透出给你复核。合并保留旧笔记的标题与索引身份，只更新正文。
+
+### ④ 摘要自我整理（三舱）
+
+上下文压缩时，旧消息被整理进**三舱记忆**，而不是简单丢弃：
+
+| 舱 | 存什么 | 确定性规则 |
+|----|--------|-----------|
+| **事实舱 facts** | 已确认的稳定事实 | LLM 只产增量，代码去重追加；上限 **20 条**，超限丢最旧，**永不被重写** |
+| **未决舱 open_items** | 尚未解决的事项（带全局 id） | LLM 标记新增 / 已解决，代码**按 id 确定性淘汰**；上限 **8 条** |
+| **脉络舱 summary** | 对话脉络的连续性摘要 | LLM 每窗增量产出，代码叠加；字符上限 **600** |
+
+关键设计：**LLM 只看新消息产增量，确定性代码管积累**（去重 / 按 id 淘汰 / 机械上限），事实与未决舱永不被 LLM 重写——防止每次压缩都让摘要「衰减变形」。整理失败（LLM 不可用 / 解析失败）时三舱原样保留，宁可少记一窗增量，不拿既有积累冒险。
+
+> 跨会话记忆（画像读回、摘要与路线跨线程继承）已列入设计规划，见 `docs/memory_plan.md`。
+
+### 一次对话中的记忆流转
+
+```
+你: "React 的 useEffect 为什么依赖数组变了才会重跑？"
+     │
+     ▼
+① 确定性检索 ──► 知识库命中「React 笔记 · Hooks 章节」──► 注入上下文 ──┐
+     │                                                            │
+② Coach 结合笔记作答，你继续追问 3 轮                                │
+     │                                                            │
+③ 缓冲累计达标（6 回合 / 2500 字）──► 后台线程差量提取 ◄──────────────┘
+     │
+     ├─ 有新知识点 ──► 自动落库 ✓（冲突时自动以新为准修正并报告）
+     └─ 无新内容 ────► 清空缓冲，继续陪练
+
+④ 聊久了，消息 >40 条 ──► 三舱整理：事实 / 未决 / 脉络增量吸收，压缩上下文
+```
+
+---
+
+## Web 界面
+
+```bash
+python -m src.web.server   # 默认 http://127.0.0.1:8000（只绑本机）
+```
+
+- **场景卡片**：📚 学习新技术（collect）/ 📖 解读文档（read）/ 💬 问我的笔记（ask）/ 🧭 定制路线（route），一键开始；
+- **对话流**：SSE 实时流式输出，长任务（collect / read / 沉淀）进度实时展示；
+- **一键沉淀**：read 完成后出现「📝 一键沉淀」入口；相似笔记候选弹出决策面板（全部合并 / 编号逐条 / 全部跳过），确认后合并入库；
+- **后台不阻塞**：切走会话不中断正在跑的任务；待确认的合并决策跨会话 / 刷新保留，切回来继续确认；
+- **会话管理**：左侧会话列表，新建 / 切换 / 删除，历史经 checkpointer 持久化；
+- **资料库浏览 + 文档阅读器**：按 materials / reports / knowledge 三类浏览，点击进入右侧 Markdown 阅读器。
+
+---
+
+## 项目结构
+
+```
+src/
+├── cli.py                  # CLI 入口：Click 命令 + /learn REPL + route 定制路线
+├── graph.py                # 编排层：LangGraph 状态机（四个能力 + coach 循环 + 记忆节点）
+├── config.py               # 配置层：环境变量、路径、阈值
+├── web/                    # Web 服务：FastAPI + 原生模块化 SPA（零构建链）
+│   ├── server.py           #   FastAPI 应用 + /api 端点 + SSE 流
+│   ├── sessions.py         #   会话列表 / 详情 / 删除
+│   ├── runner.py           #   图后台执行线程 + 事件队列
+│   ├── docs.py             #   资料 / 报告 / 笔记文件浏览 API
+│   └── static/             #   前端 SPA（零依赖，hash 路由）
+├── pipelines/              # 应用层：确定性业务管道（纯数据，无 I/O 副作用）
+│   ├── collect.py          #   资料收集管道
+│   ├── read.py             #   文档解读管道
+│   ├── note.py             #   差量提取 + 合并 + 入库（含冲突解决）
+│   ├── qa.py               #   联想检索问答管道
+│   └── route.py            #   Coach 工具实现 + 三模式提示词 + 记忆沉淀 / 三舱整理
+├── domain/                 # 领域层：纯业务规则（零 I/O，可独立单测）
+│   ├── chunking.py         #   Markdown 感知切块
+│   ├── dedup.py            #   去重 / 文件名清洗
+│   ├── extraction.py       #   LLM 输出解析
+│   ├── roadmap.py          #   学习路线 schema / 里程碑推进
+│   ├── survey.py           #   问卷解析 / 画像推导
+│   ├── exit_intent.py      #   退出意图确定性识别
+│   ├── hybrid.py           #   混合检索重排规则
+│   └── quality.py          #   资料质量预筛打分
+├── adapters/               # 基础设施层：外部 I/O
+│   ├── llm.py              #   LLM 调用（DashScope OpenAI 兼容）
+│   ├── search.py           #   Tavily 搜索
+│   ├── fetch.py            #   Firecrawl 抓取
+│   ├── embedding.py        #   DashScope 向量化
+│   ├── vector.py           #   Chroma 向量库（索引 / 混合检索 / 对账）
+│   ├── learner.py          #   画像 / 路线文件读写
+│   └── store.py            #   知识库文件存储 + 笔记匹配
+└── baselines/              # 研究层：ReAct 基线（benchmark 用，主流程绝不 import）
+
+materials/   收集的资料清单      reports/   解读报告
+knowledge/   知识笔记           learner/    用户画像
+roadmaps/    学习路线           .graph/     会话状态（checkpointer）
+.chroma/     语义向量库          docs/       设计文档与评估报告
+```
+
+---
+
+## 配置
+
+关键配置项（全部可通过环境变量覆盖，见 `src/config.py`）：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `ROUTE_MAX_TOOL_CALLS_PER_TURN` | `8` | 每用户回合工具调用预算 |
 | `ROUTE_RECURSION_LIMIT` | `50` | 图级执行硬上限 |
-| `COACH_HISTORY_KEEP` | `10` | 每轮保留最近对话轮数 |
+| `COACH_HISTORY_KEEP` | `10` | 上下文保留最近对话轮数 |
 | `COACH_COMPRESS_AT` | `40` | 消息数压缩阈值 |
-| `COACH_SUMMARY_MAX_TOKENS` | `800` | 摘要长度上限 |
-| `ROUTE_FALLBACK_TO_TEXT` | `true` | 工具通道失败时纯文本降级 |
+| `ROUTE_MEMORY_SWEEP_TURNS` | `6` | 沉淀触发：累计用户回合数 |
+| `ROUTE_MEMORY_SWEEP_CHARS` | `2500` | 沉淀触发：累计对话字符数 |
+| `ROUTE_MEMORY_SWEEP_ASYNC` | `true` | 后台异步沉淀（false 退回同步） |
+| `ROUTE_MEMORY_SWEEP_TIMEOUT` | `300` | 后台沉淀线程超时（秒） |
+| `ROUTE_KB_INJECT_SIM` | `0.65` | 提问注入知识库的相似度阈值 |
+| `ROUTE_KB_SNIPPETS` | `3` | 注入上下文片段数上限 |
+| `COACH_FACTS_MAX` | `20` | 事实舱上限 |
+| `COACH_OPEN_MAX` | `8` | 未决舱上限 |
+| `COACH_SUMMARY_MAX_CHARS` | `600` | 脉络舱字符上限 |
+| `QA_USE_HYBRID` | `true` | 混合检索（dense + BM25 + RRF）开关 |
+| `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | `800` / `100` | 文档切块参数 |
+| `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8000` | Web 服务地址 |
+| `AGENT_USE_FUNCTION_CALLING` | `false` | 原生 function calling（默认文本解析，兼容百炼系模型） |
 
 ---
 
-## 项目结构（代码结构）
+## 测试
 
+```bash
+pytest
 ```
-src/
-├── cli.py                  # CLI 入口：Click 命令 + /learn REPL + route 定制路线 + 渲染
-├── graph.py                # 编排层：LangGraph 状态机（collect/read/qa + note 两段式 + coach 陪练循环）
-├── config.py               # 配置层：环境变量、路径、阈值
-├── web/                    # Web 服务：FastAPI + 原生模块化 SPA（零构建链）
-│   ├── server.py           #   FastAPI 应用 + /api 端点 + SSE 流
-│   ├── sessions.py         #   会话列表 / 详情 / 删除（读 SqliteSaver checkpoint）
-│   ├── runner.py           #   图后台执行线程 + 事件队列（run / resume / job_info）
-│   ├── docs.py             #   资料/报告/笔记文件浏览 API（路径白名单防穿越）
-│   └── static/             #   前端 SPA：index.html + css/ + js/
-│       ├── js/main.js      #     入口：初始化 + hash 路由 + beforeunload
-│       ├── js/store.js     #     共享状态 + 发布订阅
-│       ├── js/api.js       #     fetch + EventSource 封装
-│       ├── js/cards.js     #     场景卡片 + 表单校验
-│       ├── js/markdown.js  #     轻量 markdown 渲染器（零依赖）
-│       ├── js/router.js    #     hash 路由：#/chat/:id、#/docs/:type
-│       └── js/views/       #     对话流 chat / 阅读器 reader / 资料库 docs
-├── pipelines/              # 应用层：确定性业务管道（纯数据，无 I/O 副作用）
-│   ├── collect.py          #   资料收集 / 定向深挖管道 + 提示词
-│   ├── read.py             #   文档解读管道 + 分类门 + 提示词
-│   ├── note.py             #   笔记差量提取 + 合并确认 + 入库管道 + 提示词
-│   ├── qa.py               #   联想检索问答管道 + 提示词
-│   └── route.py            #   coach 陪练工具实现 + 三模式提示词 + 摘要压缩
-├── domain/                 # 领域层：纯业务规则（零 I/O、零框架，可独立单测）
-│   ├── chunking.py         #   Markdown 感知切块（版本变更自动全量重切索引）
-│   ├── dedup.py            #   文件名清洗 / 主题重叠 / 笔记头 / 去重判定
-│   ├── extraction.py       #   LLM 输出解析（JSON 提取 / 列表 / 分类）
-│   ├── roadmap.py          #   学习路线 schema / 校验 / 里程碑推进（route 模块）
-│   ├── survey.py           #   问卷解析 / 画像推导 / 完成判定（route 模块）
-│   ├── exit_intent.py      #   退出意图确定性识别（route 模块）
-│   └── card_input.py       #   场景卡片输入解析与校验（CLI / Web 共用契约）
-├── adapters/               # 基础设施层：外部 I/O（domain 绝不反向依赖）
-│   ├── llm.py              #   LLM 调用（DashScope OpenAI 兼容）+ 时间标签注入 + chat_with_tools
-│   ├── search.py           #   Tavily 搜索
-│   ├── fetch.py            #   Firecrawl 抓取
-│   ├── embedding.py        #   DashScope 向量化
-│   ├── vector.py           #   Chroma 向量库（索引 / 混合检索 / 缓存）
-│   ├── learner.py          #   用户画像 / 学习路线文件读写（route 模块）
-│   └── store.py            #   知识库文件存储 + 文件读写工具
-└── baselines/              # 研究层：ReAct 基线（benchmark 用，主流程绝不 import）
-    └── react_agent.py      #   旧 ReAct Agent 冻结副本
-```
+
+覆盖四件套管道、混合检索、记忆沉淀（同步 / 异步 / 失败回滚）、三舱整理、冲突合并、Coach 循环路由、Web 端到端等，详见 `tests/`。
+
+---
 
 ## 技术栈
 
-- **语言**: Python 3.11+
-- **LLM**: 阿里云百炼 DashScope（OpenAI 兼容接口，`openai` 库；模型由 `MODEL_NAME` 配置）
-- **向量化**: DashScope `text-embedding-v3`（单请求批量上限 10）
-- **编排**: LangGraph + SqliteSaver checkpointer（中断 / 恢复 / 跨会话持久化）
-- **语义检索**: Chroma（本地 `.chroma/`，cosine 度量）+ BM25 混合检索（RRF 融合）
-- **搜索**: Tavily API
-- **网页抓取**: Firecrawl
-- **知识存储**: Markdown 文件 + 语义索引
-- **Web**: FastAPI + uvicorn，原生模块化 SPA（无 node 构建链）
-- **CLI**: Click + Rich
+- **语言**：Python 3.11+
+- **LLM**：阿里云百炼 DashScope（OpenAI 兼容接口，模型由 `MODEL_NAME` 配置）
+- **编排**：LangGraph + SqliteSaver checkpointer（中断 / 恢复 / 跨会话持久化）
+- **语义检索**：Chroma（本地 `.chroma/`）+ DashScope `text-embedding-v3` + BM25 混合检索（RRF 融合 + 词法软重排）
+- **搜索 / 抓取**：Tavily / Firecrawl
+- **知识存储**：Markdown 文件 + 语义索引
+- **Web**：FastAPI + uvicorn，原生模块化 SPA（无 node 构建链）
+- **CLI**：Click + Rich
+
+## 相关设计文档
+
+- `docs/memory_plan.md` —— 记忆系统五步增强计划（写触发 / 读路由 / 冲突解决 / 三舱整理 / 跨会话）
+- `docs/PRD.md` —— 产品需求文档
+- `docs/PROMPT_DESIGN.md` —— 提示词设计
+- `docs/eval_retrieval_scenarios.md` + `docs/report/` —— 检索场景评估与优化记录
