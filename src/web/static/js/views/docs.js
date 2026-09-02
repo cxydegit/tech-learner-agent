@@ -1,5 +1,5 @@
 /* ============================================================
-   资料库浏览视图（P3）：#/docs/:type
+   资料库浏览视图：#/docs/:type
    - 主区列出 materials / reports / knowledge 的 markdown（GET /api/docs）
    - 点击文档 → 右侧阅读器打开（openDoc）
    - 顶部三个分类 tab 切换（navigate hash）

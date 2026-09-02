@@ -1,6 +1,6 @@
 """ReAct Agent 基线 —— benchmark 对比用，主流程绝不 import。
 
-自 agent.py / tools.py / prompts.py 原样搬入（冻结的 Stage 4 benchmark 基线）：
+自 agent.py / tools.py / prompts.py 原样搬入（冻结的 benchmark 基线）：
 Agent 类（含 ``_extract_json_object`` 逐字副本）、MAX_LOOP_COUNT、console、
 REACT_SYSTEM_PROMPT、TOOL_REGISTRY 及工具注册相关函数。
 

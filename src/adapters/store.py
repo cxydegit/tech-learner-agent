@@ -3,7 +3,7 @@
 自 storage.py 迁出（去重/命名纯规则在 domain/dedup.py）+ tools.py 迁出
 save_file_tool / read_file_tool / list_files_tool。
 
-⚠️ vector 导入必须保持函数内 lazy（不变量 I1：`import src.cli` 不得拉起 chromadb）。
+⚠️ vector 导入必须保持函数内 lazy（`import src.cli` 不得拉起 chromadb）。
 """
 
 import re
@@ -12,7 +12,12 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import config
-from ..domain.dedup import _parse_tags, _title_fast_match, _with_header, sanitize_filename
+from ..domain.dedup import (
+    _parse_tags,
+    _title_fast_match,
+    _with_header,
+    sanitize_filename,
+)
 
 
 def ensure_knowledge_base() -> None:
@@ -33,7 +38,7 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
                     ) -> tuple[dict | None, float | None, str | None]:
     """语义去重：召回候选 → 标题 fast-path → LLM 判定，返回第一个判定 same 的候选。
 
-    设计（RAG_OPTIMIZATION P0 压力测试后重构）：候选召回与合并决策解耦——
+    设计：候选召回与合并决策解耦——
     - 候选召回：语义检索 top2（限定同一技术领域）；相似度低于
       RAG_DEDUP_JUDGE_SIM_MIN 的不送判定（实测同义改写对源笔记 ≥0.50，0.4 以下
       几乎不可能是同一篇，省 LLM 调用）；
@@ -41,7 +46,7 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
       直接确认，不花 LLM 调用；
     - LLM 判定：其余候选交给 adapters/llm.judge_same_knowledge_point（替代旧的
       标签/内容 overlap 确认层——合成压力测试证明确定性信号无法识别真正措辞不同
-      的同义改写，见 RAG_OPTIMIZATION）；
+      的同义改写）；
     - 判定失败 / LLM 不可用 → 不合并（宁可可修的重复，也不静默错并）。
 
     返回**第一个**判定 same 的候选（top1 优先；fast-path 优先于 LLM 判定），
@@ -71,8 +76,7 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
         # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
         # 而 existing 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
         hit_path = h.get("path") or ""
-        if hit_path.startswith("knowledge/"):
-            hit_path = hit_path[len("knowledge/"):]
+        hit_path = hit_path.removeprefix("knowledge/")
         existing_note = next((n for n in existing if n["path"] == hit_path), None)
         if not existing_note:
             continue
@@ -85,7 +89,7 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
             verdict, reason = judge_same_knowledge_point(topic, tags, content, existing_note)
             if verdict == "same":
                 return existing_note, sim, reason or "LLM 判定为同一知识点"
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 —— LLM 不可用时静默降级为不合并（安全侧）
             pass
     # RAG 不可用时的兜底：标题 fast-path 全量扫描（零 embedding）
     for n in existing:
@@ -97,7 +101,7 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
 def recall_existing_notes(tech: str, query: str, top_k: int = 3) -> list[dict]:
     """语义召回该技术领域下与学习内容最相关的已有笔记 top-k（差量提取的对比上下文）。
 
-    复用 semantic_search_knowledge 限定 knowledge 源 + tech 目录（lazy import，守 I1）；
+    复用 semantic_search_knowledge 限定 knowledge 源 + tech 目录（lazy import）；
     RAG 未索引 / 不可用时回退到最近 top_k 篇，保证提取提示词至少有一点对比对象。
 
     Args:
@@ -122,8 +126,7 @@ def recall_existing_notes(tech: str, query: str, top_k: int = 3) -> list[dict]:
     recalled: list[dict] = []
     for h in hits:
         path = h.get("path") or ""
-        if path.startswith("knowledge/"):
-            path = path[len("knowledge/"):]
+        path = path.removeprefix("knowledge/")
         n = by_path.get(path)
         if n and n not in recalled:
             recalled.append({**n, "similarity": h.get("similarity", 0)})
@@ -146,7 +149,7 @@ _INDEX_RETRY_DELAY_SECONDS = 1.5
 def _update_rag_index(filepath: Path) -> dict:
     """笔记写库后增量更新 RAG 索引：失败不阻断沉淀，但状态必须返回给调用方呈现。
 
-    P3.1（8-19 事故复盘）：此前失败被 `except: pass` 静默吞掉——embedding API
+    此前失败被 `except: pass` 静默吞掉——embedding API
     一次抖动让 4 篇新笔记「保存成功但检索不到」，无日志无重试、对账只删不补，
     缺口留存 6 天才被评估撞见。现在：瞬时失败立即重试一次（失败的调用不产生
     embedding 计费）；仍失败则返回失败状态，由接口层（cli/graph/web）渲染警告。
@@ -184,7 +187,7 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
                  *, replace_path: str | None = None) -> dict:
     """持久化一条知识笔记：新建 dated 文件，或覆盖合并进已有文件。
 
-    Step 3 起**不再静默追加**：去重/合并决策上移到 note_pipeline + 交互层
+    **不再静默追加**：去重/合并决策上移到 note_pipeline + 交互层
     （pipelines/note.py），此处只做纯 I/O——
     - replace_path 为 None：创建新 dated 文件并更新 INDEX.md；
     - replace_path 给出：把 content（交互层已用 LLM 差量合并好的正文）覆盖写入该文件，
@@ -211,7 +214,7 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
         if filepath.exists():
             old = filepath.read_text(encoding="utf-8")
             old_date, old_tags = _parse_header(old)
-            date_str = old_date or datetime.now().strftime("%Y-%m-%d")
+            date_str = old_date or datetime.now().astimezone().strftime("%Y-%m-%d")
             tag_str = " ".join(f"#{t}" for t in _merge_tags(old_tags, tags))
             header = f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n"
             filepath.write_text(header + content.lstrip(), encoding="utf-8")
@@ -220,7 +223,7 @@ def persist_note(tech: str, topic: str, content: str, tags: list[str] | None = N
             return result
 
     # 新建：dated 文件 + 更新索引
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now().astimezone().strftime("%Y-%m-%d")
     filename = f"{date_str}-{sanitize_filename(topic)}.md"
     filepath = tech_dir / filename
     filepath.write_text(_with_header(topic, tags, content), encoding="utf-8")
@@ -271,7 +274,7 @@ def update_index(tech: str, topic: str, filepath: Path) -> None:
     rel_path = filepath.relative_to(config.KNOWLEDGE_DIR)
 
     # 构建新条目
-    new_entry = f"- [{topic}]({rel_path.as_posix()}) — {datetime.now().strftime('%Y-%m-%d')}"
+    new_entry = f"- [{topic}]({rel_path.as_posix()}) — {datetime.now().astimezone().strftime('%Y-%m-%d')}"
 
     # 检查技术领域是否已存在
     tech_header = f"### {tech_display}"

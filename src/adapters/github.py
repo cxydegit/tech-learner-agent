@@ -1,6 +1,6 @@
 """GitHub 外部 I/O 适配器：查询仓库 star 数（质量预筛用）。
 
-Step 5 Part B：标准库 ``urllib`` 单次 GET，可选 ``GITHUB_TOKEN``（5000 次/时）。
+标准库 ``urllib`` 单次 GET，可选 ``GITHUB_TOKEN``（5000 次/时）。
 任何失败都返回 None 优雅降级——不设 token 时调用方（collect_pipeline）直接跳过，
 不会发起网络请求。
 """

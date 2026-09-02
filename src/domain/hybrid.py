@@ -1,6 +1,6 @@
 """混合检索纯函数：BM25 打分 + RRF 名次融合（零 I/O、零框架依赖）。
 
-P1（docs/RAG_OPTIMIZATION.md）：补纯 dense 漏「精确词匹配」的经典弱点——搜
+设计动机：补纯 dense 漏「精确词匹配」的经典弱点——搜
 RedisJSON / FT.SEARCH 这类专有名词时，embedding 模糊匹配失效。BM25 对词法命中
 是秒杀级（token 原样躺在文档里），RRF 无权重融合两条名次链：精确词命中由 BM25
 榜单兜住，语义相近由 dense 榜单兜住。
@@ -8,7 +8,7 @@ RedisJSON / FT.SEARCH 这类专有名词时，embedding 模糊匹配失效。BM2
 全部标准库自实现（不引 rank_bm25）：当前知识库规模小，内存打分即可。
 分词规则与 domain/dedup.py::_topics_overlap 同源（英文按词、中文按单字），
 但**点号不拆词**：FT.SEARCH / RedisJSON 这类点号分隔的缩写整体算一个 token——
-拆成 ft/search 会让罕见缩写被高频词稀释掉 idf，正是 P1 想修的精确词弱点的来源之一。
+拆成 ft/search 会让罕见缩写被高频词稀释掉 idf，正是想修的精确词弱点的来源之一。
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def rrf_fuse(dense: list[dict], sparse: list[dict], k: int = 60) -> list[dict]:
         并追加：
         - ``rrf_score``: 原始融合分
         - ``similarity``: 归一化融合分（最大值归 1，用于按相关度排序 / 展示）
-        - ``dense_similarity``: dense 原始余弦（若该 id 未进 dense 则为 None，留给 P2 阈值）
+        - ``dense_similarity``: dense 原始余弦（若该 id 未进 dense 则为 None，留给阈值过滤）
         - ``bm25_score``: BM25 归一化分（若未进 sparse 则为 None）
     """
     merged: dict[str, dict] = {}

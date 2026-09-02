@@ -72,7 +72,7 @@ def parse_entries(raw: str) -> list[dict]:
     # 直接解析整个响应
     try:
         return as_list(json.loads(text))
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 —— LLM 输出非 JSON 时降级走兜底解析
         pass
 
     # 抽取第一个 JSON 数组块
@@ -80,7 +80,7 @@ def parse_entries(raw: str) -> list[dict]:
     if m:
         try:
             return as_list(json.loads(m.group(0)))
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 —— 抽取失败返回空列表
             pass
     return []
 
@@ -102,7 +102,7 @@ def parse_json_object(raw: str) -> dict:
         data = json.loads(text)
         if isinstance(data, dict):
             return data
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 —— 解析失败降级走花括号配对抽取
         pass
 
     # 兜底：用花括号配对抽取第一个 JSON 对象

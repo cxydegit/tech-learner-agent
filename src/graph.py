@@ -1,44 +1,44 @@
-"""LangGraph 有状态编排（Stage 3）：/learn 会话的状态图 + 人机交互点。
+"""LangGraph 有状态编排：/learn 会话的状态图 + 人机交互点。
 
-架构定位：确定性管道（collect/read/note）是图的"叶子节点"，图负责编排——
+架构定位：确定性管道（collect/read/note/ask）是图的"叶子节点"，图负责编排——
 有状态、可中断、跨会话：
 - ``StateGraph(LearnState)``：按 ``command`` 条件路由到对应管道节点
-- note 两段式（``note_extract`` → ``note_confirm``）：提取只跑一次，合并确认的 ``interrupt()``
-  在 ``note_confirm`` 暂停图，等 CLI 用 ``Command(resume=...)`` 恢复 —— resume 只重跑确认节点，不重跑昂贵提取
-- ``SqliteSaver`` checkpointer 跨会话/跨进程持久化（替换 session.py 的 JSON 落盘）
-
-节点不再 print：进度回调传 None，输出只经 ``last_output`` 返回，由 CLI 层渲染。
-已知取舍：/learn 失去分步进度行（后续可用 ``status: Annotated[list[str], operator.add]``
-状态字段补，本阶段不做）。
-
-用法：
-    with open_graph() as graph:
-        config = {"configurable": {"thread_id": "..."}}
-        graph.stream_events({...}, config, version="v3")
 """
 
 import json
 import operator
 import threading
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Annotated, Callable, TypedDict
+from typing import Annotated, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 
 from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
 from .domain import exit_intent, survey
 from .pipelines.collect import collect_pipeline
-from .pipelines.note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
+from .pipelines.note import (
+    format_merge_candidates,
+    note_pipeline,
+    parse_merge_decision,
+    persist_points,
+)
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
-from .pipelines.route import (COACH_TOOLS_BY_MODE, CoachCtx, coach_system_prompt,
-                              consolidate_memory, run_coach_tool, run_kb_retrieve,
-                              run_memory_sweep)
+from .pipelines.route import (
+    COACH_TOOLS_BY_MODE,
+    CoachCtx,
+    coach_system_prompt,
+    consolidate_memory,
+    run_coach_tool,
+    run_kb_retrieve,
+    run_memory_sweep,
+)
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
 warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel is experimental.")
@@ -50,7 +50,7 @@ warnings.filterwarnings("ignore", message="The v3 streaming protocol on Pregel i
 _progress_registry: dict[str, Callable[[str], None]] = {}
 _progress_lock = threading.Lock()
 
-# 并行沉淀（v2）侧信道：thread_id → run_memory_sweep 结果（后台 daemon 线程写、coach_memory_write
+# 并行沉淀侧信道：thread_id → run_memory_sweep 结果（后台 daemon 线程写、coach_memory_write
 # 排水读后弹出）。用进程内内存 dict 而非文件：满足"后台线程绝不写持久化状态"的硬约束
 # （进程退出无害丢失；重启靠 memory_sweep_inflight 快照同步兜底）。单次赋值原子，锁仅作保险。
 _sweep_results: dict[str, dict] = {}
@@ -86,7 +86,7 @@ def _get_progress() -> Callable[[str], None] | None:
         if tid:
             with _progress_lock:
                 return _progress_registry.get(tid)
-    except Exception:  # noqa: BLE001 —— CLI / 非图上下文取不到即返回 None
+    except Exception:  # noqa: BLE001, S110 —— CLI / 非图上下文取不到即返回 None
         pass
     return None
 
@@ -139,7 +139,7 @@ def _conversation(state: "LearnState", assistant_content: str, node_type: str,
     前端按列表顺序渲染即可。doc 为 collect/read 产出的文档相对路径（Web「阅读全文」chip 用）；
     sources 为 qa 的来源笔记（Web「查看来源笔记」卡片用）。
     """
-    now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")  # noqa: DTZ005 —— 本地 naive 语义，与会话列表/前端格式一致
     assistant: dict = {"role": "assistant", "type": node_type, "content": assistant_content, "ts": now}
     if doc:
         assistant["doc"] = doc
@@ -181,19 +181,19 @@ class LearnState(TypedDict):
     # 会话标题：首次 collect 时固化为技术名，之后不再随动作改变（Web 会话列表用）
     title: str
     # Web 对话流：{role: user|assistant, type, content, ts} 累加记录，跨命令持久化。
-    # Web 按轮渲染「用户输入 + AI 回复」，历史会话重载直接读它（§4-①）。
+    # Web 按轮渲染「用户输入 + AI 回复」，历史会话重载直接读它。
     # CLI 不读此字段，纯增量不破坏现有渲染。
     conversation: Annotated[list[dict], operator.add]
 
     # ---- 定制化学习路线（模块 2）：coach agent 循环 ----
-    # 模式状态机：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练，Step 4 接工具）。
+    # 模式状态机：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练）。
     # 切换由确定性代码判定（_route_after_survey / confirm_roadmap 工具），模型只负责对话 + 选工具。
     mode: str
     # 模型上下文消息（openai 兼容 dict 列表，有界、覆盖写）：与 conversation（展示用）分离——
     # conversation 无界保留完整对话供前端渲染，coach_messages 只留最近几轮 + 摘要。
     coach_messages: list
     coach_summary: str  # 脉络舱：近期学习焦点摘要（允许衰减，真相在 roadmap/知识库，有字符上限）
-    # 记忆系统 Step 4：三舱记忆——事实舱（画像补充/偏好/纠正/决定，追加式，永不被 LLM 重写）
+    # 三舱记忆——事实舱（画像补充/偏好/纠正/决定，追加式，永不被 LLM 重写）
     # 与未决舱（[{id, text}]，LLM 判定 resolved 编号、代码按 id 确定性淘汰）。checkpointer 持久化。
     coach_facts: list
     coach_open_items: list
@@ -216,13 +216,13 @@ class LearnState(TypedDict):
     # 里程碑验收拒绝节流：本回合 update_roadmap 已被验收拒绝的次数（≥2 后不再受理，
     # 防重试循环烧光工具预算；coach_human 每用户回合清零）
     coach_verify_rejects: int
-    # 记忆系统 Step 1：自上次沉淀以来的对话消息对 [{role, content}]（coach_human 填充，
+    # 自上次沉淀以来的对话消息对 [{role, content}]（coach_human 填充，
     # coach_memory_write 达阈值触发 note 沉淀后清空；checkpointer 持久化，中断恢复不丢）
     memory_sweep_buffer: list
-    # 并行沉淀（v2）在途请求：{tech, buffer(触发时快照), fired_at} —— fire 时写入、排水后清空。
+    # 并行沉淀在途请求：{tech, buffer(触发时快照), fired_at} —— fire 时写入、排水后清空。
     # 存 buffer 快照是为了后台线程失败 / 进程重启时能同步兜底重跑（不丢沉淀内容）。
     memory_sweep_inflight: dict | None
-    # 记忆系统 Step 2：确定性读路由——当前用户回合命中知识库的相关片段 [{path, snippet}]
+    # 确定性读路由——当前用户回合命中知识库的相关片段 [{path, snippet}]
     # （coach_kb_retrieve 每用户回合覆盖；coaching 提示词注入作答上下文）
     kb_context: list | None
 
@@ -328,12 +328,12 @@ def note_confirm_node(state: LearnState) -> dict:
         f"新增 {persisted['new_count']} 篇，合并更新 {persisted['merged_count']} 篇"
         if persisted["results"] else "未沉淀任何知识点"
     )
-    # P3.1：索引失败不阻断沉淀，但要在产出里可见（8-19 事故：静默失败留缺口 6 天）
+    # 索引失败不阻断沉淀，但要在产出里可见（此前静默失败会留索引缺口）
     index_failed = [r["topic"] for r in persisted["results"] if r.get("index_ok") is False]
     if index_failed:
         summary += (f"\n⚠️ RAG 索引更新失败：{'、'.join(index_failed)}"
                     f"（笔记已保存，下次运行 index 自动补齐）")
-    # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给用户复核
+    # 合并时发现的矛盾以新内容为准修正，报告透出给用户复核
     conflict_reports = persisted.get("conflict_reports") or []
     if conflict_reports:
         summary += "\n" + "\n".join(f"⚠️ 合并发现矛盾：{c['report']}" for c in conflict_reports)
@@ -520,7 +520,7 @@ def coach_human(state: LearnState) -> dict:
         "doc_type": (doc.get("type") or "read") if doc else None,
     })
     reply = (reply or "").strip()
-    now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now().isoformat(timespec="seconds")  # noqa: DTZ005 —— 本地 naive 语义，与会话列表/前端格式一致
     updates: dict = {
         "coach_messages": [*msgs, {"role": "user", "content": reply}],
         "coach_turn_tool_count": 0,
@@ -542,7 +542,7 @@ def coach_human(state: LearnState) -> dict:
         assistant_rec,
         {"role": "user", "type": "chat", "content": reply, "ts": now},
     ]
-    # 记忆系统 Step 1：仅 coaching 模式且非待确认笔记流时，把本回合（assistant 讲解 + 用户回复）
+    # 仅 coaching 模式且非待确认笔记流时，把本回合（assistant 讲解 + 用户回复）
     # 压入沉淀缓冲（coach_memory_write 达阈值触发 note 沉淀后清空）
     if state.get("mode") == "coaching" and not state.get("coach_note_pending"):
         buf = list(state.get("memory_sweep_buffer") or [])
@@ -609,7 +609,7 @@ def _sweep_fired_stale(inflight: dict) -> bool:
         fired = datetime.fromisoformat(fired_at)
     except Exception:  # noqa: BLE001 —— 非法时间戳按超时处理
         return True
-    return (datetime.now() - fired).total_seconds() > config.ROUTE_MEMORY_SWEEP_TIMEOUT
+    return (datetime.now() - fired).total_seconds() > config.ROUTE_MEMORY_SWEEP_TIMEOUT  # noqa: DTZ005 —— fired_at 为本地 naive 时间戳
 
 
 def _threshold_met(buffer: list[dict]) -> bool:
@@ -653,7 +653,7 @@ def _start_sweep_thread(tech: str, buffer: list[dict], tid: str) -> None:
 
 
 def coach_memory_write(state: LearnState) -> dict:
-    """确定性写触发（记忆系统 Step 1）：coach 对话积累超阈值 → 自动沉淀学习内容进知识库。
+    """确定性写触发：coach 对话积累超阈值 → 自动沉淀学习内容进知识库。
 
     仅 coaching 模式生效；agent 的 note 工具流进行中（coach_note_pending 非空）时跳过。
     单节点双阶段：
@@ -663,8 +663,8 @@ def coach_memory_write(state: LearnState) -> dict:
       skip → 只清在途。
       后台线程仍在跑（未超时）→ 本回合不阻塞、不重复 fire；
       超时 / 线程失败 / 进程重启 → **把快照并回 buffer**（不重跑不阻塞），交给未来正常 fire 重扫。
-    - **fire**：无在途请求且 buffer 达阈值 → 快照 buffer 交给后台线程（ASYNC=true 并行），
-      或同步执行（ASYNC=false，v1 逃生舱）。
+    - **fire**：无在途请求且 buffer 达阈值 → 快照 buffer 交给后台线程（并行），
+      或同步执行（同步逃生舱）。
 
     本节点只做编排，管道逻辑在 pipelines.route.run_memory_sweep。
     """
@@ -692,7 +692,7 @@ def coach_memory_write(state: LearnState) -> dict:
             updates["coach_note_pending"] = result["pending"]  # 图路由到 coach_candidate_confirm 确定性确认
         return updates  # 排水后本回合不再 fire（buffer 下回合再判）
 
-    # 阶段 2 · fire：达阈值 → 并行（后台线程）或同步（v1 逃生舱）
+    # 阶段 2 · fire：达阈值 → 并行（后台线程）或同步（同步逃生舱）
     buffer = state.get("memory_sweep_buffer") or []
     if not buffer or state.get("coach_note_pending"):
         return {}
@@ -702,7 +702,7 @@ def coach_memory_write(state: LearnState) -> dict:
         snapshot = list(buffer)
         updates: dict = {
             "memory_sweep_inflight": {"tech": tech, "buffer": snapshot,
-                                      "fired_at": datetime.now().isoformat(timespec="seconds")},
+                                      "fired_at": datetime.now().isoformat(timespec="seconds")},  # noqa: DTZ005 —— 本地 naive 语义
             "memory_sweep_buffer": [],
         }
         _start_sweep_thread(tech, snapshot, tid)
@@ -714,7 +714,7 @@ def coach_memory_write(state: LearnState) -> dict:
 
 
 def coach_candidate_confirm(state: LearnState) -> dict:
-    """确定性候选确认（记忆系统 Step 1 v2）：sweep 产出的相似候选直接 interrupt 用户确认，
+    """确定性候选确认：sweep 产出的相似候选直接 interrupt 用户确认，
     不经过 agent。用户回复后确定性解析（all / 编号 / skip）落库，清空 pending。
     复用现有 format_merge_candidates / parse_merge_decision / persist_points。
     """
@@ -743,7 +743,7 @@ def _route_after_memory_write(state: LearnState) -> str:
 
 
 def coach_kb_retrieve(state: LearnState) -> dict:
-    """确定性读路由（记忆系统 Step 2）：coach 用户每回合提问先查库，命中注入 kb_context。
+    """确定性读路由：coach 用户每回合提问先查库，命中注入 kb_context。
 
     仅 coaching 模式生效；取最后一条用户消息过两级闸门（廉价元问题闸门 + 质量相似度闸门），
     命中片段写入 kb_context（coaching 提示词注入作答上下文），无命中 / 低于阈值 → 清空。
@@ -903,10 +903,10 @@ def build_graph(checkpointer):
         END: END,
     })
     builder.add_edge("coach_guard", "coach_human")
-    # 记忆系统 Step 1+2：用户回复后先走确定性写触发（coach_memory_write），
+    # 用户回复后先走确定性写触发（coach_memory_write），
     # 再走确定性读路由（coach_kb_retrieve，提问先查库、命中注入 kb_context），最后进 trim→llm
     builder.add_edge("coach_survey", "coach_memory_write")
-    # 记忆系统 Step 1 v2：sweep 候选待确认 → 确定性确认节点（不经过 agent）；否则正常读路由
+    # sweep 候选待确认 → 确定性确认节点（不经过 agent）；否则正常读路由
     builder.add_conditional_edges("coach_memory_write", _route_after_memory_write, {
         "coach_candidate_confirm": "coach_candidate_confirm",
         "coach_kb_retrieve": "coach_kb_retrieve",

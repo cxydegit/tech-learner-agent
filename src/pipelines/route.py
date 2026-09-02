@@ -1,25 +1,27 @@
-"""coach agent 循环的提示词 + 工具实现（模块 2 定制化学习路线）。
+"""coach agent 循环的提示词 + 工具实现（定制化学习路线）。
 
 定位：pipelines 层，prompts 就近存放；graph.py 的 coach 节点组负责循环编排，
 本模块只提供"单次往返"需要的东西——按 mode 的系统提示词、各模式可用工具
 schema、工具执行（大内容写文件、出入参短，工具可经 ctx.updates 请求状态变更）。
 
-Step 1-3 范围：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练，
-完整工具在后续阶段接入；现为对话 stub）。
+三阶段范围：survey（问卷）→ planning（路线生成/确认）→ coaching（执行陪练）。
 """
 
-import json
 import re
 
-from ..config import config
 from ..adapters import learner
 from ..adapters.llm import generate_text
-from ..domain import exit_intent
+from ..config import config
+from ..domain import exit_intent, survey
 from ..domain import roadmap as roadmap_domain
-from ..domain import survey
 from ..domain.extraction import parse_json_object
 from .collect import collect_pipeline
-from .note import format_merge_candidates, note_pipeline, parse_merge_decision, persist_points
+from .note import (
+    format_merge_candidates,
+    note_pipeline,
+    parse_merge_decision,
+    persist_points,
+)
 from .qa import _search_notes, qa_pipeline
 from .read import read_pipeline
 
@@ -99,7 +101,7 @@ def _coaching_prompt(state, tech: str) -> str:
     prog = ""
     if roadmap:
         prog = "\n\n当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap)
-    # 记忆系统 Step 4：画像直注（修复 coaching 模式不注入画像的缺口，画像与摘要解耦）+ 三舱注入
+    # 画像直注（画像与摘要解耦，避免 coaching 模式丢失画像上下文）+ 三舱注入
     profile = state.get("learner_profile") or {}
     profile_block = f"用户画像：{survey.profile_summary(profile)}\n" if profile else ""
     facts = state.get("coach_facts") or []
@@ -113,7 +115,7 @@ def _coaching_prompt(state, tech: str) -> str:
                       + "\n".join(f"- [{it['id']}] {it['text']}" for it in open_items) + "\n")
     conv = (state.get("coach_summary") or "").strip()
     conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
-    # 记忆系统 Step 2：确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
+    # 确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
     kb = state.get("kb_context") or []
     kb_block = ""
     if kb:
@@ -333,7 +335,7 @@ REVISE_ROADMAP_SCHEMA = {
 COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
     "survey": [],
     "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA, GET_ROADMAP_SCHEMA],
-    # coaching 不再暴露 note/note_commit：学习内容由自动沉淀（记忆系统 Step 1 v2，后台线程）
+    # coaching 不再暴露 note/note_commit：学习内容由自动沉淀（后台线程）
     # 确定性落库 + 候选确定性确认，agent 手动 note 会同步阻塞对话（note_pipeline 耗时长）
     "coaching": [COLLECT_SCHEMA, READ_SCHEMA, ASK_SCHEMA,
                  GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA, REVISE_ROADMAP_SCHEMA],
@@ -404,7 +406,7 @@ def _generate_roadmap(args: dict, ctx: CoachCtx) -> dict:
         entry["roadmap_path"] = str(jp)
         try:
             learner.save_tech_profile(ctx.tech, entry)
-        except Exception:  # noqa: BLE001 —— 画像落盘失败不阻断路线生成
+        except Exception:  # noqa: BLE001, S110 —— 画像落盘失败不阻断路线生成
             pass
     return {
         "status": "ok",
@@ -512,10 +514,10 @@ def _note(args: dict, ctx: CoachCtx) -> dict:
 
 
 def _index_warning(persisted: dict) -> str:
-    """索引失败提示（P3.1）：沉淀结果里有 index_ok=False 时生成给 agent 转述的警告。
+    """索引失败提示：沉淀结果里有 index_ok=False 时生成给 agent 转述的警告。
 
-    索引失败不阻断沉淀（笔记已在磁盘），但必须可见——8-19 事故的教训：静默失败
-    让 4 篇笔记「保存成功但检索不到」，缺口留存 6 天。
+    索引失败不阻断沉淀（笔记已在磁盘），但必须可见——静默失败会让笔记
+    「保存成功但检索不到」。
     """
     failed = [r["topic"] for r in persisted.get("results", []) if r.get("index_ok") is False]
     if not failed:
@@ -532,7 +534,7 @@ def _note_commit(args: dict, ctx: CoachCtx) -> dict:
     indices = parse_merge_decision(decision, len(pending["merge_candidates"]))
     persisted = persist_points(tech, pending["new_points"], pending["merge_candidates"], indices)
     ctx.updates["coach_note_pending"] = None  # 提交后清掉，避免重复提交
-    # 记忆系统 Step 3：合并时发现的矛盾以新内容为准修正，报告透出给 agent 转述用户
+    # 合并时发现的矛盾以新内容为准修正，报告透出给 agent 转述用户
     conflict_reports = persisted.get("conflict_reports") or []
     out = {"status": "ok", "new_count": persisted["new_count"], "merged_count": persisted["merged_count"],
            "conflict_reports": conflict_reports,
@@ -545,7 +547,7 @@ def _note_commit(args: dict, ctx: CoachCtx) -> dict:
 
 
 # ============================================================
-# 记忆系统 Step 1：确定性写触发（学习内容自动沉淀）
+# 确定性写触发（学习内容自动沉淀）
 # 纯函数：对话缓冲 → note_pipeline → 返回决策，落库/暂存由 graph 节点编排。
 # ============================================================
 
@@ -607,7 +609,7 @@ def run_memory_sweep(tech: str, buffer: list[dict], progress=None) -> dict:
 
 
 # ============================================================
-# 记忆系统 Step 2：确定性读路由（提问先查库）
+# 确定性读路由（提问先查库）
 # 纯函数：元问题廉价闸门 + 知识库检索 + 相似度阈值过滤 → 命中片段列表，注入 coaching 提示词。
 # ============================================================
 
@@ -641,7 +643,7 @@ def _is_meta_question(text: str) -> bool:
 def _hit_relevance(h: dict) -> float | None:
     """命中的「可标定相关度」：可用于绝对阈值比较的分数。
 
-    P1 起 hybrid 的 ``similarity`` 是归一化相对分（top 恒 1.0，见 rrf_fuse），
+    hybrid 的 ``similarity`` 是归一化相对分（top 恒 1.0，见 rrf_fuse），
     与 ROUTE_KB_INJECT_SIM 这类绝对阈值**不可比**；``dense_similarity`` 才是融合时
     保留的原始余弦。优先级：
     - hybrid 且进过 dense 榜单：dense_similarity（真实余弦）
@@ -894,9 +896,8 @@ def run_coach_tool(name: str, args: dict, ctx: CoachCtx) -> dict:
 
 
 # ============================================================
-# 记忆系统 Step 4：三舱记忆整理（事实/未决/脉络）
+# 三舱记忆整理（事实/未决/脉络）
 # 核心原则：LLM 只看新消息产增量；已积累的记忆永不再过 LLM 的手（衰减结构性归零）。
-# 提示词已提交用户审核并确认。
 # ============================================================
 
 CONSOLIDATE_MEMORY_PROMPT = """你是学习会话的记忆整理助手。我会给你：现有「稳定事实」列表、现有「未决事项」列表（带编号）、以及一批刚发生的对话。请为长期记忆做一次增量整理。

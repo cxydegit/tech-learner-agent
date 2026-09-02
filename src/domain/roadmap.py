@@ -35,7 +35,7 @@ _STAGE_REQUIRED = ("name", "goal", "est_hours", "milestones")
 
 
 def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def _deepcopy(data):
@@ -288,8 +288,8 @@ def roadmap_to_markdown(roadmap: dict) -> str:
         f"# {tech} 学习路线",
         "",
         f"> 目标：{roadmap.get('goal') or ''}",
-        f"> 预估总时长：{roadmap.get('total_hours') or 0} 小时 ｜ "
-        f"状态：{'✅ 已完成' if roadmap.get('status') == 'completed' else '进行中'}",
+        (f"> 预估总时长：{roadmap.get('total_hours') or 0} 小时 ｜ "
+        f"状态：{'✅ 已完成' if roadmap.get('status') == 'completed' else '进行中'}"),
         f"> 当前阶段：{_stage_name(roadmap, roadmap.get('current_stage'))}",
         "",
         "## 阶段总览",

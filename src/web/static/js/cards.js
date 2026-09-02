@@ -2,7 +2,7 @@
    场景卡片：配置 + 表单构建 + 校验（与 domain/card_input.py 契约一致）
    - collect → {command, tech, focus?}
    - read / ask → {command, args: [...]}（卡片命令名 ask → 图命令 qa）
-   - "定制路线" disabled（Step 6）
+   - route → {command, tech}
    ============================================================ */
 
 import { escapeHtml } from "./markdown.js";

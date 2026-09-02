@@ -51,13 +51,13 @@ class Config:
     # 分块硬上限（字符）：超出它的表格 / 代码块不再整块原子保留，按逻辑结构二次切分
     # （表格按行重复表头 / 代码按空行分组），防超大块超出 embedding 输入上限。仅拦截病态块。
     RAG_CHUNK_HARD_CAP: int = int(os.getenv("RAG_CHUNK_HARD_CAP", "8192"))
-    # P3 索引对账（孤儿分块清理）：磁盘文件删除 / 改名后自动清理 Chroma 残留分块。
+    # 索引对账（孤儿分块清理）：磁盘文件删除 / 改名后自动清理 Chroma 残留分块。
     # index_paths 末尾与 /ask 惰性入口都受此开关控制。
     RAG_RECONCILE: bool = os.getenv("RAG_RECONCILE", "true").lower() == "true"
     # /ask 惰性对账节流间隔（秒）：只在此间隔内的首次 /ask 做一次元数据对账（毫秒级），
     # 避免每次提问都扫全库；index_paths 末尾的对账不走节流（写入路径自愈）。
     RAG_RECONCILE_INTERVAL: int = int(os.getenv("RAG_RECONCILE_INTERVAL", "300"))
-    # /ask 路径单次对账补缺失的文件数上限（P3.1）：提问时补缺失会触发 embedding 调用，
+    # /ask 路径单次对账补缺失的文件数上限：提问时补缺失会触发 embedding 调用，
     # 限量避免拖延迟；写路径（index_paths / 写笔记）不限，缺口随下次写入全量补齐。
     RAG_RECONCILE_BACKFILL_MAX: int = int(os.getenv("RAG_RECONCILE_BACKFILL_MAX", "3"))
 
@@ -77,7 +77,7 @@ class Config:
     COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "10"))
     #消息数 超过 40 条 才触发压缩
     COACH_COMPRESS_AT: int = int(os.getenv("COACH_COMPRESS_AT", "40"))
-    # 记忆系统 Step 4：三舱记忆整理——LLM 只看新消息产增量，确定性代码管积累（防重写衰减）。
+    # 记忆系统：三舱记忆整理——LLM 只看新消息产增量，确定性代码管积累（防重写衰减）。
     # 事实/未决舱永不被 LLM 重写，只有机械上限；脉络舱允许衰减（外部真相兜底）+字符上限。
     COACH_FACTS_MAX: int = int(os.getenv("COACH_FACTS_MAX", "20"))  # 事实舱上限（超限丢最旧）
     COACH_OPEN_MAX: int = int(os.getenv("COACH_OPEN_MAX", "8"))  # 未决舱上限（超限丢最旧）
@@ -85,17 +85,17 @@ class Config:
 
     # 工具调用通道失败时的回退开关：true → 去掉 tools 定义用纯文本再问一次（降级可用性）
     ROUTE_FALLBACK_TO_TEXT: bool = os.getenv("ROUTE_FALLBACK_TO_TEXT", "true").lower() == "true"
-    # 记忆系统 Step 1：coach 对话确定性写触发——自上次沉淀以来累计用户回合数 / 字符数
+    # 记忆系统：coach 对话确定性写触发——自上次沉淀以来累计用户回合数 / 字符数
     # 任一达到即把这段对话自动喂给 note 管道沉淀。
     ROUTE_MEMORY_SWEEP_TURNS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_TURNS", "6"))
     ROUTE_MEMORY_SWEEP_CHARS: int = int(os.getenv("ROUTE_MEMORY_SWEEP_CHARS", "2500"))
-    # 并行沉淀（v2）：true → 后台 daemon 线程跑纯管道（只读+LLM），结果经进程内内存侧信道，
-    # 下一用户回合排水落库，沉淀耗时不再阻塞对话；false → 退回 v1 同步路径（逃生舱）。
+    # 并行沉淀：true → 后台 daemon 线程跑纯管道（只读+LLM），结果经进程内内存侧信道，
+    # 下一用户回合排水落库，沉淀耗时不再阻塞对话；false → 退回同步路径（逃生舱）。
     ROUTE_MEMORY_SWEEP_ASYNC: bool = os.getenv("ROUTE_MEMORY_SWEEP_ASYNC", "true").lower() == "true"
     # 后台沉淀线程超时（秒）：note 提取可能耗时几十秒，阈值取远高于正常耗时；
     # 超过仍未出结果（线程死/进程重启）→ 把 inflight 快照并回 buffer，交给未来正常 fire 重扫
     ROUTE_MEMORY_SWEEP_TIMEOUT: float = float(os.getenv("ROUTE_MEMORY_SWEEP_TIMEOUT", "300"))
-    # 记忆系统 Step 2：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
+    # 记忆系统：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
     # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
     # 注入阈值（可标定余弦，见 route.py::_hit_relevance）：hybrid 的归一化 similarity（top 恒 1.0）
     # 不能当绝对门槛，run_kb_retrieve 用 dense 原始余弦过闸。标定依据 scripts/calibrate_inject_threshold.py：
@@ -113,21 +113,21 @@ class Config:
     LEARNER_DIR: Path = BASE_DIR / "learner"
     ROADMAP_DIR: Path = BASE_DIR / "roadmaps"
 
-    # Note 模块（Step 3 差量提取）：召回已有笔记作上下文的预算参数
+    # Note 模块（差量提取）：召回已有笔记作上下文的预算参数
     NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "3"))  # 召回该 tech 已有笔记 top-k 作差量上下文
     NOTE_CONTEXT_LIMIT: int = int(os.getenv("NOTE_CONTEXT_LIMIT", "500"))  # 每条已有笔记在提取提示词里的截断字数
 
-    # QA 模块（Step 4 联想检索）：检索与提示词预算参数
+    # QA 模块（联想检索）：检索与提示词预算参数
     QA_TOP_K: int = int(os.getenv("QA_TOP_K", "8"))  # 召回笔记片段条数
     QA_MAX_GROUPS: int = int(os.getenv("QA_MAX_GROUPS", "5"))  # 最多按来源笔记分组数
     QA_SNIPPETS_PER_NOTE: int = int(os.getenv("QA_SNIPPETS_PER_NOTE", "3"))  # 每组最多片段数
     QA_SNIPPET_CHARS: int = int(os.getenv("QA_SNIPPET_CHARS", "500"))  # 每条片段截断字数
     QA_HISTORY_ROUNDS: int = int(os.getenv("QA_HISTORY_ROUNDS", "3"))  # 多轮上下文取最近 N 轮
 
-    # P1 混合检索（BM25 + RRF）：/ask 召回改走 hybrid_search_knowledge，可关回纯 dense
+    # 混合检索（BM25 + RRF）：/ask 召回改走 hybrid_search_knowledge，可关回纯 dense
     QA_USE_HYBRID: bool = os.getenv("QA_USE_HYBRID", "true").lower() == "true"
     QA_RRF_K: int = int(os.getenv("QA_RRF_K", "60"))  # RRF 融合常数（名次倒数分母）
-    # P1.1 词法一致性软重排：RRF 融合后按「查询词在块中的覆盖率（mini-idf 加权）」加分。
+    # 词法一致性软重排：RRF 融合后按「查询词在块中的覆盖率（mini-idf 加权）」加分。
     # 仅当 BM25 正命中 ≤ QA_RERANK_MIN_HITS 篇笔记（罕见词型查询，dense 对专有名词
     # 零词法重合噪声的失败场景）时启用；概念查询 BM25 命中散落，不重排避免误伤语义排序
     # （实测分界：命中≤3 篇只改进/持平，≥4 篇会回退）。只加分不减分；w=0 等价纯 RRF。
@@ -135,7 +135,7 @@ class Config:
     QA_RERANK_LEXICAL_W: float = float(os.getenv("QA_RERANK_LEXICAL_W", "0.5"))
     QA_RERANK_MIN_HITS: int = int(os.getenv("QA_RERANK_MIN_HITS", "3"))
 
-    # Step 5 Part B 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
+    # 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
     QUALITY_DOMAIN_BONUS_OFFICIAL: int = int(os.getenv("QUALITY_DOMAIN_BONUS_OFFICIAL", "20"))
     QUALITY_DOMAIN_BONUS_PLATFORM: int = int(os.getenv("QUALITY_DOMAIN_BONUS_PLATFORM", "10"))
     QUALITY_URL_BONUS_OFFICIAL_DOCS: int = int(os.getenv("QUALITY_URL_BONUS_OFFICIAL_DOCS", "10"))
@@ -161,11 +161,11 @@ class Config:
 
     # 抓取内容长度限制（字符数）
     MAX_FETCH_CHARS: int = int(os.getenv("MAX_FETCH_CHARS", "16000"))
-    # 抓取并发与超时（Stage 4 benchmark 发现：5 次顺序抓取是 collect 耗时主因，改并发 + 超时）
+    # 抓取并发与超时（实测：5 次顺序抓取是 collect 耗时主因，改并发 + 超时）
     FETCH_MAX_WORKERS: int = int(os.getenv("FETCH_MAX_WORKERS", "5"))  # 并发抓取线程数上限
     FETCH_TIMEOUT_SECONDS: float = float(os.getenv("FETCH_TIMEOUT_SECONDS", "45"))  # 单次抓取超时上限（秒）
 
-    # Web 服务（WEB_PLAN.md §4-⑥）：默认只绑 127.0.0.1（个人工具不进局域网、不暴露公网）
+    # Web 服务：默认只绑 127.0.0.1（个人工具不进局域网、不暴露公网）
     WEB_HOST: str = os.getenv("WEB_HOST", "127.0.0.1")
     WEB_PORT: int = int(os.getenv("WEB_PORT", "8000"))
 

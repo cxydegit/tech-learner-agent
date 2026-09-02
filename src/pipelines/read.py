@@ -5,15 +5,14 @@ CLASSIFY_DOC_PROMPT / READ_SYSTEM_PROMPT。纯数据进出，不打印、不写�
 不做"缓存复用"交互（复用决策属调用方职责）。
 """
 
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
 
 from ..adapters.fetch import fetch_tool
 from ..adapters.llm import current_time_label, generate_text, replace_time_line
 from ..adapters.store import index_file_lazy, save_file_tool
 from ..domain.dedup import sanitize_filename
 from ..domain.extraction import parse_classify
-
 
 # ============================================================
 # 提示词
@@ -181,7 +180,7 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
 
     # 3. 保存报告 + 写后单文件立即索引（read 缓存命中即时生效；失败不阻断，对账兜底）
     title = fetched.get("title") or "文档"
-    filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().strftime('%Y%m%d')}-解读.md"
+    filename = f"{sanitize_filename(title) or 'report'}-{datetime.now().astimezone().strftime('%Y%m%d')}-解读.md"
     save_result = save_file_tool(f"reports/{filename}", report)
     index_status = index_file_lazy(save_result["path"])
 

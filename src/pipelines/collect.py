@@ -5,8 +5,8 @@
 """
 
 from collections import Counter
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
 
 from ..adapters.fetch import fetch_many
 from ..adapters.github import fetch_star_count
@@ -16,11 +16,10 @@ from ..adapters.store import save_file_tool
 from ..config import config
 from ..domain.quality import screen_results
 
-
 # ============================================================
 # 合成报告提示词
 #
-# 两套提示词按 focus 切换（Step 5 A2）：
+# 两套提示词按 focus 切换：
 # - 无 focus：固定模板（结构化学习资料清单，用户没提侧重点，给默认铺路）
 # - 有 focus：非固定模板（只保「核心资料」表硬骨架，其余围绕用户关注点自由输出）
 # focus 本身作为「用户提示词」放进 user_content，这里只做结构性切换。
@@ -96,7 +95,7 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
     """确定性管道核心：搜索去重 → 抓取 → LLM 合成 → 保存。
 
     与 run_collect 的区别：只返回数据（urls / report / materials_path），
-    不打印、不写会话 —— 供 LangGraph 节点复用（Stage 3）。
+    不打印、不写会话 —— 供 LangGraph 节点复用。
 
     Args:
         tech_name: 技术名称
@@ -200,11 +199,11 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
 def materials_filename(tech_name: str) -> str:
     """collect 报告文件名：``materials/{tech}-materials-{MMDD-HHMM}.md``。
 
-    时间版本号让同一技术的多次询问各留一份，避免互相覆盖（Step 5 验收发现：
-    无 focus 与有 focus 的两次 collect 此前都写 `{tech}-materials.md`，后者覆盖前者）。
+    时间版本号让同一技术的多次询问各留一份，避免互相覆盖（无 focus 与有 focus
+    的两次 collect 若都写 `{tech}-materials.md`，后者会覆盖前者）。
     """
     safe = tech_name.lower().replace(" ", "-")
-    stamp = datetime.now().strftime("%m%d-%H%M")
+    stamp = datetime.now().astimezone().strftime("%m%d-%H%M")
     return f"materials/{safe}-materials-{stamp}.md"
 
 

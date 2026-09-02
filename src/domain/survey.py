@@ -153,9 +153,7 @@ def is_survey_complete(answers: dict) -> bool:
 def derive_profile(answers: dict, tech: str) -> dict:
     """根据问卷答案推导用户画像（含小白/开发者分档，供 coach 提示词差异化）。"""
     level = answers.get("self_level")
-    if level is None:
-        bucket = "beginner"
-    elif level <= 3:
+    if level is None or level <= 3:
         bucket = "beginner"
     elif level <= 6:
         bucket = "intermediate"

@@ -69,7 +69,7 @@ def collect(tech_name: str, focus: tuple = ()):
 
 @cli.command()
 @click.argument("url", required=False)
-def read(url: str = None):
+def read(url: str | None = None):
     """解读指定的技术文档。
 
     URL: 文档页面链接
@@ -79,7 +79,7 @@ def read(url: str = None):
         console.print(f"[yellow]{parsed['error']}[/yellow]")
         return
     url = parsed["args"][0]
-    console.print(Panel(f"📖 开始解读文档...", style="bold blue"))
+    console.print(Panel("📖 开始解读文档...", style="bold blue"))
     console.print(f"[dim]{url}[/dim]")
 
     # RAG 历史召回：该 URL 已有解读则提示复用（失败静默，不影响抓取）
@@ -102,7 +102,7 @@ def read(url: str = None):
 @click.argument("tech")
 @click.option("--file", "-f", "file_path", help="从本地文件读取学习内容")
 @click.option("--text", "-t", "content", help="直接提供学习内容文本")
-def note(tech: str, file_path: str = None, content: str = None):
+def note(tech: str, file_path: str | None = None, content: str | None = None):
     """将学习内容整理为结构化笔记（差量提取，重复内容不沉淀）。
 
     TECH: 技术名称
@@ -254,7 +254,7 @@ def _list_route_threads() -> None:
 @click.argument("tech_name", required=False)
 @click.option("--list", "list_threads", is_flag=True, help="列出所有定制路线会话（找回用）")
 @click.option("--resume", "resume_thread", default=None, help="恢复指定会话线程（thread_id 见 --list）")
-def route(tech_name: str = None, list_threads: bool = False, resume_thread: str = None):
+def route(tech_name: str | None = None, list_threads: bool = False, resume_thread: str | None = None):
     """定制学习路线：问卷 → 学习路线 → 执行陪练（coach agent 循环）。
 
     TECH_NAME: 要学习的技术名（含空格需加引号）；不传则交互式询问。
@@ -300,7 +300,7 @@ def route(tech_name: str = None, list_threads: bool = False, resume_thread: str 
                 return  # 回车/其他 → 退出
 
     if thread_id is None:
-        thread_id = f"route-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        thread_id = f"route-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}"
         console.print(Panel(f"🧭 开始定制「{parsed['tech']}」的学习路线（问卷 → 路线 → 陪练）", style="bold blue"))
     else:
         console.print(Panel(f"🧭 继续「{parsed['tech']}」的定制路线（会话 {thread_id}）", style="bold blue"))
@@ -502,7 +502,7 @@ def _maybe_guide_collect(graph, gconfig, final) -> None:
 
 @cli.command()
 @click.argument("session_id", required=False)
-def learn(session_id: str = None):
+def learn(session_id: str | None = None):
     """进入交互式学习会话（/learn REPL，LangGraph 图驱动）。
 
     SESSION_ID: 可选，恢复指定会话（对应 checkpointer 的 thread_id）；不传则新建
@@ -514,7 +514,7 @@ def learn(session_id: str = None):
         thread_id = session_id
         console.print(f"[green]已恢复会话:[/green] {session_id}")
     else:
-        thread_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        thread_id = f"learn-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}"
         console.print(f"[green]已创建新会话:[/green] {thread_id}")
 
     console.print("[dim]进入学习会话（LangGraph 图驱动）。输入命令开始，/help 查看帮助，/quit 退出。[/dim]")

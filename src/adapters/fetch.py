@@ -1,6 +1,6 @@
 """抓取基础设施：Firecrawl 网页转 Markdown。
 
-自 tools.py 迁出：fetch_tool；Stage 4 benchmark 后新增 fetch_many（并发抓取，按输入顺序归并）。
+自 tools.py 迁出：fetch_tool；后新增 fetch_many（并发抓取，按输入顺序归并）。
 """
 
 import time
@@ -61,7 +61,7 @@ def fetch_many(urls: list[str], max_workers: int | None = None,
                timeout: float | None = None) -> list[dict]:
     """并发抓取多个 URL，按输入顺序返回结果；单个失败/超时记空结果，不拖垮整批。
 
-    Firecrawl 延迟是网络瓶颈，串行抓取是 collect 耗时的主因（Stage 4 benchmark 实测
+    Firecrawl 延迟是网络瓶颈，串行抓取是 collect 耗时的主因（实测
     5 页串行占 collect 总耗时约 80%）。这里用线程池并行，结果按输入顺序归并，保持
     输出确定性；墙钟时间用共享 deadline 封顶，避免「N 个全超时」叠加成 N 倍耗时。
 
@@ -85,7 +85,7 @@ def fetch_many(urls: list[str], max_workers: int | None = None,
     def _one(u: str) -> dict:
         try:
             return fetch_tool(u, timeout=config.FETCH_TIMEOUT_SECONDS)
-        except Exception as e:  # fetch_tool 通常不抛；兜底防意外
+        except Exception as e:  # noqa: BLE001 —— fetch_tool 通常不抛；兜底防意外
             return {"url": u, "markdown": "", "title": "", "error": str(e)}
 
     def _empty(u: str, reason: str) -> dict:
@@ -100,7 +100,7 @@ def fetch_many(urls: list[str], max_workers: int | None = None,
             if fut.done():
                 try:
                     results.append(fut.result())
-                except Exception:
+                except Exception:  # noqa: BLE001 —— 兜底：单条失败不影响整体
                     results.append(_empty(urls[idx], "error"))
                 continue
             remaining = deadline - time.monotonic()
@@ -109,7 +109,7 @@ def fetch_many(urls: list[str], max_workers: int | None = None,
                 continue
             try:
                 results.append(fut.result(timeout=remaining))
-            except Exception:
+            except Exception:  # noqa: BLE001 —— 超时/异常 → 按超时条目兜底
                 results.append(_empty(urls[idx], "timeout"))
     finally:
         pool.shutdown(wait=False)  # 不等超时线程，墙钟被封顶

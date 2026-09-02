@@ -1,7 +1,7 @@
 """LLM 基础设施：一次性非循环生成 + 系统时间标签注入（确定性兜底）。
 
 自 agent.py 迁出：generate_text（原 _generate_text）。另含 collect/read
-管道共用的 current_time_label / replace_time_line（Step 1 修复时间编造的产物）。
+管道共用的 current_time_label / replace_time_line（修复时间编造的产物）。
 """
 
 import json
@@ -16,7 +16,7 @@ from ..domain.extraction import parse_json_object
 
 def current_time_label() -> str:
     """当前系统时间标签（YYYY-MM-DD HH:MM），注入 collect/read 管道防止 LLM 编造历史日期。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def replace_time_line(report: str, label: str, now: str) -> str:
@@ -135,7 +135,7 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
 
 
 # ============================================================
-# 去重 LLM 判定（RAG_OPTIMIZATION P0 压力测试后重构）
+# 去重 LLM 判定
 # 旧确定性确认层（标题/标签/内容 overlap）对真正措辞不同的同义改写确认率仅 9%，
 # 新方案把「是否同一知识点」交给 LLM 判定；标题 fast-path（domain/dedup）先挡掉
 # 「标题基本同一句」的平凡情况省一次调用。判定输出 same/diff + 理由，理由供

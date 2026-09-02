@@ -1,13 +1,13 @@
 """图执行后台任务：run / resume + SSE 进度事件队列。
 
-WEB_PLAN.md §4-⑤：图执行为同步阻塞 → 丢进后台线程；collect/read 长任务的进度经
+图执行为同步阻塞 → 丢进后台线程；collect/read 长任务的进度经
 管道 `progress=` 回调注入（CLI 传 None，Web 传流式回调）推给 SSE；note 的 interrupt()
 （合并确认）两段式：run 跑到 interrupt → 推 `interrupt` 事件 → 前端展示 → resume 提交决策。
 
 线程模型：每个 thread_id 一个 Job（queue + worker 线程），同一时刻只允许一个活跃 worker
 （单飞，避免并发写同一 checkpoint 冲突）。事件经 job.queue 投递，SSE 端消费。
 
-I1：本模块顶层不 import langgraph（SqliteSaver / build_graph / Command 全函数内 lazy）。
+本模块顶层不 import langgraph（SqliteSaver / build_graph / Command 全函数内 lazy）。
 """
 
 import queue
@@ -27,7 +27,7 @@ class Job:
     resume（Command 对象）统一视为 note 合并确认的继续。
     """
 
-    __slots__ = ("queue", "thread", "lock", "command")
+    __slots__ = ("command", "lock", "queue", "thread")
 
     def __init__(self) -> None:
         self.queue: queue.Queue[dict] = queue.Queue()
@@ -65,8 +65,9 @@ def get_job(thread_id: str) -> Job:
 
 def _worker(thread_id: str, payload: Any) -> None:
     """后台线程：打开 SqliteSaver → 编译图 → stream_events 执行 → 事件入队。"""
-    from ..graph import build_graph, web_progress
     from langgraph.checkpoint.sqlite import SqliteSaver
+
+    from ..graph import build_graph, web_progress
 
     job = _job(thread_id)
 

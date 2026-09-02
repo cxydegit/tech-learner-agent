@@ -1,6 +1,6 @@
 """搜索结果质量预筛（纯规则，零 I/O、零框架依赖）。
 
-Step 5 Part B：确定性预筛丢明显垃圾（内容农场 / 低分），高质量结果保留供后续
+确定性预筛丢明显垃圾（内容农场 / 低分），高质量结果保留供后续
 抓取与 LLM 合成排序。GitHub 星数通过注入的 ``fetch_stars`` 回调完成，函数本身
 不做网络——domain 层可独立单测。
 
@@ -81,7 +81,7 @@ def _star_bonus(stars: int, star_tiers) -> int:
 def _domain_of(url: str) -> str:
     """提取 URL 主机名（小写、去 www. 前缀）。"""
     host = (urlparse(url).netloc or "").lower()
-    return host[4:] if host.startswith("www.") else host
+    return host.removeprefix("www.")
 
 
 def _match_domain(host: str, base: str) -> bool:

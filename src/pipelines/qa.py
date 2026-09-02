@@ -1,19 +1,18 @@
 """跨笔记联想检索 Q&A 管道：召回知识库 → 按 path 分组 → 单次 LLM 综合回答 + 来源标注。
 
-Step 4 新功能：用户问「我之前有哪些笔记提到过 X？」，系统跨笔记召回分散片段 →
+用户问「我之前有哪些笔记提到过 X？」，系统跨笔记召回分散片段 →
 按来源笔记聚合 → 一次 LLM 综合回答 + 标注来源。纯数据进出（返回 dict），无副作用、不打印；
 交互（no_hit 的 collect 引导）由 CLI / LangGraph 节点完成。
 
-⚠️ vector 导入必须保持函数内 lazy（不变量 I1：`import src.cli` 不得拉起 chromadb），
+⚠️ vector 导入必须保持函数内 lazy（顶层 `import src.cli` 不得拉起 chromadb），
 测试通过 monkeypatch `_search_notes` 桥接做零网络单测。
 """
 
 import re
-from typing import Callable
+from collections.abc import Callable
 
 from ..adapters.llm import generate_text
 from ..config import config
-
 
 # ============================================================
 # 提示词
@@ -44,29 +43,33 @@ QA_PROMPT = """你是一个知识问答助手，回答用户关于 TA 的学习�
 
 
 # ============================================================
-# 召回桥接（I1：vector 层函数内 lazy）
+# 召回桥接（vector 层函数内 lazy）
 # ============================================================
 
 def _search_notes(question: str, top_k: int, tech: str | None):
-    """lazy import vector 层，守住 I1（`import src.cli` 不加载 chromadb）。
+    """lazy import vector 层（顶层 `import src.cli` 不加载 chromadb）。
 
-    P1 起默认走混合检索（dense + BM25 → RRF，config.QA_USE_HYBRID），
+    默认走混合检索（dense + BM25 → RRF，config.QA_USE_HYBRID），
     hybrid 内部已各自吞掉空索引 / Chroma 异常，这里再套一层兜底回退纯 dense。
 
-    P3 起检索前先做一次惰性对账（节流，见 config.RAG_RECONCILE_INTERVAL）：
+    检索前先做一次惰性对账（节流，见 config.RAG_RECONCILE_INTERVAL）：
     清理磁盘已删除笔记的残留分块，避免本轮召回并引用已不存在的笔记。
 
     测试通过 monkeypatch 本函数返回种子命中集，做零网络管道单测。
     """
-    from ..adapters.vector import hybrid_search_knowledge, reconcile_orphans, semantic_search_knowledge
+    from ..adapters.vector import (
+        hybrid_search_knowledge,
+        reconcile_orphans,
+        semantic_search_knowledge,
+    )
     try:
-        reconcile_orphans()  # P3：/ask 前清孤儿分块；节流 + 内部吞异常，失败不影响检索
-    except Exception:  # noqa: BLE001 —— 对账失败不应阻断提问
+        reconcile_orphans()  # /ask 前清孤儿分块；节流 + 内部吞异常，失败不影响检索
+    except Exception:  # noqa: BLE001, S110 —— 对账失败不应阻断提问
         pass
     if config.QA_USE_HYBRID:
         try:
             return hybrid_search_knowledge(question, top_k, tech)
-        except Exception:  # noqa: BLE001 —— 混合检索异常时回退纯 dense
+        except Exception:  # noqa: BLE001, S110 —— 混合检索异常时回退纯 dense
             pass
     return semantic_search_knowledge(question, top_k, tech)
 

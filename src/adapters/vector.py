@@ -7,14 +7,14 @@
 - ``index_documents()`` / ``index_paths()``：全量 / 增量建立索引（含变更检测，避免重复计费）
 - ``semantic_search()``：通用语义检索（可用 where 过滤 source / tech）
 - ``semantic_search_knowledge()``：笔记语义去重召回（限定 knowledge 源、可选限定技术领域）
-- ``keyword_search_knowledge()``：词法 BM25 召回（P1，补纯 dense 漏精确词匹配）
-- ``hybrid_search_knowledge()``：dense + BM25 → RRF 融合召回（P1，Q&A 默认走这里）
+- ``keyword_search_knowledge()``：词法 BM25 召回（补纯 dense 漏精确词匹配）
+- ``hybrid_search_knowledge()``：dense + BM25 → RRF 融合召回（Q&A 默认走这里）
 - ``check_read_cache()``：read 历史召回（命中已有解读则提示复用）
-- ``reconcile_orphans()``：索引对账（P3 删孤儿 + P3.1 补缺失；index_paths 末尾自动跑，
+- ``reconcile_orphans()``：索引对账（删孤儿 + 补缺失；index_paths 末尾自动跑，
   /ask 节流跑且单次补齐限量）
 
 ⚠️ 本模块 import 时会加载 chromadb，必须保持 lazy 导入（见 CLI / store 的调用点），
-否则 `import src.cli` 会被拉起 chromadb（不变量 I1）。
+否则 `import src.cli` 会被拉起 chromadb。
 """
 
 from __future__ import annotations
@@ -156,8 +156,8 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
     Returns:
         {"indexed": int, "skipped": int, "orphans": int, "backfilled": int,
          "errors": list[str]}
-        ``orphans`` 为对账清理的孤儿分块数（P3）；``backfilled`` 为对账补齐的
-        缺失文件数（P3.1，磁盘有而索引无的文件——写路径自愈，不限个数）。
+        ``orphans`` 为对账清理的孤儿分块数；``backfilled`` 为对账补齐的
+        缺失文件数（磁盘有而索引无的文件——写路径自愈，不限个数）。
     """
     collection = get_collection()
     indexed = skipped = 0
@@ -172,7 +172,7 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
         if err:
             errors.append(err)
 
-    # P3/P3.1 对账：以「磁盘现状」为准修齐索引——删孤儿 + 补缺失。手动 index /
+    # 对账：以「磁盘现状」为准修齐索引——删孤儿 + 补缺失。手动 index /
     # 每次写笔记都会经过这里，缺口随下一次自然写入自愈，无需定期跑 index。
     rec = _reconcile_index(backfill=True)
     return {"indexed": indexed, "skipped": skipped,
@@ -194,14 +194,14 @@ def index_documents(paths: list[Path] | None = None, force: bool = False) -> dic
 
 
 # ============================================================
-# 索引对账（P3：孤儿分块清理）
+# 索引对账（孤儿分块清理）
 # ============================================================
 
 def _reconcile_index(*, backfill: bool, max_backfill: int | None = None) -> dict:
     """对账：以「磁盘现状」为准修齐索引——删孤儿 + 补缺失。
 
-    - 删孤儿（P3）：磁盘已不存在文件的残留分块，/ask 会召回并引用已不存在的笔记；
-    - 补缺失（P3.1，8-19 事故）：磁盘有而索引无任何分块的文件。笔记写盘成功但
+    - 删孤儿：磁盘已不存在文件的残留分块，/ask 会召回并引用已不存在的笔记；
+    - 补缺失：磁盘有而索引无任何分块的文件。笔记写盘成功但
       索引静默失败时，缺口从这里自愈——digest 变更检测保证补齐幂等、不重复计费。
 
     Args:
@@ -345,7 +345,7 @@ def semantic_search_knowledge(query: str, top_k: int = 1, tech: str | None = Non
 
 
 # ============================================================
-# 词法 BM25 检索 + 混合检索（P1）
+# 词法 BM25 检索 + 混合检索
 # ============================================================
 
 def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None) -> list[dict]:
@@ -395,12 +395,12 @@ def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None
 
 
 def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None) -> list[dict]:
-    """混合检索（P1）：dense + BM25 → RRF 融合。
+    """混合检索：dense + BM25 → RRF 融合。
 
     每路取 ``top_k*3`` 候选再融合后截断到 top_k（候选充足融合才有意义）；
     dense 空回退 keyword、keyword 全零回退 dense（两路内部已各自吞掉 Chroma 异常）。
     返回条目的 ``similarity`` 为归一化 RRF 分（top=1.0），``dense_similarity`` 保留
-    原始余弦给 P2 相关度阈值等下游。
+    原始余弦给相关度阈值等下游。
     """
     cand = max(top_k * 3, 8)
     dense = semantic_search_knowledge(query, cand, tech)
@@ -410,7 +410,7 @@ def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None)
     if not sparse:
         return dense[:top_k]
     fused = rrf_fuse(dense, sparse, config.QA_RRF_K)
-    # 词法一致性软重排（P1.1）：仅当查询是「罕见词型」（BM25 正命中集中在 ≤ N 篇笔记）
+    # 词法一致性软重排：仅当查询是「罕见词型」（BM25 正命中集中在 ≤ N 篇笔记）
     # 才启用，纠正 dense 对裸缩写/专有名词的零词法重合噪声（RoPE → rag-架构模式
     # 语义第1但通篇无 RoPE 的案例）。概念查询 BM25 命中散落各篇，不重排避免误伤语义排序
     # （实测：命中≤3 篇时重排只改进/持平；≥4 篇时会造成回退）。
@@ -458,7 +458,7 @@ def check_read_cache(url: str, threshold: float = 0) -> dict | None:
         if hits and hits[0]["similarity"] >= threshold:
             h = hits[0]
             return {"path": h["path"], "similarity": h["similarity"], "content": h["document"]}
-    except Exception:  # noqa: BLE001 —— RAG 不可用时静默降级
+    except Exception:  # noqa: BLE001, S110 —— RAG 不可用时静默降级
         pass
     return None
 

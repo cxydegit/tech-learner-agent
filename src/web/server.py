@@ -1,6 +1,6 @@
-"""FastAPI 应用：托管 src/web/static 静态资源 + /api 端点（WEB_PLAN.md §4-②）。
+"""FastAPI 应用：托管 src/web/static 静态资源 + /api 端点。
 
-API 契约（§5）：
+API 契约：
 ```
 GET    /api/sessions                      会话列表 [{thread_id, title, tech, created_at, updated_at, preview, qa_count, note_count}]
 POST   /api/sessions                      新建会话 → {thread_id}
@@ -15,8 +15,8 @@ DELETE /api/sessions/{id}                 删除会话
 统一卡片契约与 domain/card_input.parse_card_input 一致：collect → {command, tech, focus?}；
 read/ask → {command, args: [...]}；前端卡片命令名 ask 经 card_input 映射为图命令 qa。
 
-I1：本模块顶层不 import langgraph / chromadb（见各子模块 lazy import），
-`import src.web` 满足 WEB_PLAN.md §9 约束。
+本模块顶层不 import langgraph / chromadb（见各子模块 lazy import），
+`import src.web` 不拉起重型依赖。
 """
 
 import asyncio
@@ -69,7 +69,7 @@ def _build_payload(req: RunRequest) -> dict:
 def create_app() -> FastAPI:
     app = FastAPI(title="Tech Learner Agent", docs_url="/api/docs-ui", openapi_url="/api/openapi.json")
 
-    # 个人工具绑 127.0.0.1（§3.1），宽松 CORS 仅为支持 file:// 直开 index.html 的开发调试
+    # 个人工具绑 127.0.0.1，宽松 CORS 仅为支持 file:// 直开 index.html 的开发调试
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

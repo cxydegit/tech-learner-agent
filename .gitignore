@@ -15,8 +15,10 @@ __pycache__/
 .idea/
 .vscode/
 
-# Claude Code 本地缓存
+# Claude Code 本地缓存与本地开发规范（仅本地使用，不随仓库分发）
 .claude/
+CLAUDE.md
+.workbuddy/
 
 # 运行时生成的资料缓存
 materials/
@@ -32,9 +34,7 @@ learner/
 .leamsessions/
 .graph
 
-#用于开发、面试
+# 内部开发文档与脚本（未追踪但可能存在，避免误入）
 docs/
-
-#测试、验证工具
 scripts/
 

@@ -17,7 +17,7 @@ from ..config import config
 
 # 分块器版本号：改分块逻辑时递增，作为 content_hash 前缀。
 # 版本提升 → 既有 hash 全部失配 → 首次 index 自动全量重切（无需手动清库）。
-# v3：新增超大原子块硬上限 + 逻辑二次切分（表格按行重复表头 / 代码按空行分组 + 截断保底）。
+# 当前版本行为：超大原子块硬上限 + 逻辑二次切分（表格按行重复表头 / 代码按空行分组 + 截断保底）。
 CHUNKER_VERSION = 3
 
 # chunk_markdown 的返回值：text 用于嵌入，section 是标题路径字符串（存入 Chroma 元数据便于调试）
@@ -64,7 +64,7 @@ def chunk_text(text: str, chunk_size: int = 0, overlap: int = 0) -> list[str]:
 
 
 # ============================================================
-# Markdown 感知分块（chunker v2）
+# Markdown 感知分块
 # ============================================================
 
 _FENCE_RE = re.compile(r"^(```+|~~~+)")
@@ -352,4 +352,4 @@ def _content_digest(content: str) -> str:
     版本号提升 → 同一文件的新 hash 与旧 hash 必然不同 → 既有分块全部失配，
     首次 index 自动全量重切，无需手动清库。
     """
-    return sha1(f"{CHUNKER_VERSION}\n{content}".encode("utf-8")).hexdigest()
+    return sha1(f"{CHUNKER_VERSION}\n{content}".encode()).hexdigest()

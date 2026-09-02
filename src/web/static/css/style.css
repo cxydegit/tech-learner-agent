@@ -375,7 +375,7 @@ button { font-family: inherit; cursor: pointer; }
 .coach-reply { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .coach-reply input { flex: 1; width: auto; }
 
-/* ============ 侧栏资料库入口（P3） ============ */
+/* ============ 侧栏资料库入口 ============ */
 .lib-nav { padding: 6px 16px 12px; border-top: 1px solid var(--line-soft); flex-shrink: 0; }
 .lib-label { font-size: 11px; color: var(--ink-3); letter-spacing: 2px; margin: 10px 0 6px; }
 .lib-item {
@@ -384,7 +384,7 @@ button { font-family: inherit; cursor: pointer; }
 }
 .lib-item:hover { background: rgba(255,255,255,.7); color: var(--accent-deep); }
 
-/* ============ 资料库浏览视图（P3） ============ */
+/* ============ 资料库浏览视图 ============ */
 .app.view-docs .input-wrap { display: none; }
 .docs-tabs { max-width: 760px; margin: 0 auto 16px; display: flex; gap: 8px; flex-wrap: wrap; }
 .docs-tab {

@@ -1,13 +1,13 @@
 """知识沉淀管道：召回已有笔记 → LLM 差量提取(JSON) → 逐条匹配 → 返回候选（纯数据）。
 
 自 agent.py 迁出：note_pipeline + 就近携带 EXTRACT/MERGE/SUGGEST_SYSTEM_PROMPT。
-Step 3 起 note_pipeline 只做「召回已有笔记 → 差量提取（只写增量，可输出 []）→ 逐条匹配」，
+note_pipeline 只做「召回已有笔记 → 差量提取（只写增量，可输出 []）→ 逐条匹配」，
 返回 {new_points, merge_candidates, empty_reason, suggestion}，**不持久化、不交互**；
-入库（persist_points）与交互确认由 CLI / LangGraph 节点完成（见 OPTIMIZATION_PLAN Step 3）。
+入库（persist_points）与交互确认由 CLI / LangGraph 节点完成。
 """
 
 import re
-from typing import Callable
+from collections.abc import Callable
 
 from ..adapters.llm import generate_text
 from ..adapters.store import (
@@ -21,7 +21,6 @@ from ..adapters.store import (
 from ..config import config
 from ..domain.dedup import strip_note_header
 from ..domain.extraction import parse_entries, parse_json_object
-
 
 # ============================================================
 # 提示词
@@ -116,7 +115,7 @@ SUGGEST_SYSTEM_PROMPT = """你是一个学习规划助手。某个技术领域�
 def _build_extraction_user(tech: str, conversation_log: str, existing: list[dict]) -> str:
     """组装差量提取的 user_content：技术 + 已有笔记上下文(限量) + 学习内容。
 
-    Token 预算（OPTIMIZATION_PLAN Step 3）：已有笔记每条截断 ~500 字、top 3~5 条，
+    Token 预算：已有笔记每条截断 ~500 字、top 3~5 条，
     学习内容截断 12000 字，避免长对话直接把提示词撑爆。
     """
     if existing:
@@ -195,7 +194,7 @@ def note_pipeline(tech: str, conversation_log: str,
         # 无技术主题（未 collect）时不兜底空标签；LLM 没给 tags 就留空，避免 `#` 空标签
         tags = e.get("tags") or ([tech] if tech else [])
         # 候选召回 → 标题 fast-path → LLM 判定（find_note_match），返回第一个判定
-        # same 的候选及理由；reason 供确认时展示（RAG_OPTIMIZATION P0 压力测试后重构）。
+        # same 的候选及理由；reason 供确认时展示。
         match, similarity, reason = find_note_match(tech, topic, existing_all, content=body, tags=tags)
         if match:
             merge_candidates.append({

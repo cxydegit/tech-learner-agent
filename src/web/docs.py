@@ -1,10 +1,10 @@
 """文件浏览 API：列出 / 读取 materials/ reports/ knowledge/ 的 markdown。
 
-WEB_PLAN.md §4-④：路径白名单限定三目录，防路径穿越。
+路径白名单限定三目录，防路径穿越：
 - 列目录：扁平列出三目录下所有 `.md`（含子目录），path 用相对项目根的 posix 路径；
 - 读文件：校验 path 落在白名单内（杜绝绝对路径 / 盘符 / `..` 跳出），再读取内容。
 
-I1：本模块顶层只依赖轻量模块（config），无重依赖。
+本模块顶层只依赖轻量模块（config），无重依赖。
 """
 
 from pathlib import Path

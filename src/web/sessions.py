@@ -1,11 +1,11 @@
 """会话列表 / 详情 / 删除：基于 SqliteSaver.list() + 每线程最新 checkpoint。
 
-WEB_PLAN.md §4-③：会话列表项 `{thread_id, title, tech, created_at, updated_at, preview, qa数, note数}`。
+会话列表项 `{thread_id, title, tech, created_at, updated_at, preview, qa数, note数}`：
 - `saver.list(None)` 可遍历全部线程，按 checkpoint_id 降序 → 每线程第一条即最新 checkpoint；
 - `created_at` / `updated_at` 首选 conversation 的 ts（新会话有），老会话回退 checkpoint_id / thread_id 时间；
 - title 默认 `tech + 时间`。
 
-I1：本模块顶层不 import langgraph（SqliteSaver 函数内 lazy）。
+本模块顶层不 import langgraph（SqliteSaver 函数内 lazy）。
 """
 
 import re
@@ -18,7 +18,7 @@ _THREAD_ID_TS_RE = re.compile(r"(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})")
 
 
 def _open_saver():
-    """打开 SqliteSaver 连接（lazy import 守 I1；with 语句负责关闭）。"""
+    """打开 SqliteSaver 连接（lazy import 保持顶层无重依赖；with 语句负责关闭）。"""
     from langgraph.checkpoint.sqlite import SqliteSaver
     return SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH))
 
@@ -65,7 +65,7 @@ def _parse_thread_ts(thread_id: str) -> str | None:
         return None
     y, mo, d, h, mi, s = (int(x) for x in m.groups())
     try:
-        return datetime(y, mo, d, h, mi, s).isoformat(timespec="seconds")
+        return datetime(y, mo, d, h, mi, s).isoformat(timespec="seconds")  # noqa: DTZ001 —— thread_id 即本地时间标识，naive 语义
     except ValueError:
         return None
 
@@ -85,8 +85,8 @@ def _checkpoint_ts(tup) -> str | None:
         if u.version == 6:
             ts_100ns = ((u.int >> 80) << 12) | ((u.int >> 64) & 0x0FFF)
             epoch_s = ts_100ns / 1e7 - 12219292800
-            return datetime.fromtimestamp(epoch_s).isoformat(timespec="seconds")
-    except Exception:  # noqa: BLE001 —— 解析失败返回 None，调用方回退
+            return datetime.fromtimestamp(epoch_s).isoformat(timespec="seconds")  # noqa: DTZ006 —— 转本地时间展示，naive 即可
+    except Exception:  # noqa: BLE001, S110 —— 解析失败返回 None，调用方回退
         pass
     return None
 
@@ -131,7 +131,7 @@ def create_session() -> str:
     graph.update_state 写入一个空快照，让详情/列表立即可读。
     """
     from ..graph import build_graph
-    thread_id = f"learn-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    thread_id = f"learn-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}"
     config.GRAPH_DB_DIR.mkdir(parents=True, exist_ok=True)
     with _open_saver() as saver:
         saver.setup()

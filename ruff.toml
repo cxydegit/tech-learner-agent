@@ -1,0 +1,41 @@
+# ruff 配置（`ruff check` 用）
+#
+# 规则取舍说明：
+# - select 对齐项目实际规则：基础 E4/E7/E9/F + 导入排序 I + 过时语法 UP
+#   + 盲捕获 BLE001 + 优雅降级 S110 + datetime 时区 DTZ + 简化 SIM。
+# - S110 / BLE001：刻意优雅降级（检索失败返回空、LLM 解析失败回退、兜底防意外），
+#   代码中已用 `# noqa: BLE001, S110` 就地标注，不全局屏蔽，避免掩盖真实问题。
+# - DTZ（datetime 无时区）：strftime 输出场景统一改 `datetime.now().astimezone()`
+#   （本地 aware，strftime 输出不变）；isoformat 输出场景（会话消息 ts）为保持
+#   naive 格式（与 sessions.py 解析出的 naive 一致、前端/排序兼容）就地 `# noqa: DTZ005`
+#   标注；sessions.py 解析线程 ID 构造本地时间（DTZ001/006）同样 noqa 标注。
+# - baselines/react_agent.py 是冻结的 benchmark 基线（文件头约定"方法体零漂移"），
+#   类型注解与异常处理保持原样，per-file 豁免。
+# - E501（行过长）不启用（项目有自身换行风格，需逐个手工处理，见 line-length）；
+#   B008 / SIM105 / B007 / B905 / S310 / S324 / E731 当前无有效收益，忽略。
+
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = [
+    "E4", "E7", "E9", "F",  # 语法/未定义
+    "I",                     # 导入排序
+    "UP",                    # 过时语法（Optional→X|None 等）
+    "BLE001",                # 盲捕获（逐处 noqa 标注）
+    "S110",                  # try-except-pass（逐处 noqa 标注）
+    "DTZ",                   # datetime 无时区
+    "SIM",                   # 可简化写法
+]
+ignore = [
+    "B008",   # function-call-in-default-argument
+    "SIM105", # suppressible-exception（与 BLE001 同类，逐处处理）
+    "B007",   # unused-loop-control-variable（约定用 _ 前辍即已表达）
+    "B905",   # zip-without-explicit-strict（长度相等已由数据保证）
+    "S310",   # suspicious-url-open-usage（工具函数按设计抓取 URL）
+    "S324",   # hashlib-insecure-hash-function（content digest 非安全用途）
+    "E731",   # lambda-assignment（回调注册风格）
+]
+
+[lint.per-file-ignores]
+"src/baselines/react_agent.py" = ["BLE001", "UP045"]  # 冻结基线：保持原版注解与异常处理

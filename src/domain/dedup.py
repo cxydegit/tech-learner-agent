@@ -4,6 +4,7 @@
 仅依赖 re + datetime。
 """
 
+import itertools
 import re
 from datetime import datetime
 
@@ -46,13 +47,13 @@ def _topics_overlap(a: str, b: str) -> bool:
 
 def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
     """给笔记正文加上标题和标签头部。"""
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now().astimezone().strftime("%Y-%m-%d")
     tag_str = " ".join(f"#{t}" for t in (tags or []))
     return f"# {topic}\n\n> 日期：{date_str}\n> 标签：{tag_str}\n\n{content.lstrip()}"
 
 
 # ============================================================
-# 去重「标题 fast-path」纯函数（RAG_OPTIMIZATION P0 压力测试后重构）
+# 去重「标题 fast-path」纯函数
 # 旧的标签 / 内容 overlap 确认层（_same_knowledge_point 及其信号）在 LLM 合成
 # 压力测试（scripts/eval_dedup_synth.json）中被证明无法识别真正措辞不同的同义改写
 # （对源笔记方向确认率仅 9%），且标签信号会撞到错误候选造成错合并，已整体删除。
@@ -102,7 +103,7 @@ def _title_tokens(title: str) -> set[str]:
              if len(t) >= 2 and t not in _TITLE_STOP}
     cjk = re.findall(r"[一-鿿]", low)
     bigrams = {
-        a + b for a, b in zip(cjk, cjk[1:])
+        a + b for a, b in itertools.pairwise(cjk)
         if a + b not in _TITLE_STOP and a not in _TITLE_STOP_SINGLE and b not in _TITLE_STOP_SINGLE
     }
     return latin | bigrams

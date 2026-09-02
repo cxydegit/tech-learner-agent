@@ -1,6 +1,6 @@
 /* ============================================================
    API 层：fetch + EventSource 封装（对接 src/web/server.py）
-   全部端点见 WEB_PLAN.md §5；错误统一抛 Error(detail)。
+   端点见 server.py 模块 docstring；错误统一抛 Error(detail)。
    ============================================================ */
 
 const BASE = "/api";
