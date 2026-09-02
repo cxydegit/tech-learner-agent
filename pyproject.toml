@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tech-learner-agent"
+version = "0.1.0"
+description = "自带记忆的技术学习陪练 Agent：collect / read / note / ask + Coach Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Tech Learner Agent Authors" }]
+keywords = ["agent", "learning", "rag", "langgraph", "ai-tutor"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "tavily-python>=0.5,<1",
+    "firecrawl-py>=1,<5",
+    "click>=8.1",
+    "python-dotenv>=1.0",
+    "rich>=13,<16",
+    "openai>=1,<3",
+    "chromadb>=0.5,<2",
+    "langgraph>=1.2,<2",
+    "langgraph-checkpoint-sqlite>=3.1,<4",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+tech-learner = "src.cli:cli"
+tech-learner-web = "src.web.server:main"
+
+[project.urls]
+Homepage = "https://github.com/<owner>/tech-learner-agent"
+Issues = "https://github.com/<owner>/tech-learner-agent/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

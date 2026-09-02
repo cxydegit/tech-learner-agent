@@ -38,3 +38,10 @@ learner/
 docs/
 scripts/
 
+# Python 构建产物（pip install -e . 生成的 egg-info / build / dist）
+*.egg-info/
+build/
+dist/
+__pycache__/
+*.pyc
+

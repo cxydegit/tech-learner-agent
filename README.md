@@ -1,5 +1,9 @@
 # Tech Learner Agent
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](./pyproject.toml)
+[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](./.github/workflows/ci.yml)
+
 > 一个**自带记忆**的技术学习陪练 Agent：收集资料 → 解读文档 → 沉淀笔记 → 问自己的笔记，再由一个 Coach Agent 串成「问卷 → 规划 → 陪练」的完整学习闭环。
 
 它不再是一个只会执行单条命令的工具箱，而是一个**记得住、想得起、会长大**的学习伙伴：每一次对话中产生的知识点都会自动沉淀进知识库（后台执行、不打断对话），下一次提问时它会把相关的旧笔记主动翻出来结合回答；新旧知识冲突时它自动以新内容为准修正并报告；聊得足够久时它还会把历史压缩成「事实 / 未决 / 脉络」三舱记忆，让长期陪练既不忘事、也不爆上下文。
@@ -68,15 +72,25 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装
+
+需要 **Python 3.11+**。
 
 ```bash
-python -m venv venv
-venv\Scripts\activate      # Windows
-# source venv/bin/activate # macOS/Linux
-
-pip install -r requirements.txt
+# 克隆与安装（自动装齐所有依赖）
+git clone https://github.com/<owner>/tech-learner-agent
+cd tech-learner-agent
+pip install -e .          # 开发模式；正式使用可直接 pip install .
 ```
+
+安装后会自动创建两个命令：
+
+| 命令 | 作用 |
+|------|------|
+| `tech-learner` | CLI（`collect` / `read` / `note` / `ask` / `route`） |
+| `tech-learner-web` | 启动 Web 界面（默认 http://127.0.0.1:8000） |
+
+> 旧 `requirements.txt` 已被 `pyproject.toml` 取代；自定义依赖请加在 `pyproject.toml` 的 `[project].dependencies` 里。
 
 ### 2. 配置 API Keys
 
@@ -103,7 +117,7 @@ python -m src.cli collect "Spring Boot 3"            # 收集学习资料
 python -m src.cli read "https://docs.spring.io/..."   # 解读一篇文档
 python -m src.cli note "Spring Boot" -f materials/xxx.md   # 沉淀笔记（-f 文件 / -t 文本 / stdin）
 python -m src.cli index                              # 建立/增量更新语义索引
-python -m src.cli learn                              # 交互式学习会话（含 /ask）
+python -m src.cli learn                              # 持久化会话（含 /ask）
 python -m src.cli route "Spring Boot"                # 开始 Coach 定制路线
 python -m src.cli route --list / --resume            # 找回 / 恢复陪练会话
 
