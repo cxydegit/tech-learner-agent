@@ -7,21 +7,27 @@ on:
 
 jobs:
   test:
-    name: ruff + pytest (ubuntu, Python 3.12)
+    name: ruff + pytest (ubuntu, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖「最低支持版本」3.11 与「最新声明版本」3.12（requires-python = ">=3.11"）。
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-      - name: Install (editable)
+      - name: Install (editable + dev extras)
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
-          pip install ruff pytest
+          # 工具链（ruff/pytest）由 pyproject.toml 的 dev 组统一声明，与本地开发一致
+          pip install -e ".[dev]"
       - name: Lint
-        run: ruff check src
+        # src + tests 都纳入检查；
+        run: ruff check src tests
       - name: Test
         # 默认环境变量即可——仓库用 .env.example 的占位值；
         # 真正需要 LLM 的测试通过 mock / skip 隔离（见 tests/ 离线用例）
