@@ -274,6 +274,11 @@ def test_e2e_async_fire_then_drain(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
     monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
     monkeypatch.setattr(config, "KNOWLEDGE_DIR", tmp_path / "knowledge")  # 防泄漏真实知识库
+    monkeypatch.setattr(config, "CHROMA_DIR", tmp_path / ".chroma")  # 索引同样隔离，防对账误删真实库
+    # vector 全局单例若已指向真实 .chroma，重置让 get_collection 落到上面的临时目录
+    import src.adapters.vector as vector_mod
+    monkeypatch.setattr(vector_mod, "_client", None)
+    monkeypatch.setattr(vector_mod, "_collection", None)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 100000)
     monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_chat)

@@ -188,6 +188,9 @@ def index(force: bool = False):
     backfilled = result.get("backfilled", 0)
     if backfilled:
         console.print(f"🩹 对账补齐 [bold]{backfilled}[/bold] 个缺失文件（此前索引失败/未索引）")
+    warn = result.get("warn", "")
+    if warn:
+        console.print(f"[yellow]⚠️ {warn}[/yellow]")
     if result["errors"]:
         console.print("[yellow]部分文件索引失败：[/yellow]")
         for e in result["errors"]:

@@ -132,7 +132,7 @@ def test_reconcile_deletes_orphans_and_backfills_missing(monkeypatch):
                         lambda col, p, force: backfilled_files.append(p) or ("indexed", None))
 
     out = vector_mod._reconcile_index(backfill=True)
-    assert out == {"orphans": 1, "backfilled": 2}
+    assert out == {"orphans": 1, "backfilled": 2, "warn": ""}
     assert fake.deleted == ["gone.md::0"]
     assert [p.name for p in backfilled_files] == ["a.md", "b.md"]   # sorted 稳定
 
@@ -148,7 +148,7 @@ def test_reconcile_backfill_respects_cap(monkeypatch):
     monkeypatch.setattr(vector_mod, "_index_single_file",
                         lambda col, p, force: seen.append(p) or ("indexed", None))
     out = vector_mod._reconcile_index(backfill=True, max_backfill=2)
-    assert out == {"orphans": 0, "backfilled": 2}
+    assert out == {"orphans": 0, "backfilled": 2, "warn": ""}
     assert len(seen) == 2
 
 
@@ -156,4 +156,49 @@ def test_reconcile_disabled_returns_zero(monkeypatch):
     """RAG_RECONCILE 关闭时不做任何事。"""
     monkeypatch.setattr(config, "RAG_RECONCILE", False)
     out = vector_mod._reconcile_index(backfill=True)
-    assert out == {"orphans": 0, "backfilled": 0}
+    assert out == {"orphans": 0, "backfilled": 0, "warn": ""}
+
+
+# ============ 孤儿删除安全闸：磁盘扫描异常时拒绝删孤儿（整库误清防线） ============
+
+def test_reconcile_skips_orphan_delete_when_disk_ratio_crashes(monkeypatch):
+    """磁盘可见文件断崖式减少（如目录被切换/空目录运行）→ 孤儿删除被安全闸拦截，
+    只补缺失不删分块——防止整库 knowledge 分块被误当孤儿清空。"""
+    monkeypatch.setattr(config, "RAG_RECONCILE", True)
+    monkeypatch.setattr(config, "RAG_RECONCILE_MIN_DISK_RATIO", 0.5)
+    # 索引里有 100 篇笔记，磁盘只剩 2 个文件（模拟扫描异常）
+    fake = _FakeCollection(
+        ids=[f"knowledge/n{i}.md::0" for i in range(100)],
+        metas=[{"path": f"knowledge/n{i}.md"} for i in range(100)],
+    )
+    monkeypatch.setattr(vector_mod, "get_collection", lambda: fake)
+    monkeypatch.setattr(vector_mod, "_discover_files",
+                        lambda: [config.BASE_DIR / "knowledge/a.md", config.BASE_DIR / "materials/b.md"])
+    backfilled_files = []
+    monkeypatch.setattr(vector_mod, "_index_single_file",
+                        lambda col, p, force: backfilled_files.append(p) or ("indexed", None))
+
+    out = vector_mod._reconcile_index(backfill=True)
+    assert out["orphans"] == 0          # 拒绝删除
+    assert fake.deleted is None         # 未调用 delete
+    assert out["backfilled"] == 2       # 补缺失照常（缺口由写路径自愈）
+    assert "疑似扫描异常" in out["warn"]
+    assert out["warn"] and "跳过" in out["warn"]
+
+
+def test_reconcile_orphan_delete_runs_when_disk_healthy(monkeypatch):
+    """磁盘文件数与索引相当（正常删了几篇）→ 安全闸不误伤，孤儿照常清理。"""
+    monkeypatch.setattr(config, "RAG_RECONCILE", True)
+    monkeypatch.setattr(config, "RAG_RECONCILE_MIN_DISK_RATIO", 0.5)
+    # 磁盘 98 篇、索引 100 篇（删了 2 篇），ratio=0.98 > 0.5 → 正常删孤儿
+    fake = _FakeCollection(
+        ids=[f"knowledge/n{i}.md::0" for i in range(100)],
+        metas=[{"path": f"knowledge/n{i}.md"} for i in range(100)],
+    )
+    monkeypatch.setattr(vector_mod, "get_collection", lambda: fake)
+    monkeypatch.setattr(vector_mod, "_discover_files",
+                        lambda: [config.BASE_DIR / f"knowledge/n{i}.md" for i in range(98)])
+    out = vector_mod._reconcile_index(backfill=False)
+    assert out["orphans"] == 2          # 正常清理 2 个孤儿
+    assert out["warn"] == ""
+    assert fake.deleted == ["knowledge/n98.md::0", "knowledge/n99.md::0"]

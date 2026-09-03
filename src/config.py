@@ -60,6 +60,10 @@ class Config:
     # /ask 路径单次对账补缺失的文件数上限：提问时补缺失会触发 embedding 调用，
     # 限量避免拖延迟；写路径（index_paths / 写笔记）不限，缺口随下次写入全量补齐。
     RAG_RECONCILE_BACKFILL_MAX: int = int(os.getenv("RAG_RECONCILE_BACKFILL_MAX", "3"))
+    # 孤儿删除安全闸：当磁盘可见 Markdown 文件数低于索引中已跟踪文件数的该比例时，
+    # 判定为「磁盘扫描异常 / 目录被切换」而非「文件真被删除」——跳过删孤儿只补缺失，
+    # 防止整库分块被误当孤儿清空（knowledge 全库消失事故的根因防线）。0 表示关闭闸门。
+    RAG_RECONCILE_MIN_DISK_RATIO: float = float(os.getenv("RAG_RECONCILE_MIN_DISK_RATIO", "0.5"))
 
     # LangGraph checkpointer 持久化（SqliteSaver，跨会话/跨进程恢复）
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"

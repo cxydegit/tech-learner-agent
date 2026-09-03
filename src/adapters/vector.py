@@ -155,9 +155,10 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
 
     Returns:
         {"indexed": int, "skipped": int, "orphans": int, "backfilled": int,
-         "errors": list[str]}
+         "errors": list[str], "warn": str}
         ``orphans`` 为对账清理的孤儿分块数；``backfilled`` 为对账补齐的
         缺失文件数（磁盘有而索引无的文件——写路径自愈，不限个数）。
+        ``warn`` 为孤儿删除被安全闸拦截时的提示（空串 = 正常执行）。
     """
     collection = get_collection()
     indexed = skipped = 0
@@ -176,7 +177,8 @@ def index_paths(paths: list[Path], force: bool = False) -> dict:
     # 每次写笔记都会经过这里，缺口随下一次自然写入自愈，无需定期跑 index。
     rec = _reconcile_index(backfill=True)
     return {"indexed": indexed, "skipped": skipped,
-            "orphans": rec["orphans"], "backfilled": rec["backfilled"], "errors": errors}
+            "orphans": rec["orphans"], "backfilled": rec["backfilled"],
+            "errors": errors, "warn": rec.get("warn", "")}
 
 
 def index_documents(paths: list[Path] | None = None, force: bool = False) -> dict:
@@ -210,24 +212,42 @@ def _reconcile_index(*, backfill: bool, max_backfill: int | None = None) -> dict
             避免提问时突发多次 embedding 调用拖延迟；写路径（index_paths）不限。
 
     Returns:
-        {"orphans": 删除的孤儿分块数, "backfilled": 补齐的文件数}
+        {"orphans": 删除的孤儿分块数, "backfilled": 补齐的文件数,
+         "warn": 孤儿删除被安全闸拦截时的警告信息（空串 = 正常执行）}
 
     受 config.RAG_RECONCILE 控制（默认开）；Chroma 异常 / 索引未建时静默降级为 0。
+
+    安全闸（孤儿误删防线）：孤儿删除以「磁盘现状」为准，但磁盘扫描可能因
+    目录被切换 / rglob 异常 / 空目录运行而暂时看不到文件——此时若照常删孤儿，
+    会把整库分块（尤其 knowledge 笔记）全当孤儿清空。防护：当磁盘可见文件数
+    与索引已跟踪文件数之比低于 RAG_RECONCILE_MIN_DISK_RATIO 时，判定为扫描异常，
+    跳过删孤儿（只补缺失，缺口由写路径自愈），避免「全库消失」类事故。
     """
     if not config.RAG_RECONCILE:
-        return {"orphans": 0, "backfilled": 0}
+        return {"orphans": 0, "backfilled": 0, "warn": ""}
     try:
         res = get_collection().get(include=["metadatas"])
     except Exception:  # noqa: BLE001 —— 索引未建 / Chroma 异常时静默降级
-        return {"orphans": 0, "backfilled": 0}
+        return {"orphans": 0, "backfilled": 0, "warn": ""}
     ids = res.get("ids", [])
     metas = res.get("metadatas", []) or []
-    disk_paths = {p.relative_to(config.BASE_DIR).as_posix() for p in _discover_files()}
+    disk_files = _discover_files()
+    disk_paths = {p.relative_to(config.BASE_DIR).as_posix() for p in disk_files}
     indexed_paths = {m.get("path") for m in metas}
 
-    # 1) 删孤儿：path 不在磁盘的分块
+    # 1) 删孤儿：path 不在磁盘的分块。安全闸：磁盘可见文件数断崖式低于索引
+    #    跟踪数（而非接近全量）→ 疑似扫描异常，拒绝删孤儿，避免误清整库。
     orphans = 0
     orphan_ids = [doc_id for doc_id, m in zip(ids, metas) if m.get("path") not in disk_paths]
+    warn = ""
+    min_ratio = config.RAG_RECONCILE_MIN_DISK_RATIO
+    if orphan_ids and disk_paths and min_ratio > 0:
+        ratio = len(disk_paths) / max(len(indexed_paths), 1)
+        if ratio < min_ratio:
+            warn = (f"磁盘可见文件 {len(disk_paths)} 个 << 索引跟踪 {len(indexed_paths)} 个 "
+                    f"(ratio {ratio:.2f} < {min_ratio})，疑似扫描异常，已跳过 {len(orphan_ids)} 个"
+                    "孤儿分块的删除，仅补缺失（检查是否在空/临时目录下运行过 index）")
+            orphan_ids = []
     if orphan_ids:
         try:
             get_collection().delete(ids=orphan_ids)
@@ -246,7 +266,7 @@ def _reconcile_index(*, backfill: bool, max_backfill: int | None = None) -> dict
             status, _err = _index_single_file(collection, config.BASE_DIR / rel, force=False)
             if status == "indexed":
                 backfilled += 1
-    return {"orphans": orphans, "backfilled": backfilled}
+    return {"orphans": orphans, "backfilled": backfilled, "warn": warn}
 
 
 def reconcile_orphans(force: bool = False) -> dict:
@@ -257,14 +277,18 @@ def reconcile_orphans(force: bool = False) -> dict:
     突发大量 embedding 调用会拖延迟）。force=True 跳过节流强制对账。
 
     Returns:
-        {"orphans": int, "backfilled": int}（节流跳过 / 未启用时均为 0）
+        {"orphans": int, "backfilled": int, "warn": str}（节流跳过 / 未启用时 warn 为空）
     """
     global _last_reconcile_at
     now = time.time()
     if not force and now - _last_reconcile_at < config.RAG_RECONCILE_INTERVAL:
-        return {"orphans": 0, "backfilled": 0}
+        return {"orphans": 0, "backfilled": 0, "warn": ""}
     _last_reconcile_at = now
-    return _reconcile_index(backfill=True, max_backfill=config.RAG_RECONCILE_BACKFILL_MAX)
+    rec = _reconcile_index(backfill=True, max_backfill=config.RAG_RECONCILE_BACKFILL_MAX)
+    if rec.get("warn"):
+        import warnings
+        warnings.warn(rec["warn"], stacklevel=2)
+    return rec
 
 
 # ============================================================
@@ -482,6 +506,10 @@ def main() -> None:
     print(f"索引完成：新增 {result['indexed']} 个文件，跳过 {result['skipped']} 个未变化文件")
     if result.get("backfilled"):
         print(f"对账补齐 {result['backfilled']} 个缺失文件（此前索引失败 / 未索引）")
+    if result.get("orphans"):
+        print(f"清理孤儿分块 {result['orphans']} 个")
+    if result.get("warn"):
+        print(f"⚠️ {result['warn']}")
     if result["errors"]:
         print("错误：")
         for e in result["errors"]:
