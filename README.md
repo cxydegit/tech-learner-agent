@@ -52,52 +52,37 @@
 
 ## 整体架构
 
-```mermaid
-flowchart TB
-    classDef entry fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e293b
-    classDef phase fill:#fff1f2,stroke:#fb7185,stroke-width:1.5px,color:#9f1239
-    classDef tool  fill:#ecfdf5,stroke:#34d399,stroke-width:1.5px,color:#065f46
-    classDef auto  fill:#ecfdf5,stroke:#34d399,stroke-width:1.5px,color:#065f46,stroke-dasharray:5 4
-    classDef store fill:#faf5ff,stroke:#c084fc,stroke-width:1.5px,color:#581c87
-
-    subgraph L1["用户入口"]
-        direction LR
-        CLI["💻 tech-learner · CLI"]:::entry
-        WEB["🌐 tech-learner-web · Web"]:::entry
-    end
-
-    subgraph L2["🧭 Coach Agent · 中枢大脑"]
-        direction LR
-        S["问卷 survey<br/>画像与诊断"]:::phase --> P["规划 planning<br/>学习路线"]:::phase --> C["陪练 coaching<br/>对话驱动"]:::phase
-    end
-
-    subgraph L3["🧰 四件套基础能力"]
-        direction LR
-        COLLECT["📚 collect<br/>资料收集"]:::tool
-        READ["📖 read<br/>文档解读"]:::tool
-        ASK["💬 ask<br/>问我的笔记"]:::tool
-        NOTE["📝 note<br/>知识沉淀 · 后台自动"]:::auto
-    end
-
-    subgraph L4["💾 持久化"]
-        direction LR
-        KB["🧠 知识库 + 语义索引<br/>knowledge/ · .chroma/"]:::store
-        PROFILE["👤 画像 + 学习路线<br/>learner/ · roadmaps/"]:::store
-        SESS["🗄 会话快照<br/>.graph/checkpoints.sqlite"]:::store
-    end
-
-    L1 --> L2
-    L2 -- "作为工具调度" --> L3
-    L3 -- "沉淀 · 检索" --> L4
-
-    linkStyle default stroke:#94a3b8,stroke-width:1.5px
 ```
-
-> 图中只画主干：note 由记忆系统后台自动触发（缓冲 ≥6 回合 / ≥2500 字），提问时先查知识库（命中 ≥0.65 自动注入），上下文压缩时增量整理「三舱记忆」（事实 / 未决 / 脉络）。
+              ┌─────────────────────────────────────────────────────┐
+              │              Coach Agent (route)                    │
+              │   问卷 → 规划 → 陪练，项目的中枢大脑                  │
+              │   负责编排 / 记忆 / 上下文 / 护栏                    │
+              └───────┬──────────────┬──────────────┬───────────────┘
+                      │              │              │
+         ┌────────────┘              │              └────────────┐
+         ▼                           ▼                           ▼
+   ┌───────────┐              ┌───────────┐               ┌───────────┐
+   │  collect  │              │   read    │               │    ask    │
+   │  资料收集  │              │  文档解读  │               │ 问我的笔记 │
+   └───────────┘              └───────────┘               └───────────┘
+                                    │ 记忆系统（note / ask 确定性接入）
+                                    ▼
+   ┌───────────┐   ┌────────────────────────────┐     ┌───────────┐
+   │   note    │◄──┤  ① 确定性沉淀写入（不阻塞）  ├──►  │  知识库    │
+   │  知识沉淀  │   │  ② 确定性检索注入（先查库） │      │ knowledge/│
+   └───────────┘   │  ③ 冲突解决（以新为准）     │      │ + .chroma/│
+                   │  ④ 三舱摘要自我整理         │     └───────────┘
+                   └──────────────┬─────────────┘
+                                  ▼
+                   ┌───────────────┴───┐   ┌──────────────────┐
+                   │  画像 + 学习路线    │  │ 对话历史 /会话状态 │
+                   │  learner/roadmaps │   │ .graph/          │
+                   └───────────────────┘   │ checkpoints.sqlite│
+                                           └──────────────────┘
+```
 
 **角色分工**：`collect` / `read` / `note` / `ask` 是四个**确定性、可独立使用**的基础能力；`route`（Coach Agent）是项目的**编排中枢**，它像一位真正的教练——先了解你（问卷），再为你定制学习路线（规划），然后陪你一步步执行（陪练），并在过程中把 `collect`、`read`、`ask` 作为自己的工具来调度，同时通过记忆系统持续读写你的知识库。
 
-***
 
 ## 快速开始
 
@@ -261,25 +246,13 @@ python -m src.web.server                             # 打开 http://127.0.0.1:8
 
 对话中产生的学习内容**不需要**模型自觉调工具——系统自动完成：
 
-- 每次对话轮次被压入一个**沉淀缓冲**；
-
-- 缓冲累计到 **≥6 个用户回合** 或 **≥2500 字**（任一达到）即触发一次沉淀；
+- 累计到 **≥6 个用户回合** 或 **≥2500 字**（任一达到）即触发一次沉淀；
 
 - 触发后**后台线程**执行纯 note 管道（只读知识库 + LLM 差量提取），**对话完全不阻塞**；
 
 - 线程失败 / 超时 / 进程重启 → 快照自动回滚到缓冲，交给未来正常触发重扫，**不丢不重**；
 
-- 结果确定性分派：
-
-  - **无新内容**（闲聊 / 过程消息）→ 天然被差量提取过滤，清空缓冲无动作；
-
-  - **有新知识点且无相似候选** → 自动落库，agent 可自然提及「已沉淀 N 个新知识点」；
-
-  - **有相似候选** → 走**确定性确认节点**（不经过 agent 转述）：暂停问你「合并 / 跳过」，解析你的决定后落库；
-
 - 反馈通过 SSE 进度事件实时展示（Web 端），`ROUTE_MEMORY_SWEEP_ASYNC=false` 可退回同步路径（逃生舱）。
-
-> 效果：聊着聊着，知识就自动进了笔记库。沉淀耗时是「后台的」，对话是「即时的」。
 
 ### ② 确定性检索（ask）
 
@@ -290,8 +263,6 @@ python -m src.web.server                             # 打开 http://127.0.0.1:8
 - **质量闸门**：复用 ask 的混合检索，只有命中片段与问题相似度达到阈值（余弦 **0.65**）才注入上下文，最多注入 **3 条**片段；
 
 - **优雅降级**：检索异常（未索引 / 向量库不可用）返回空，模型用自己的知识正常回答，绝不让检索失败拖垮对话。
-
-> 效果：教练回答你的问题时，会主动「翻旧笔记」结合你的历史沉淀作答，而不是只靠模型原生知识。
 
 ### ③ 记忆冲突解决
 
