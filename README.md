@@ -299,11 +299,11 @@ python -m src.web.server   # 默认 http://127.0.0.1:8000（只绑本机）
 
 - **资料库浏览 + 文档阅读器**：按 materials / reports / knowledge 三类浏览，点击进入右侧 Markdown 阅读器。
 
-![img.png](img.png)
-![img_1.png](img_1.png)
-![img_2.png](img_2.png)
-![img_3.png](img_3.png)
-![img_4.png](img_4.png)
+![web-scenarios](assets/web-scenarios.png)
+![web-read-report](assets/web-read-report.png)
+![web-coach-roadmap](assets/web-coach-roadmap.png)
+![web-ask-sources](assets/web-ask-sources.png)
+![web-library](assets/web-library.png)
 
 ## 项目结构
 
