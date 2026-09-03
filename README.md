@@ -52,34 +52,48 @@
 
 ## 整体架构
 
+```mermaid
+flowchart TB
+    classDef entry fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#1e293b
+    classDef phase fill:#fff1f2,stroke:#fb7185,stroke-width:1.5px,color:#9f1239
+    classDef tool  fill:#ecfdf5,stroke:#34d399,stroke-width:1.5px,color:#065f46
+    classDef auto  fill:#ecfdf5,stroke:#34d399,stroke-width:1.5px,color:#065f46,stroke-dasharray:5 4
+    classDef store fill:#faf5ff,stroke:#c084fc,stroke-width:1.5px,color:#581c87
+
+    subgraph L1["用户入口"]
+        direction LR
+        CLI["💻 tech-learner · CLI"]:::entry
+        WEB["🌐 tech-learner-web · Web"]:::entry
+    end
+
+    subgraph L2["🧭 Coach Agent · 中枢大脑"]
+        direction LR
+        S["问卷 survey<br/>画像与诊断"]:::phase --> P["规划 planning<br/>学习路线"]:::phase --> C["陪练 coaching<br/>对话驱动"]:::phase
+    end
+
+    subgraph L3["🧰 四件套基础能力"]
+        direction LR
+        COLLECT["📚 collect<br/>资料收集"]:::tool
+        READ["📖 read<br/>文档解读"]:::tool
+        ASK["💬 ask<br/>问我的笔记"]:::tool
+        NOTE["📝 note<br/>知识沉淀 · 后台自动"]:::auto
+    end
+
+    subgraph L4["💾 持久化"]
+        direction LR
+        KB["🧠 知识库 + 语义索引<br/>knowledge/ · .chroma/"]:::store
+        PROFILE["👤 画像 + 学习路线<br/>learner/ · roadmaps/"]:::store
+        SESS["🗄 会话快照<br/>.graph/checkpoints.sqlite"]:::store
+    end
+
+    L1 --> L2
+    L2 -- "作为工具调度" --> L3
+    L3 -- "沉淀 · 检索" --> L4
+
+    linkStyle default stroke:#94a3b8,stroke-width:1.5px
 ```
-              ┌─────────────────────────────────────────────────────┐
-              │              Coach Agent (route)                    │
-              │   问卷 → 规划 → 陪练，项目的中枢大脑                  │
-              │   负责编排 / 记忆 / 上下文 / 护栏                    │
-              └───────┬──────────────┬──────────────┬───────────────┘
-                      │              │              │
-         ┌────────────┘              │              └────────────┐
-         ▼                           ▼                           ▼
-   ┌───────────┐              ┌───────────┐               ┌───────────┐
-   │  collect  │              │   read    │               │    ask    │
-   │  资料收集  │              │  文档解读  │               │ 问我的笔记 │
-   └───────────┘              └───────────┘               └───────────┘
-                                    │ 记忆系统（note / ask 确定性接入）
-                                    ▼
-   ┌───────────┐   ┌──────────────────────────────┐   ┌───────────┐
-   │   note    │◄──┤   ① 确定性沉淀写入（后台，不阻塞）├──►  知识库    │
-   │  知识沉淀  │   │   ② 确定性检索注入（提问先查库） │   knowledge/ │
-   └───────────┘   │   ③ 冲突解决（以新为准 + 报告）  │   + .chroma/ │
-                   │   ④ 三舱摘要自我整理            │   └───────────┘
-                   └──────────────┬────────────────┘
-                                  ▼
-                   ┌───────────────┴───┐   ┌──────────────────┐
-                   │  画像 + 学习路线    │   │ 对话历史 / 会话状态 │
-                   │  learner/roadmaps │   │ .graph/          │
-                   └───────────────────┘   │ checkpoints.sqlite│
-                                           └──────────────────┘
-```
+
+> 图中只画主干：note 由记忆系统后台自动触发（缓冲 ≥6 回合 / ≥2500 字），提问时先查知识库（命中 ≥0.65 自动注入），上下文压缩时增量整理「三舱记忆」（事实 / 未决 / 脉络）。
 
 **角色分工**：`collect` / `read` / `note` / `ask` 是四个**确定性、可独立使用**的基础能力；`route`（Coach Agent）是项目的**编排中枢**，它像一位真正的教练——先了解你（问卷），再为你定制学习路线（规划），然后陪你一步步执行（陪练），并在过程中把 `collect`、`read`、`ask` 作为自己的工具来调度，同时通过记忆系统持续读写你的知识库。
 
@@ -119,12 +133,18 @@ cp .env.example .env
 
 | 变量                  | 来源                                                    | 说明                                                  |
 | ------------------- | ----------------------------------------------------- | --------------------------------------------------- |
-| `OPENAI_API_KEY`    | [阿里云百炼](https://bailian.console.aliyun.com)           | DashScope API Key（本项目走百炼的 OpenAI 兼容接口）              |
-| `OPENAI_BASE_URL`   | 固定值                                                   | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
-| `MODEL_NAME`        | 百炼控制台                                                 | 大模型名（如 `glm-5`）                                     |
+| `OPENAI_API_KEY`    | 你的 OpenAI 兼容服务商（默认[阿里云百炼](https://bailian.console.aliyun.com)） | LLM API Key——`OPENAI_BASE_URL` 指向谁就填谁的 key             |
+| `OPENAI_BASE_URL`   | 默认百炼，可换任意兼容服务（见下）                                      | 默认 `https://dashscope.aliyuncs.com/compatible-mode/v1`；chat 走 OpenAI 兼容协议，整组变量切到 OpenAI 官方 / DeepSeek / Ollama 等即可换服务 |
+| `MODEL_NAME`        | 你所选服务控制台                                            | 大模型名（默认例 `glm-5`；随 `OPENAI_BASE_URL` 切换同步改）          |
 | `TAVILY_API_KEY`    | [tavily.com](https://tavily.com)                      | 网页搜索                                                |
 | `FIRECRAWL_API_KEY` | [firecrawl.dev](https://firecrawl.dev)                | 网页抓取                                                |
 | `GITHUB_TOKEN`      | [GitHub Settings](https://github.com/settings/tokens) | **可选**，collect 质量预筛查星数用，不填自动跳过                      |
+
+> **切换 LLM 服务商（可选）**：本项目 LLM 调用统一走 **OpenAI 兼容协议**，默认指向百炼、不绑定百炼——想用 OpenAI 官方 / DeepSeek / 硅基流动 / 本地 Ollama 等，把 `OPENAI_BASE_URL` 换成该服务的兼容端点，`OPENAI_API_KEY`、`MODEL_NAME` 同步替换即可。
+>
+> **chat / embedding 异源（可选）**：默认 embedding 走上面的 `OPENAI_API_KEY` / `OPENAI_BASE_URL`（与 chat 同源，零额外配置）。若想走其他embedding服务（如 chat=DeepSeek、embedding=硅基流动），需要补 `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` /`EMBEDDING_MODEL`。
+> 
+> **如果中途切换 embedding 端点/模型，需重建语义索引**（Chroma 集合配置会随之变化）：删掉 `.chroma/` 后重新 `python -m src.cli index`。
 
 ### 3. 两种使用方式
 
@@ -359,10 +379,10 @@ src/
 │   ├── hybrid.py           #   混合检索重排规则
 │   └── quality.py          #   资料质量预筛打分
 ├── adapters/               # 基础设施层：外部 I/O
-│   ├── llm.py              #   LLM 调用（DashScope OpenAI 兼容）
+│   ├── llm.py              #   LLM 调用（OpenAI 兼容）
 │   ├── search.py           #   Tavily 搜索
 │   ├── fetch.py            #   Firecrawl 抓取
-│   ├── embedding.py        #   DashScope 向量化
+│   ├── embedding.py        #   OpenAI 兼容向量化
 │   ├── vector.py           #   Chroma 向量库（索引 / 混合检索 / 对账）
 │   ├── learner.py          #   画像 / 路线文件读写
 │   └── store.py            #   知识库文件存储 + 笔记匹配
@@ -397,6 +417,8 @@ roadmaps/    学习路线           .graph/     会话状态（checkpointer）
 | `COACH_SUMMARY_MAX_CHARS`              | `600`                | 脉络舱字符上限                             |
 | `QA_USE_HYBRID`                        | `true`               | 混合检索（dense + BM25 + RRF）开关          |
 | `RAG_CHUNK_SIZE` / `RAG_CHUNK_OVERLAP` | `800` / `100`        | 文档切块参数                              |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | 回落 `OPENAI_*`    | 独立 embedding 端点（chat / embedding 异源，可选）    |
+| `EMBEDDING_BATCH_SIZE`                 | `10`                  | embedding 单请求批量上限（10=百炼限额，换服务可调大）        |
 | `WEB_HOST` / `WEB_PORT`                | `127.0.0.1` / `8000` | Web 服务地址                            |
 
 ***
@@ -418,11 +440,11 @@ pytest
 
 - **语言**：Python 3.11+
 
-- **LLM**：阿里云百炼 DashScope（OpenAI 兼容接口，模型由 `MODEL_NAME` 配置）
+- **LLM**：OpenAI 兼容接口（默认阿里云百炼 DashScope；`OPENAI_BASE_URL` / `MODEL_NAME` 指向任意兼容服务即可整组切换）
 
 - **编排**：LangGraph + SqliteSaver checkpointer（中断 / 恢复 / 跨会话持久化）
 
-- **语义检索**：Chroma（本地 `.chroma/`）+ DashScope `text-embedding-v3` + BM25 混合检索（RRF 融合 + 词法软重排）
+- **语义检索**：Chroma（本地 `.chroma/`）+ `text-embedding-v3`（默认百炼，可异源配置）+ BM25 混合检索（RRF 融合 + 词法软重排）
 
 - **搜索 / 抓取**：Tavily / Firecrawl
 

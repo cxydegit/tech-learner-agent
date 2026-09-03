@@ -35,8 +35,15 @@ class Config:
     KNOWLEDGE_DIR: Path = BASE_DIR / "knowledge"
 
     # RAG / Embedding 配置
-    # Embedding 后端：阿里云百炼 text-embedding-v3（走现有 OPENAI_BASE_URL 兼容端点，零新依赖）
+    # Embedding 后端：OpenAI 兼容 embeddings（默认百炼 text-embedding-v3；端点可异源，见下）
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
+    # 独立 Embedding 端点（chat / embedding 异源支持）：
+    # 不设 → 回落 OPENAI_*（与旧行为一致，存量 .env 零改动）；
+    # 设了 → embedding 走独立 key/端点，解锁「chat=DeepSeek、embedding=OpenAI/百炼」等组合。
+    EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL", "")
+    # embeddings 单请求批量上限（默认 10 是百炼限额；OpenAI 官方上限更高（2048），换服务按需调整）
+    EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
     # Chroma 本地持久化目录（运行时生成，已加入 .gitignore）
     CHROMA_DIR: Path = BASE_DIR / ".chroma"
     RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "5"))

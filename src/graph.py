@@ -361,8 +361,25 @@ def qa_node(state: LearnState) -> dict:
     # sources 精简版写进 conversation（含 path/topic/similarity，供前端来源卡片），去 snippet 控体积
     src = [{"path": s.get("path"), "topic": s.get("topic"), "similarity": s.get("similarity")}
            for s in result["sources"]]
-    return {"qa_history": [exchange], "last_output": out,
-            "conversation": _conversation(state, out, "qa", sources=src)}
+    # 纯 ask 会话（从未 collect、无 tech）固化标题：用首个问题命名，
+    # 避免会话列表恒显示"新会话"。已有 title/tech 的会话不覆盖（collect 固化优先）。
+    updates: dict = {"qa_history": [exchange], "last_output": out,
+                     "conversation": _conversation(state, out, "qa", sources=src)}
+    if not (state.get("title") or "").strip() and not (state.get("tech") or "").strip():
+        updates["title"] = _ask_title(question)
+    return updates
+
+
+# ask 会话命名：取问题主干（去掉末尾标点/语气词），过长截断加省略号
+def _ask_title(question: str, max_chars: int = 20) -> str:
+    t = (question or "").strip().rstrip("？?。！!~～ ")
+    if not t:
+        return ""
+    if len(t) <= max_chars:
+        return t
+    # 按字符截断到 max_chars-1（预留省略号 1 字符位），并剥掉截断处可能的半个标点
+    cut = t[: max_chars - 1].rstrip("，,：:、;； ")
+    return cut + "…"
 
 
 def _render_qa(result: dict) -> str:
