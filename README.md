@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](./pyproject.toml)
-[![CI](https://img.shields.io/badge/CI-passing-brightgreen.svg)](./.github/workflows/ci.yml)
+[![CI](https://github.com/cxydegit/tech-learner-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/cxydegit/tech-learner-agent/actions/workflows/ci.yml)
 
 > 一个**自带记忆**的技术学习陪练 Agent：收集资料 → 解读文档 → 沉淀笔记 → 问自己的笔记，再由一个 Coach Agent 串成「问卷 → 规划 → 陪练」的完整学习闭环。
 
