@@ -1,4 +1,4 @@
-"""记忆系统 Step 1 v2 单测：并行沉淀（后台线程 + 内存侧信道）——fire / drain / 超时兜底 / e2e。
+"""记忆系统单测：并行沉淀（后台线程 + 内存侧信道）—— fire / drain / 超时兜底 / e2e。
 
 零网络：monkeypatch note_pipeline / run_memory_sweep / _start_sweep_thread。
 
@@ -23,7 +23,7 @@ from src.graph import build_graph
 
 _BUF = [{"role": "assistant", "content": "讲解一"}, {"role": "user", "content": "懂了"},
         {"role": "assistant", "content": "讲解二"}, {"role": "user", "content": "继续"}]
-_NOW = datetime.now().isoformat(timespec="seconds")
+_NOW = datetime.now().isoformat(timespec="seconds")  # noqa: DTZ005 —— 与 graph.isoformat 保持 naive 字符串以做陈旧比较
 _STALE = "2000-01-01T00:00:00"
 
 

@@ -1,4 +1,4 @@
-"""记忆系统 Step 1 单测：确定性写触发（run_memory_sweep + coach_memory_write + 图级 e2e）。
+"""记忆系统单测：确定性写触发（run_memory_sweep + coach_memory_write + 图级 e2e）。
 
 零网络：monkeypatch note_pipeline / persist_points / run_memory_sweep。
 
@@ -17,7 +17,6 @@ import src.graph as graph_mod
 import src.pipelines.route as route_mod
 from src.config import config
 from src.graph import build_graph
-
 
 # ============ run_memory_sweep（route.py 纯函数） ============
 
@@ -132,7 +131,7 @@ def test_write_below_threshold_preserves_buffer(monkeypatch):
 
 
 def test_write_triggers_on_turns_and_clears(monkeypatch):
-    # pinned 到 ASYNC=false：v1 同步路径（逃生舱），触发即应用
+    # pinned 到 ASYNC=false：同步路径（与 _async 文件的后台线程对照），触发即应用
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 10000)
@@ -154,7 +153,7 @@ def test_write_triggers_on_turns_and_clears(monkeypatch):
 
 
 def test_write_triggers_on_chars(monkeypatch):
-    # pinned 到 ASYNC=false：v1 同步路径（逃生舱）
+    # pinned 到 ASYNC=false：同步路径（与 _async 文件的后台线程对照）
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 100)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 5)  # buffer 必然超
@@ -169,7 +168,7 @@ def test_write_triggers_on_chars(monkeypatch):
 
 
 def test_write_pending_sets_state(monkeypatch):
-    # pinned 到 ASYNC=false：v1 同步路径（逃生舱）
+    # pinned 到 ASYNC=false：同步路径（与 _async 文件的后台线程对照）
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_TURNS", 2)
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_CHARS", 10000)
@@ -238,7 +237,7 @@ def _run(graph, gconfig, payload, replies, *, max_iters=60):
 
 def test_e2e_coaching_sweep_auto_persist(monkeypatch, tmp_path):
     """coaching 连续 2 回合（阈值调低）→ 确定性触发自动沉淀，buffer 清空。
-    pinned 到 ASYNC=false：v1 同步路径（逃生舱）的确定性 e2e。"""
+    pinned 到 ASYNC=false：同步路径的确定性 e2e。"""
     monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
     monkeypatch.setattr(config, "LEARNER_DIR", tmp_path / "learner")
     monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", False)

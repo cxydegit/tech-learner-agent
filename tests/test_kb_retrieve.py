@@ -1,4 +1,4 @@
-"""记忆系统 Step 2 单测：确定性读路由（run_kb_retrieve + coach_kb_retrieve + 提示词注入 + 图级 e2e）。
+"""记忆系统单测：确定性读路由（run_kb_retrieve + coach_kb_retrieve + 提示词注入 + 图级 e2e）。
 
 零网络：monkeypatch _search_notes / run_kb_retrieve / chat_with_tools。
 
@@ -17,7 +17,6 @@ import src.graph as graph_mod
 import src.pipelines.route as route_mod
 from src.config import config
 from src.graph import build_graph
-
 
 # ============ run_kb_retrieve（route.py 纯函数） ============
 

@@ -1,4 +1,4 @@
-"""记忆系统 Step 3 单测：合并时矛盾识别（merge_notes JSON 解析 + persist_points 收集 + 各展示点透出）。
+"""记忆系统单测：合并时矛盾识别（merge_notes JSON 解析 + persist_points 收集 + 各展示点透出）。
 
 零网络：monkeypatch generate_text / persist_note / merge_notes / persist_points。
 

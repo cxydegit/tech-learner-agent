@@ -1,4 +1,4 @@
-"""Markdown 感知分块器（chunker v2）结构性单测（无网络）。
+"""Markdown 感知分块器结构性单测（无网络）。
 
 覆盖 chunk_markdown 的核心不变量：
 - 长表格 / 长代码围栏整体原子成块，绝不按字符硬切
@@ -48,7 +48,7 @@ def test_long_table_stays_whole():
     while start < len(lines) and not lines[start].lstrip().startswith("|"):
         start += 1
     body = lines[start:]
-    assert body and all(l.lstrip().startswith("|") for l in body)
+    assert body and all(line.lstrip().startswith("|") for line in body)
 
 
 # 2. 长代码围栏整体完整，围栏成对闭合
@@ -152,14 +152,14 @@ def test_real_corpus_no_cell_fragment():
 
     for c in chunks:
         lines = c.text.splitlines()
-        if not any(l.lstrip().startswith("|") for l in lines):
+        if not any(line.lstrip().startswith("|") for line in lines):
             continue
         # 跳过章节前缀行（前缀不以 | 开头），从首个表格行起整块都应是表格行
         start = 0
         while start < len(lines) and not lines[start].lstrip().startswith("|"):
             start += 1
         body = lines[start:]
-        assert body and all(l.lstrip().startswith("|") for l in body), (
+        assert body and all(line.lstrip().startswith("|") for line in body), (
             f"表格被切开或夹带正文: …{c.text[:100]!r}"
         )
 

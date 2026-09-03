@@ -1,4 +1,4 @@
-"""coach 循环骨架单测（Step 2 + 部分 Step 3 路由）：survey 全流程 / 退出意图 / 工具护栏。
+"""coach 循环骨架单测：survey 全流程 / 退出意图 / 工具护栏。
 
 零网络：monkeypatch graph 模块的 chat_with_tools 为脚本化响应，驱动 interrupt/resume。
 
@@ -42,7 +42,7 @@ def _run(graph, gconfig, payload, replies, *, max_iters=60):
 
 
 def _scripted_survey_chat(system_prompt, messages, tools):
-    """按 system_prompt 中的字段标签返回固定提问（Step 2 无工具调用）。"""
+    """按 system_prompt 中的字段标签返回固定提问（问卷阶段无工具调用）。"""
     if "路线规划助手" in system_prompt:
         return {"content": "路线已初步生成：\n- 阶段1 环境搭建（4h）\n- 阶段2 核心概念（8h）\n请确认或提出修改。",
                 "tool_calls": []}
@@ -185,7 +185,7 @@ def test_coach_llm_tool_calls_passthrough(monkeypatch):
     assert last["tool_calls"][0]["function"]["name"] == "get_roadmap"
 
 
-# ---------- Step 3：planning 端到端（问卷 → 路线生成 → 确认 → coaching） ----------
+# ---------- planning 端到端（问卷 → 路线生成 → 确认 → coaching） ----------
 
 def _scripted_planning_chat(system_prompt, messages, tools):
     """问卷固定提问 + planning 阶段脚本化工具调用（generate → 呈现 → confirm）。"""
@@ -242,7 +242,7 @@ def test_planning_generates_roadmap_and_confirms(monkeypatch, tmp_path):
     assert interrupts[6]["mode"] == "planning"
 
 
-# ---------- Step 4：coaching 工具端到端 + 上下文压缩 ----------
+# ---------- coaching 工具端到端 + 上下文压缩 ----------
 
 def _scripted_coaching_chat(system_prompt, messages, tools):
     """问卷 + planning（生成/确认路线）+ coaching（collect → 勾选里程碑 → 结束）。"""
@@ -395,9 +395,8 @@ def test_coach_trim_initializes_survey():
     assert out["survey_field"] == "self_level"
 
 
-# ---------- Step 4：note → 合并确认 → note_commit 端到端 ----------
-
-# （已移除）coaching 不再暴露 note/note_commit 工具：学习内容由自动沉淀（Step 1 v2 后台线程 +
-# 确定性候选确认 coach_candidate_confirm）覆盖，agent 手动 note 会同步阻塞对话。
-# 候选确认 e2e 见 test_memory_sweep.py::test_e2e_coaching_sweep_candidates_need_user 与
-# test_memory_sweep_async.py::test_candidate_confirm_node。
+# ---------- note 端到端：候选确认由自动沉淀覆盖，coaching 不再暴露 note/note_commit ----------
+#
+# 学习内容由自动沉淀（后台线程 + coach_candidate_confirm 候选确认）覆盖，
+# 候选确认 e2e 见 test_memory_sweep.py::test_e2e_coaching_sweep_candidates_need_user
+# 与 test_memory_sweep_async.py::test_candidate_confirm_node。

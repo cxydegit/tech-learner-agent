@@ -1,7 +1,7 @@
-"""I1 不变量断言（RISKS.md 隐患 8）：`import src.cli` 不得把 chromadb/langgraph 放入 sys.modules。
+"""I1 不变量断言：`import src.cli` 不得把 chromadb/langgraph 放入 sys.modules。
 
 守护点：cli.py 顶层只 import 轻量管道；重依赖（chromadb/vector、langgraph/graph）全部
-函数内 lazy。Step 4 的 qa.py 用 `_search_notes` 函数内 lazy import vector 守住此条。
+函数内 lazy。qa.py 的 `_search_notes` 走函数内 lazy import vector 守住此条。
 
 运行：PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m pytest tests/test_i1.py -v
 """

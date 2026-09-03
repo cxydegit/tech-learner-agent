@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.domain.hybrid import build_bm25, lexical_rerank, rrf_fuse, tokenize
 
-
 # ---------- tokenize ----------
 
 def test_tokenize_english_and_chinese_char():

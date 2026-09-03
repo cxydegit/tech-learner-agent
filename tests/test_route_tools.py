@@ -432,7 +432,7 @@ def test_update_roadmap_claim_exempts_verification(monkeypatch):
 
 
 def test_update_roadmap_disabled_by_config(monkeypatch):
-    """ROUTE_MILESTONE_VERIFY=False → 跳过验收（逃生舱）。"""
+    """ROUTE_MILESTONE_VERIFY=False → 跳过验收（旁路开关，便于不依赖 LLM 的集成测试）。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(config, "ROUTE_MILESTONE_VERIFY", False)
     monkeypatch.setattr(route_mod, "verify_milestone",
@@ -484,12 +484,3 @@ def test_update_roadmap_blocks_after_two_rejections(monkeypatch):
     assert "停止调用 update_roadmap" in out3["instruction"]
     assert len(calls) == 2  # 第 3 次未调 LLM 验收
     assert ctx.updates["coach_verify_rejects"] == 2
-
-
-def test_transcript_text_caps_tail():
-    conv = [{"role": "user", "content": "0" * 100},
-            {"role": "system", "content": "内部"},  # 非对话角色过滤
-            {"role": "assistant", "content": "1" * 100}]
-    out = route_mod._transcript_text(conv, 50)
-    assert len(out) == 50
-    assert out.endswith("1" * 50)

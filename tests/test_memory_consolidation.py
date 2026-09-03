@@ -1,4 +1,4 @@
-"""记忆系统 Step 4 单测：三舱记忆整理（consolidate_memory + coach_trim 三舱写入 + coaching 提示词注入）。
+"""记忆系统单测：三舱记忆整理（consolidate_memory + coach_trim 三舱写入 + coaching 提示词注入）。
 
 零网络：monkeypatch generate_text。
 
@@ -13,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import src.graph as graph_mod
 import src.pipelines.route as route_mod
 from src.config import config
-
 
 _OK_JSON = ('{"facts_add": ["用户偏好类比讲解"], "open_add": ["AOP 切面顺序还没搞懂"], '
             '"resolved": [2], "context": "最近学了 Spring AOP。"}')

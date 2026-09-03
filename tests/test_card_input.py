@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.domain.card_input import parse_card_input
 
-
 # ---------- collect ----------
 
 def test_collect_tech_only():

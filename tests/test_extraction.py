@@ -12,7 +12,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.domain.extraction import as_list, extract_json_object, parse_classify, parse_entries
 
-
 # ---------- extract_json_object ----------
 
 def test_extract_json_object_simple():

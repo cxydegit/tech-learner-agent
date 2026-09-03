@@ -14,7 +14,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.domain.quality import _star_bonus, screen_results
 
-
 QUALITY = dict(
     official_domains={"python.org"},
     platform_domains={"github.com", "stackoverflow.com"},

@@ -19,7 +19,6 @@ from src.domain.dedup import (
     strip_note_header,
 )
 
-
 # ---------- sanitize_filename ----------
 
 def test_sanitize_filename_basic():
@@ -91,7 +90,7 @@ def test_strip_note_header_plain_body():
     assert strip_note_header("## 是什么\n正文") == "## 是什么\n正文"
 
 
-# ---------- 去重标题 fast-path（RAG_OPTIMIZATION P0 压力测试后重构） ----------
+# ---------- 去重标题 fast-path（重写标题前先走词法匹配，省一次 LLM 判定） ----------
 
 def test_parse_tags_from_header():
     assert _parse_tags("# 主题\n\n> 日期：2026-08-09\n> 标签：#Redis #数据结构 #选型\n\n正文") == [

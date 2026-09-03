@@ -12,8 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.pipelines.collect import _excluded_summary, materials_filename
 
-
-# ---------- materials 文件名（时间版本号，Step 5 验收发现覆盖 bug） ----------
+# ---------- materials 文件名（带时间版本号避免覆盖） ----------
 
 def test_materials_filename_has_timestamp_version():
     """每次运行带 MMDD-HHMM 时间版本号，区分多次询问。"""

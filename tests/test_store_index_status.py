@@ -1,7 +1,7 @@
-"""P3.1 索引失败状态化 + 对账补缺失的单测（零网络）。
+"""索引失败状态化 + 对账补缺失的单测（零网络）。
 
-背景（8-19 事故）：`_update_rag_index` 曾用 `except: pass` 静默吞掉索引失败，
-4 篇笔记「保存成功但检索不到」，缺口留存 6 天。本组测试锁住三个行为：
+背景：`_update_rag_index` 曾用 `except: pass` 静默吞掉索引失败，
+4 篇笔记「保存成功但检索不到」，缺口留存。本组测试锁住三个行为：
 1. 索引失败时笔记仍写盘成功，且返回值带 index_ok=False + 原因（对调用方可见）；
 2. 瞬时失败立即重试一次（重试成功则 index_ok=True）；
 3. 对账补缺失：磁盘有而索引无的文件被补齐，孤儿分块被删除，/ask 路径限量。
@@ -16,9 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import src.adapters.store as store_mod
 import src.adapters.vector as vector_mod
-from src.adapters.store import persist_note, _update_rag_index
+from src.adapters.store import _update_rag_index, persist_note
 from src.config import config
-
 
 # ============ _update_rag_index：状态化 + 重试 ============
 
