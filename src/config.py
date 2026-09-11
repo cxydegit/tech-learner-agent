@@ -22,6 +22,15 @@ class Config:
     # LLM 配置
     LLM_MODEL: str = os.getenv("MODEL_NAME", "")
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+    # 单次请求超时（秒）：SDK 默认 600s（10 分钟），交互式 coach 循环会被挂死，必须收紧
+    LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "45"))
+    # 重试预算（工具调用通道）：瞬时错误（连接/超时/429/5xx）最多尝试 LLM_MAX_ATTEMPTS 次，
+    # 且全部尝试合计不超过 LLM_RETRY_BUDGET_SECONDS（从首次请求起算，超预算立即降级）。
+    # 退避 = LLM_RETRY_BASE_DELAY × 2^第几次 + 抖动。确定性错误（key/模型名/请求体不合法）
+    # 不重试——重试一万次也不会有不同结果。整个调用最长 ≈ 预算 + 一次请求超时（降级那次）。
+    LLM_MAX_ATTEMPTS: int = int(os.getenv("LLM_MAX_ATTEMPTS", "3"))
+    LLM_RETRY_BUDGET_SECONDS: float = float(os.getenv("LLM_RETRY_BUDGET_SECONDS", "90"))
+    LLM_RETRY_BASE_DELAY: float = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
 
     # Agent 是否使用原生 function calling（true）或文本正则解析（false）。
     # 默认 false：阿里云百炼 qwen3.7-plus 等模型不返回原生 tool_calls（返回文本形式），
@@ -84,12 +93,14 @@ class Config:
     ROUTE_RECURSION_LIMIT: int = int(os.getenv("ROUTE_RECURSION_LIMIT", "50"))
 
     # 上下文管理：coach 模型上下文每次只带最近 N 轮。
-    # 「轮」= 一条 user 消息 + 其后到下一个 user 之前的全部消息（工具调用往返算在同一轮内）——
-    # 切点必须落在 user 消息上，否则会把 tool 回执跟它的 assistant(tool_calls) 切散
-    # 因此实际保留条数随工具调用密度浮动：实测 4 轮≈10 条 / 10 轮≈32~39 条，
-    # 单次请求约 3~12K token（固定注入 ≈1.2K），远低于模型窗口。
-    COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "10"))
-    # 消息总数超过此值触发压缩（保留窗口不足这么多条时不裁）
+    # 「轮」= 一条 user 消息 + 其后到下一个 user 之前的全部消息（工具调用往返算在同一轮内）。
+    # 切点只落在 user 消息上——否则会把 tool 回执与它的 assistant(tool_calls) 切散，
+    # 产生模型直接拒收的非法消息序列。因此实际保留条数随工具调用密度浮动：
+    # 实测每轮均值 3.3 条，保留 5 轮 ≈ 16~21 条。
+    # 取值同时决定压缩频率：窗口留得越大，攒到 COACH_COMPRESS_AT 越快、压缩越频。
+    # 实测（200 轮模拟）保留 5 轮 ≈ 57 次压缩，保留 10 轮 ≈ 174 次。
+    COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "5"))
+    # 消息总数超过此值触发压缩；每次裁剪至少丢掉 (此值 − 保留窗口) 条
     COACH_COMPRESS_AT: int = int(os.getenv("COACH_COMPRESS_AT", "40"))
     # 记忆系统：三舱记忆整理——LLM 只看新消息产增量，确定性代码管积累（防重写衰减）。
     # 事实/未决舱永不被 LLM 重写，只有机械上限；脉络舱允许衰减（外部真相兜底）+字符上限。

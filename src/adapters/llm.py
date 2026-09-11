@@ -5,10 +5,12 @@
 """
 
 import json
+import random
 import re
+import time
 from datetime import datetime
 
-from openai import OpenAI
+from openai import APIConnectionError, APIStatusError, OpenAI
 
 from ..config import config
 from ..domain.extraction import parse_json_object
@@ -64,7 +66,102 @@ def generate_text(system_prompt: str, user_content: str) -> str:
 
 
 class ToolCallError(Exception):
-    """工具调用通道持久失败（重试 + 回退后仍失败），由 graph 层降级处理。"""
+    """工具调用通道持久失败（重试 + 回退后仍失败），由 graph 层降级处理。
+
+    fatal=True 表示确定性错误（鉴权失效 / 模型名不存在等）：重试与降级都不会有
+    不同结果。调用方据此换提示语——此时让用户"稍后再试"是骗他，等多久都不会好。
+    """
+
+    def __init__(self, message: str, *, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
+
+
+# 降级（去掉 tools）请求的系统提示词后缀：必须显式告知模型工具没了。
+# 不告知的话提示词里仍写着"你可以用工具推进学习：collect / read / update_roadmap…"，
+# 模型会输出"好的，我已经为你生成了路线"这类叙述式假成功——用户看不出什么都没落库。
+FALLBACK_SYSTEM_SUFFIX = (
+    "\n\n【系统状态】本次调用的工具通道不可用：你这次无法调用任何工具。"
+    "请直接用纯文本回复用户；严禁声称你已完成任何需要工具才能完成的动作"
+    "（生成/修改路线、勾选里程碑、收集资料、解读文档、写入笔记等）。"
+    "用户的要求若必须借助工具，就直接说明现在无法执行、建议稍后重试。"
+)
+
+_client: OpenAI | None = None
+
+
+def _get_client() -> OpenAI:
+    """进程内单例（复用连接池）+ 显式超时/重试策略。
+
+    max_retries=0：关掉 SDK 内置重试，避免与外层重试叠乘（曾出现 3 外层 × 3 内置
+    = 9 次请求）。重试与退避统一在 chat_with_tools 里做，次数和总耗时都可封顶。
+    timeout：SDK 默认 600s 会把交互式 coach 循环挂死，必须显式收紧。
+    """
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            base_url=config.OPENAI_BASE_URL,
+            timeout=config.LLM_REQUEST_TIMEOUT,
+            max_retries=0,
+        )
+    return _client
+
+
+# 异常分档（见 _classify）：原样重试 / 不重试但可降级 / 两类都不做
+_RETRY, _DEGRADE, _ABORT = "retry", "degrade", "abort"
+
+# 可重试的状态码（超时 / 冲突 / 限流；≥500 另行判断）：其余 4xx 都是"请求本身不合法"
+_RETRY_STATUS = frozenset({408, 409, 429})
+# 请求体不合法：可能就是 tools 定义不被该模型支持 → 不重试，但值得降级一试。
+# 其余 4xx（401/403/404 鉴权与模型名等）归 _ABORT：降级请求只少了 tools，必然同样失败。
+_PAYLOAD_STATUS = frozenset({400, 422})
+
+
+def _classify(e: Exception) -> str:
+    """按「重试能不能改变结果」给异常分档。"""
+    if isinstance(e, APIConnectionError):  # 含 APITimeoutError：连接失败 / 超时
+        return _RETRY
+    if isinstance(e, APIStatusError):
+        if e.status_code in _RETRY_STATUS or e.status_code >= 500:
+            return _RETRY
+        return _DEGRADE if e.status_code in _PAYLOAD_STATUS else _ABORT
+    # 非 SDK 异常 = 本模块或 SDK 内部的 bug（响应结构异常 / 类型错），重试无意义，
+    # 也不能包装成"模型暂时不可用"骗用户重试——原样抛出让它显形。
+    return _ABORT
+
+
+def _is_deterministic(e: Exception) -> bool:
+    """请求本身不合法（4xx 里除瞬时状态码外）：重试不会有不同结果。
+
+    降级那次也吃确定性错误 → 说明与 tools 无关，整条通道本轮没救。
+    """
+    return (isinstance(e, APIStatusError)
+            and 400 <= e.status_code < 500
+            and e.status_code not in _RETRY_STATUS)
+
+
+def _fatal_message(e: APIStatusError) -> str:
+    """确定性错误的用户可读文案：HTTP 码 + 该码最可能的原因。
+
+    笼统的"暂时不可用/请稍后再试"
+    会把排查带偏——原因要具体，用户才知道该看 key、模型名，还是会话历史。
+    """
+    hint = {
+        401: "API key 无效", 403: "无权限", 404: "模型名不存在",
+        400: "请求被拒绝（参数或会话历史不合法）", 422: "请求参数不合法",
+    }.get(e.status_code, "请求被拒绝")
+    return f"HTTP {e.status_code}（{hint}）：{str(e.message)[:200]}"
+
+
+def _backoff_delay(attempt: int) -> float:
+    """指数退避 + 抖动：首次故障往往几百毫秒到数秒自愈，立即重试只是白打三次。"""
+    return config.LLM_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.3)
+
+
+def _fallback_messages(system_prompt: str, messages: list[dict]) -> list[dict]:
+    """降级请求的 messages：系统提示词追加「工具不可用」声明（见 FALLBACK_SYSTEM_SUFFIX）。"""
+    return [{"role": "system", "content": system_prompt + FALLBACK_SYSTEM_SUFFIX}, *messages]
 
 
 def _parse_chat_response(msg) -> dict:
@@ -101,36 +198,59 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
         {"content": str | None, "tool_calls": [{id, name, arguments(dict)}], "fallback": bool}
         - 模型决定调用工具：content 可为 None、tool_calls 非空
         - 模型直接回复文本：tool_calls 为空
-        - 持久失败且 config.ROUTE_FALLBACK_TO_TEXT：去掉 tools 再问一次，返回纯文本
-          （fallback=True，调用方可感知降级）
-        - 全部失败：抛 ToolCallError
+        - fallback=True：工具通道持久失败后去掉 tools 再问一次拿到的纯文本。
+          调用方必须当降级处理——该回复**没有执行过任何工具动作**（路线/进度/笔记
+          均未变更），要给用户显式提示，否则会被当成一条正常回复。
+        - 确定性错误（key/模型名/无权限）：抛 ToolCallError（fatal=True），别建议重试
+        - 代码 bug（响应解析等非 SDK 异常）：原样抛出，不包装、不重试
     """
-    messages_payload = [{"role": "system", "content": system_prompt}, *messages]
     kwargs: dict = {
         "model": config.LLM_MODEL,
         "temperature": 0.5,
         "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-        "messages": messages_payload,
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
     }
+    client = _get_client()
+    deadline = time.monotonic() + config.LLM_RETRY_BUDGET_SECONDS
     last_err: Exception | None = None
-    for attempt in range(3):  # 瞬时故障（网络/400）重试
+    for attempt in range(config.LLM_MAX_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break  # 预算耗尽 → 立刻降级，不让用户继续干等
         try:
-            kwargs["tools"] = tools
-            client = OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
-            response = client.chat.completions.create(**kwargs)
-            return _parse_chat_response(response.choices[0].message)
-        except Exception as e:  # noqa: BLE001 —— 网络 / 400 / 解析，尝试重试或降级
+            response = client.chat.completions.create(
+                **kwargs, tools=tools, timeout=min(config.LLM_REQUEST_TIMEOUT, remaining))
+            parsed = _parse_chat_response(response.choices[0].message)
+            parsed["fallback"] = False
+            return parsed
+        except Exception as e:  # noqa: BLE001 —— 按错误性质分流，见 _classify
+            kind = _classify(e)
+            if kind == _ABORT:
+                if isinstance(e, APIStatusError):
+                    raise ToolCallError(_fatal_message(e), fatal=True) from e
+                raise  # 代码 bug：不重试、不包装，直接显形
             last_err = e
+            if kind == _DEGRADE:
+                break  # 本请求没救（如 tools 不被该模型支持）→ 直接进降级
+            delay = _backoff_delay(attempt)
+            if time.monotonic() + delay >= deadline:
+                break  # 退避完就超预算：不如现在降级
+            time.sleep(delay)
     if config.ROUTE_FALLBACK_TO_TEXT:
         try:
-            kwargs.pop("tools", None)
-            client = OpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
-            response = client.chat.completions.create(**kwargs)
+            fallback_kwargs = {**kwargs, "messages": _fallback_messages(system_prompt, messages)}
+            response = client.chat.completions.create(
+                **fallback_kwargs, timeout=config.LLM_REQUEST_TIMEOUT)
             parsed = _parse_chat_response(response.choices[0].message)
             parsed["fallback"] = True
             return parsed
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 —— 降级也失败，只能上报
             last_err = e
+    if last_err is None:  # 首次请求前预算就耗尽：没有真实错误可报，是配置问题
+        raise ToolCallError("重试预算耗尽（请检查 LLM_RETRY_BUDGET_SECONDS）")
+    if _is_deterministic(last_err):
+        # 降级那份请求也被判 4xx → 原因不在 tools，重试无益 → fatal，提示语不再劝重试
+        raise ToolCallError(_fatal_message(last_err), fatal=True) from last_err
     raise ToolCallError(str(last_err)) from last_err
 
 

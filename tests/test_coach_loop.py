@@ -185,6 +185,39 @@ def test_coach_llm_tool_calls_passthrough(monkeypatch):
     assert last["tool_calls"][0]["function"]["name"] == "get_roadmap"
 
 
+def test_coach_llm_fallback_prepends_visible_notice(monkeypatch):
+    """降级回复必须挂显式提示：模型这一轮做不了任何工具动作，用户得知情。"""
+    monkeypatch.setattr(graph_mod, "chat_with_tools",
+                        lambda s, m, t: {"content": "好的，我已经为你生成了路线。",
+                                         "tool_calls": [], "fallback": True})
+    out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
+    last = out["coach_messages"][-1]
+    assert last["role"] == "assistant"
+    assert last["content"].startswith(graph_mod.COACH_DEGRADED_NOTICE)
+    assert "我已经为你生成了路线" in last["content"]  # 模型原话保留，只是加了前缀
+
+
+def test_coach_llm_fatal_error_does_not_suggest_retry(monkeypatch):
+    """确定性错误：明确说重试无用——笼统的"稍后再试"会把用户带到错误方向。"""
+    def _raise(s, m, t):
+        raise graph_mod.ToolCallError("HTTP 401（API key 无效）：invalid key", fatal=True)
+    monkeypatch.setattr(graph_mod, "chat_with_tools", _raise)
+    out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
+    msg = out["coach_messages"][-1]["content"]
+    assert "重试无用" in msg
+    assert "HTTP 401（API key 无效）" in msg  # 原因（llm 层给出）原样透传给用户
+    assert "稍后再试" not in msg
+
+
+def test_coach_llm_transient_error_suggests_retry(monkeypatch):
+    def _raise(s, m, t):
+        raise graph_mod.ToolCallError("Connection error.")
+    monkeypatch.setattr(graph_mod, "chat_with_tools", _raise)
+    out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
+    msg = out["coach_messages"][-1]["content"]
+    assert "稍后再试" in msg and "配置" not in msg
+
+
 # ---------- planning 端到端（问卷 → 路线生成 → 确认 → coaching） ----------
 
 def _scripted_planning_chat(system_prompt, messages, tools):
@@ -383,8 +416,8 @@ def test_coach_trim_compresses_over_threshold(monkeypatch):
 def test_coach_trim_cut_lands_on_user_not_mid_tool_calls(monkeypatch):
     """切点落在 tool 上时退到本轮 user —— 保留段开头绝不能是要丢掉的那条 assistant 的 tool 回执。
 
-    复刻事故现场（docs/coach_trim-tool-accident.md）：老逻辑按条数切会把 30 号
-    assistant(tool_calls) 切走、留下 31 号 tool，消息序列非法 → 模型 400。
+    复刻事故现场：老逻辑按条数切会把 30 号 assistant(tool_calls) 切走、留下 31 号 tool，
+    消息序列非法 → 模型直接拒收整轮请求。
     """
     def turn(i, n_tools=0):
         msgs = [{"role": "user", "content": f"第{i}轮提问"}]
@@ -430,6 +463,28 @@ def test_coach_trim_heals_existing_orphan_tool_messages(monkeypatch):
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     roles = [m.get("role") for m in out["coach_messages"]]
     assert roles == ["assistant", "tool", "user"]  # 孤儿被丢，正常配对保留
+    assert not out.get("coach_summary")
+
+
+def test_coach_trim_keeps_all_when_too_few_turns(monkeypatch):
+    """超阈值但凑不出 KEEP 条 user（全是零散小轮）→ 不裁、不调摘要 LLM，消息原样返回。
+
+    这是切点退到轮起点的代价：宁可这轮不裁，也不能切在消息中间切出无主 tool 回执。
+    """
+    msgs = [m for i in range(8) for m in
+            ({"role": "user", "content": f"u{i}"},
+             {"role": "assistant", "content": f"a{i}"},
+             {"role": "assistant", "content": f"b{i}"},
+             {"role": "assistant", "content": f"c{i}"},
+             {"role": "assistant", "content": f"d{i}"})]                      # 40 条 / 8 轮
+    msgs.append({"role": "tool", "tool_call_id": "ghost", "name": "ask", "content": "{}"})
+    assert len(msgs) > config.COACH_COMPRESS_AT
+    monkeypatch.setattr(route_mod, "generate_text",
+                        lambda s, u: (_ for _ in ()).throw(AssertionError("凑不出轮数时不应触发摘要")))
+    out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
+                                "coach_summary": "", "tech": "X", "survey_answers": {}})
+    # 除孤儿被净化外，消息不因压缩而减少
+    assert [m.get("role") for m in out["coach_messages"]] == [m["role"] for m in msgs[:-1]]
     assert not out.get("coach_summary")
 
 

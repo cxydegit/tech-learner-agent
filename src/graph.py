@@ -405,6 +405,15 @@ def _render_qa(result: dict) -> str:
 
 def _turn_cut_index(msgs: list[dict], keep_turns: int) -> int | None:
     """从后往前数第 keep_turns 条 user 消息的下标（保留窗口的起点）；轮数不够返回 None。
+
+    「轮」= 一条 user 消息 + 其后到下一个 user 之前的全部消息（工具调用往返算同一轮）。
+    只在 user 消息处切：保留段首条恒为 user，不会把 tool 回执跟它配对的
+    assistant(tool_calls) 切散（那种非法序列会被模型直接拒绝）。
+
+    keep_turns 同时是压缩频率的旋钮，方向反直觉：窗口留得越大，裁剪后离
+    COACH_COMPRESS_AT 越近、下次触发越快、压缩越频繁。取值还应保证触发那一刻
+    （约 41 条）窗口里凑得出 N 条 user——每轮均值 3.3 条时 4~5 轮绰绰有余，
+    取到 10 则常凑不出，会卡在「触发却不裁」的空转里让窗口无界增长。
     """
     seen = 0
     for i in range(len(msgs) - 1, -1, -1):
@@ -475,6 +484,14 @@ def coach_trim(state: LearnState) -> dict:
     return updates
 
 
+# 工具通道降级（chat_with_tools 去掉 tools 用纯文本回问）时挂在用户可见回复前的提示。
+# 降级回复与正常回复在界面上长得一样，而这一轮模型做不了任何工具动作（路线/进度/笔记
+# 全都没变）——不显式提示的话，用户会把"我已经为你生成了路线"当成真的。
+COACH_DEGRADED_NOTICE = (
+    "⚠️ 本次工具通道不可用，未执行任何操作（路线 / 进度 / 笔记均未变更）。\n\n"
+)
+
+
 def coach_llm(state: LearnState) -> dict:
     """调用模型（按 mode 注入提示词 + 工具集），追加一条 assistant 消息。"""
     msgs = state.get("coach_messages") or []
@@ -485,12 +502,19 @@ def coach_llm(state: LearnState) -> dict:
             COACH_TOOLS_BY_MODE.get(state.get("mode") or "survey", []),
         )
     except ToolCallError as e:
-        msg = f"⚠️ 模型调用暂时不可用（{e}）。请稍后再试，或输入「结束」退出。"
+        if e.fatal:
+            # 确定性错误（鉴权/模型名/请求不合法）：重试多少次结果都一样，别让用户
+            # 一直"稍后再试"。具体原因由 llm._fatal_message 带在 {e} 里，这里不猜。
+            msg = f"⚠️ 模型调用失败（{e}）。这是确定性错误，重试无用。"
+        else:
+            msg = f"⚠️ 模型调用暂时不可用（{e}）。请稍后再试，或输入「结束」退出。"
         return {"coach_messages": [*msgs, {"role": "assistant", "content": msg}],
                 "last_output": msg}
 
     content = result.get("content")
     tool_calls = result.get("tool_calls") or []
+    if result.get("fallback"):
+        content = COACH_DEGRADED_NOTICE + (content or "")
     if not content and not tool_calls:
         # 模型空输出：给一条内部提示让它重新回复（recursion_limit 兜底防无限空转）
         return {"coach_messages": [*msgs, {"role": "system",
