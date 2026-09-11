@@ -403,20 +403,54 @@ def _render_qa(result: dict) -> str:
 # ============================================================
 
 
+def _turn_cut_index(msgs: list[dict], keep_turns: int) -> int | None:
+    """从后往前数第 keep_turns 条 user 消息的下标（保留窗口的起点）；轮数不够返回 None。
+    """
+    seen = 0
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i].get("role") == "user":
+            seen += 1
+            if seen == keep_turns:
+                return i
+    return None
+
+
+def _sanitize_messages(msgs: list[dict]) -> list[dict]:
+    """丢弃孤儿 tool 消息（tool_call_id 找不到对应 assistant 的 tool_calls）。
+
+    本节点每轮必经，无条件净化即可让存量坏会话在下一轮对话时自愈。
+    """
+    matched: set = set()
+    cleaned = []
+    for m in msgs:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                matched.add(tc.get("id"))
+            cleaned.append(m)
+        elif role == "tool":
+            if m.get("tool_call_id") in matched:
+                cleaned.append(m)
+        else:
+            cleaned.append(m)
+    return cleaned
+
+
 def coach_trim(state: LearnState) -> dict:
     """上下文管理 + 首次初始化。
 
     - 初始化：仅新线程兜底——mode 缺省置 survey、问卷起始字段置 self_level
       （跨会话恢复时两者已在 checkpoint 持久化，本节点不重复初始化）。
+    - 净化：无条件丢弃孤儿 tool 消息（存量坏会话靠它自愈，见 _sanitize_messages）。
     - 压缩：消息总量超 COACH_COMPRESS_AT 时，旧消息经三舱记忆整理（consolidate_memory）
-      增量进 facts / open_items / summary 三舱，只保留最近 COACH_HISTORY_KEEP 轮。
-      LLM 失败时三舱原样保留、消息照常裁剪（保上下文有界）。
+      增量进 facts / open_items / summary 三舱，只保留最近 COACH_HISTORY_KEEP 轮；
+      切点只落在 user 消息上（_turn_cut_index）。LLM 失败时三舱原样保留、消息照常裁剪
+      （保上下文有界）。
 
     ⚠️ 初始化判断要用「带 survey 默认值的有效 mode」，不能用裸 state.mode：
     新线程时它是 None；且本节点写入的 mode 要等返回后才生效。
     """
-    msgs = state.get("coach_messages") or []
-    keep = config.COACH_HISTORY_KEEP * 2  # 一轮 ≈ 一问一答两条
+    msgs = _sanitize_messages(state.get("coach_messages") or [])
     updates: dict = {"coach_messages": msgs}
     mode = state.get("mode") or "survey"
     updates["mode"] = mode
@@ -426,16 +460,18 @@ def coach_trim(state: LearnState) -> dict:
     # 上下文压缩：超阈值 → 三舱记忆增量整理（LLM 只看旧消息产增量，既有积累不过 LLM），
     # 只留最近 N 轮
     if len(msgs) > config.COACH_COMPRESS_AT:
-        old, recent = msgs[:-keep], msgs[-keep:]
+        cut = _turn_cut_index(msgs, config.COACH_HISTORY_KEEP)
+        if cut is None:
+            return updates  # 保留窗口覆盖全部消息（没超过 N 轮），不裁
         mem = consolidate_memory(
             {"facts": state.get("coach_facts") or [],
              "open_items": state.get("coach_open_items") or [],
              "summary": state.get("coach_summary") or ""},
-            old, state.get("tech") or "")
+            msgs[:cut], state.get("tech") or "")
         updates["coach_facts"] = mem["facts"]
         updates["coach_open_items"] = mem["open_items"]
         updates["coach_summary"] = mem["summary"]
-        updates["coach_messages"] = recent
+        updates["coach_messages"] = msgs[cut:]
     return updates
 
 

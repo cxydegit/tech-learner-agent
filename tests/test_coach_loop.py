@@ -366,7 +366,7 @@ def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
 
 
 def test_coach_trim_compresses_over_threshold(monkeypatch):
-    """超阈值 → 三舱记忆整理（LLM 增量），脉络舱写入，消息裁剪到最近 N 轮。"""
+    """超阈值 → 三舱记忆整理（LLM 增量）、脉络舱写入、裁到最近 N 轮，且切点在 user 消息上。"""
     msgs = [{"role": "user", "content": f"消息{i}"} for i in range(config.COACH_COMPRESS_AT + 5)]
     monkeypatch.setattr(route_mod, "generate_text",
                         lambda s, u: '{"facts_add": ["用户偏好类比"], "open_add": [], '
@@ -375,7 +375,62 @@ def test_coach_trim_compresses_over_threshold(monkeypatch):
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     assert out["coach_summary"] == "【压缩摘要】"
     assert out["coach_facts"] == ["用户偏好类比"]  # 事实舱同步积累
-    assert len(out["coach_messages"]) <= config.COACH_HISTORY_KEEP * 2
+    # 保留段 = 最后 KEEP 轮；切点落在第 KEEP 条（从后数）user 消息上
+    assert out["coach_messages"][0]["role"] == "user"
+    assert len(out["coach_messages"]) == config.COACH_HISTORY_KEEP
+
+
+def test_coach_trim_cut_lands_on_user_not_mid_tool_calls(monkeypatch):
+    """切点落在 tool 上时退到本轮 user —— 保留段开头绝不能是要丢掉的那条 assistant 的 tool 回执。
+
+    复刻事故现场（docs/coach_trim-tool-accident.md）：老逻辑按条数切会把 30 号
+    assistant(tool_calls) 切走、留下 31 号 tool，消息序列非法 → 模型 400。
+    """
+    def turn(i, n_tools=0):
+        msgs = [{"role": "user", "content": f"第{i}轮提问"}]
+        if n_tools:
+            ids = [f"call_{i}_{k}" for k in range(n_tools)]
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [{"id": cid, "type": "function",
+                                         "function": {"name": "ask", "arguments": "{}"}}
+                                        for cid in ids]})
+            msgs += [{"role": "tool", "tool_call_id": cid, "name": "ask", "content": "{}"}
+                     for cid in ids]
+        msgs.append({"role": "assistant", "content": f"第{i}轮回复"})
+        return msgs
+
+    msgs = [m for i in range(10) for m in turn(i, n_tools=2)]  # 50 条 / 10 轮
+    monkeypatch.setattr(route_mod, "generate_text",
+                        lambda s, u: '{"facts_add": [], "open_add": [], "resolved": [], "context": ""}')
+    out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
+                                "coach_summary": "", "tech": "X", "survey_answers": {}})
+    kept = out["coach_messages"]
+    assert kept[0]["role"] == "user"  # 切在轮起点，不是 tool 回执
+    matched = set()
+    for m in kept:
+        if m.get("role") == "assistant":
+            matched |= {tc["id"] for tc in m.get("tool_calls") or []}
+        elif m.get("role") == "tool":
+            assert m["tool_call_id"] in matched, "保留段出现无主 tool 回执"
+
+
+def test_coach_trim_heals_existing_orphan_tool_messages(monkeypatch):
+    """存量坏会话：低于阈值不压缩，但在途孤儿 tool 消息照样被净化（重进对话即自愈）。"""
+    msgs = [
+        {"role": "tool", "tool_call_id": "call_ghost", "name": "ask", "content": "{}"},  # 孤儿
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "call_ok", "type": "function",
+                         "function": {"name": "ask", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_ok", "name": "ask", "content": "{}"},
+        {"role": "user", "content": "继续"},
+    ]
+    monkeypatch.setattr(route_mod, "generate_text",
+                        lambda s, u: (_ for _ in ()).throw(AssertionError("不应触发摘要")))
+    out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
+                                "coach_summary": "", "tech": "X", "survey_answers": {}})
+    roles = [m.get("role") for m in out["coach_messages"]]
+    assert roles == ["assistant", "tool", "user"]  # 孤儿被丢，正常配对保留
+    assert not out.get("coach_summary")
 
 
 def test_coach_trim_no_compress_under_threshold(monkeypatch):

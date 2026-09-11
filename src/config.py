@@ -83,10 +83,13 @@ class Config:
     # 图级执行硬上限（LangGraph recursion_limit，防 agent 失控打转）
     ROUTE_RECURSION_LIMIT: int = int(os.getenv("ROUTE_RECURSION_LIMIT", "50"))
 
-    # 上下文管理：coach 模型上下文每次只带最近 N 轮（一问一答约 2 条/轮）
-    #压缩后保留 20 条消息（最近 10 轮对话）
+    # 上下文管理：coach 模型上下文每次只带最近 N 轮。
+    # 「轮」= 一条 user 消息 + 其后到下一个 user 之前的全部消息（工具调用往返算在同一轮内）——
+    # 切点必须落在 user 消息上，否则会把 tool 回执跟它的 assistant(tool_calls) 切散
+    # 因此实际保留条数随工具调用密度浮动：实测 4 轮≈10 条 / 10 轮≈32~39 条，
+    # 单次请求约 3~12K token（固定注入 ≈1.2K），远低于模型窗口。
     COACH_HISTORY_KEEP: int = int(os.getenv("COACH_HISTORY_KEEP", "10"))
-    #消息数 超过 40 条 才触发压缩
+    # 消息总数超过此值触发压缩（保留窗口不足这么多条时不裁）
     COACH_COMPRESS_AT: int = int(os.getenv("COACH_COMPRESS_AT", "40"))
     # 记忆系统：三舱记忆整理——LLM 只看新消息产增量，确定性代码管积累（防重写衰减）。
     # 事实/未决舱永不被 LLM 重写，只有机械上限；脉络舱允许衰减（外部真相兜底）+字符上限。
