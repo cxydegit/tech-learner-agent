@@ -41,7 +41,7 @@ def _run(graph, gconfig, payload, replies, *, max_iters=60):
     raise AssertionError("max_iters 内未收敛")
 
 
-def _scripted_survey_chat(system_prompt, messages, tools):
+def _scripted_survey_chat(system_prompt, messages, tools, **_kw):
     """按 system_prompt 中的字段标签返回固定提问（问卷阶段无工具调用）。"""
     if "路线规划助手" in system_prompt:
         return {"content": "路线已初步生成：\n- 阶段1 环境搭建（4h）\n- 阶段2 核心概念（8h）\n请确认或提出修改。",
@@ -109,7 +109,7 @@ def test_survey_parse_error_reasks(monkeypatch):
     """自评回答非数字 → 内部校验提示 → 模型重问（同字段，不推进）。"""
     state_log = {}
 
-    def scripted(system_prompt, messages, tools):
+    def scripted(system_prompt, messages, tools, **_kw):
         # 记录最近一次含【问卷校验】的消息
         for m in reversed(messages):
             if "问卷校验" in (m.get("content") or ""):
@@ -168,7 +168,7 @@ def test_guard_single_repeat_not_triggered():
 
 def test_empty_model_output_appends_system_note(monkeypatch):
     monkeypatch.setattr(graph_mod, "chat_with_tools",
-                        lambda s, m, t: {"content": None, "tool_calls": []})
+                        lambda s, m, t, **_kw: {"content": None, "tool_calls": []})
     out = graph_mod.coach_llm({"mode": "survey", "coach_messages": [], "tech": "X"})
     last = out["coach_messages"][-1]
     assert last["role"] == "system"
@@ -177,7 +177,7 @@ def test_empty_model_output_appends_system_note(monkeypatch):
 
 def test_coach_llm_tool_calls_passthrough(monkeypatch):
     monkeypatch.setattr(graph_mod, "chat_with_tools",
-                        lambda s, m, t: {"content": None,
+                        lambda s, m, t, **_kw: {"content": None,
                                          "tool_calls": [{"id": "c1", "name": "get_roadmap", "arguments": {}}]})
     out = graph_mod.coach_llm({"mode": "planning", "coach_messages": [], "tech": "X"})
     last = out["coach_messages"][-1]
@@ -188,7 +188,7 @@ def test_coach_llm_tool_calls_passthrough(monkeypatch):
 def test_coach_llm_fallback_prepends_visible_notice(monkeypatch):
     """降级回复必须挂显式提示：模型这一轮做不了任何工具动作，用户得知情。"""
     monkeypatch.setattr(graph_mod, "chat_with_tools",
-                        lambda s, m, t: {"content": "好的，我已经为你生成了路线。",
+                        lambda s, m, t, **_kw: {"content": "好的，我已经为你生成了路线。",
                                          "tool_calls": [], "fallback": True})
     out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
     last = out["coach_messages"][-1]
@@ -199,7 +199,7 @@ def test_coach_llm_fallback_prepends_visible_notice(monkeypatch):
 
 def test_coach_llm_fatal_error_does_not_suggest_retry(monkeypatch):
     """确定性错误：明确说重试无用——笼统的"稍后再试"会把用户带到错误方向。"""
-    def _raise(s, m, t):
+    def _raise(s, m, t, **_kw):
         raise graph_mod.ToolCallError("HTTP 401（API key 无效）：invalid key", fatal=True)
     monkeypatch.setattr(graph_mod, "chat_with_tools", _raise)
     out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
@@ -210,7 +210,7 @@ def test_coach_llm_fatal_error_does_not_suggest_retry(monkeypatch):
 
 
 def test_coach_llm_transient_error_suggests_retry(monkeypatch):
-    def _raise(s, m, t):
+    def _raise(s, m, t, **_kw):
         raise graph_mod.ToolCallError("Connection error.")
     monkeypatch.setattr(graph_mod, "chat_with_tools", _raise)
     out = graph_mod.coach_llm({"mode": "coaching", "coach_messages": [], "tech": "Redis"})
@@ -220,7 +220,7 @@ def test_coach_llm_transient_error_suggests_retry(monkeypatch):
 
 # ---------- planning 端到端（问卷 → 路线生成 → 确认 → coaching） ----------
 
-def _scripted_planning_chat(system_prompt, messages, tools):
+def _scripted_planning_chat(system_prompt, messages, tools, **_kw):
     """问卷固定提问 + planning 阶段脚本化工具调用（generate → 呈现 → confirm）。"""
     if "水平探测助手" in system_prompt:
         return _scripted_survey_chat(system_prompt, messages, tools)
@@ -277,7 +277,7 @@ def test_planning_generates_roadmap_and_confirms(monkeypatch, tmp_path):
 
 # ---------- coaching 工具端到端 + 上下文压缩 ----------
 
-def _scripted_coaching_chat(system_prompt, messages, tools):
+def _scripted_coaching_chat(system_prompt, messages, tools, **_kw):
     """问卷 + planning（生成/确认路线）+ coaching（collect → 勾选里程碑 → 结束）。"""
     if "水平探测助手" in system_prompt:
         return _scripted_survey_chat(system_prompt, messages, tools)
@@ -375,7 +375,7 @@ def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
     """端到端：勾选里程碑后提示词注入「待确认」块（强制停下询问）；用户回复后闸门清除。"""
     seen_prompts = []
 
-    def scripted(system_prompt, messages, tools):
+    def scripted(system_prompt, messages, tools, **_kw):
         seen_prompts.append(system_prompt)
         return _scripted_coaching_chat(system_prompt, messages, tools)
 
@@ -402,7 +402,7 @@ def test_coach_trim_compresses_over_threshold(monkeypatch):
     """超阈值 → 三舱记忆整理（LLM 增量）、脉络舱写入、裁到最近 N 轮，且切点在 user 消息上。"""
     msgs = [{"role": "user", "content": f"消息{i}"} for i in range(config.COACH_COMPRESS_AT + 5)]
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: '{"facts_add": ["用户偏好类比"], "open_add": [], '
+                        lambda s, u, **_kw: '{"facts_add": ["用户偏好类比"], "open_add": [], '
                                      '"resolved": [], "context": "【压缩摘要】"}')
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
@@ -434,7 +434,7 @@ def test_coach_trim_cut_lands_on_user_not_mid_tool_calls(monkeypatch):
 
     msgs = [m for i in range(10) for m in turn(i, n_tools=2)]  # 50 条 / 10 轮
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: '{"facts_add": [], "open_add": [], "resolved": [], "context": ""}')
+                        lambda s, u, **_kw: '{"facts_add": [], "open_add": [], "resolved": [], "context": ""}')
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     kept = out["coach_messages"]
@@ -458,7 +458,7 @@ def test_coach_trim_heals_existing_orphan_tool_messages(monkeypatch):
         {"role": "user", "content": "继续"},
     ]
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: (_ for _ in ()).throw(AssertionError("不应触发摘要")))
+                        lambda s, u, **_kw: (_ for _ in ()).throw(AssertionError("不应触发摘要")))
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     roles = [m.get("role") for m in out["coach_messages"]]
@@ -480,7 +480,7 @@ def test_coach_trim_keeps_all_when_too_few_turns(monkeypatch):
     msgs.append({"role": "tool", "tool_call_id": "ghost", "name": "ask", "content": "{}"})
     assert len(msgs) > config.COACH_COMPRESS_AT
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: (_ for _ in ()).throw(AssertionError("凑不出轮数时不应触发摘要")))
+                        lambda s, u, **_kw: (_ for _ in ()).throw(AssertionError("凑不出轮数时不应触发摘要")))
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     # 除孤儿被净化外，消息不因压缩而减少
@@ -492,7 +492,7 @@ def test_coach_trim_no_compress_under_threshold(monkeypatch):
     """低于阈值不压缩、不调摘要 LLM。"""
     msgs = [{"role": "user", "content": "x"} for _ in range(5)]
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: (_ for _ in ()).throw(AssertionError("不应触发摘要")))
+                        lambda s, u, **_kw: (_ for _ in ()).throw(AssertionError("不应触发摘要")))
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "", "tech": "X", "survey_answers": {}})
     assert out["coach_messages"] == msgs
@@ -510,3 +510,121 @@ def test_coach_trim_initializes_survey():
 # 学习内容由自动沉淀（后台线程 + coach_candidate_confirm 候选确认）覆盖，
 # 候选确认 e2e 见 test_memory_sweep.py::test_e2e_coaching_sweep_candidates_need_user
 # 与 test_memory_sweep_async.py::test_candidate_confirm_node。
+
+
+# ---------- 贵工具单轮上限 + 工具级进度 ----------
+
+def _state_with_heavy_call(name="collect", heavy=0):
+    return {
+        "coach_messages": [{"role": "assistant", "content": None,
+                            "tool_calls": [{"id": "c1", "type": "function",
+                                            "function": {"name": name, "arguments": "{}"}}]}],
+        "coach_turn_tool_count": 0,
+        "coach_turn_heavy_count": heavy,
+        "last_tool_signatures": [],
+    }
+
+
+def test_guard_allows_two_heavy_tools(monkeypatch):
+    """两个不同主题的 collect/read 是合法需求（真实事故当天就是这个形态），必须放行。"""
+    assert config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN == 2
+    assert graph_mod._coach_guard(_state_with_heavy_call(heavy=0)) is None
+    assert graph_mod._coach_guard(_state_with_heavy_call(heavy=1)) is None
+
+
+def test_guard_blocks_third_heavy_tool():
+    """第 3 个贵工具超限：停下问用户先做哪个（不硬拒）。"""
+    msg = graph_mod._coach_guard(_state_with_heavy_call(heavy=2))
+    assert msg
+    assert str(config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN) in msg
+    assert "留到下一步" in msg
+
+
+def test_guard_ignores_cheap_tools():
+    """ask / note 不烧搜索抓取额度，不占贵工具上限。"""
+    assert graph_mod._coach_guard(_state_with_heavy_call(name="ask", heavy=2)) is None
+
+
+def test_coach_tool_reports_progress_for_each_tool(monkeypatch):
+    """每个工具执行前后各发一条进度（工具名 + 耗时）：没有它用户看到的是长时间静默。"""
+    seen = []
+    monkeypatch.setattr(graph_mod, "_get_progress", lambda: seen.append)
+    monkeypatch.setattr(graph_mod, "run_coach_tool", lambda name, args, ctx: {"status": "ok"})
+    state = _state_with_heavy_call()
+    out = graph_mod.coach_tool(state)
+    assert any("⚙️ collect" in m for m in seen)
+    assert any("✅ collect" in m and "耗时" in m for m in seen)
+    assert out["coach_turn_heavy_count"] == 1  # 贵工具计数（供单轮上限）
+
+
+def test_coach_tool_progress_marks_failure(monkeypatch):
+    """工具失败也要有回执（⚠️ + 耗时），别让这一轮无声地停住。"""
+    seen = []
+    monkeypatch.setattr(graph_mod, "_get_progress", lambda: seen.append)
+    monkeypatch.setattr(graph_mod, "run_coach_tool",
+                        lambda name, args, ctx: {"status": "error", "error": "boom"})
+    graph_mod.coach_tool(_state_with_heavy_call(name="read"))
+    assert any("⚠️ read" in m and "耗时" in m for m in seen)
+
+
+def test_heavy_tool_cap_interrupts_before_execution(monkeypatch):
+    """一轮里要 3 个 collect → 护栏在**执行前**拦下（额度一点没烧），并向用户提问。"""
+    executed = []
+    calls = {"n": 0}
+
+    def scripted(system_prompt, messages, tools, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"content": None, "tool_calls": [
+                {"id": f"c{i}", "name": "collect", "arguments": {"tech": f"T{i}"}}
+                for i in range(3)]}
+        return {"content": "（改口）好，那先做第一个。", "tool_calls": []}
+
+    monkeypatch.setattr(graph_mod, "chat_with_tools", scripted)
+    monkeypatch.setattr(graph_mod, "run_coach_tool",
+                        lambda name, args, ctx: (executed.append(name), {"status": "ok"})[1])
+
+    graph = build_graph(InMemorySaver())
+    gconfig = {"configurable": {"thread_id": "test-heavy-cap"}}
+    seen: list[str] = []
+    with graph_mod.web_progress("test-heavy-cap", seen.append):
+        final, interrupts = _run(graph, gconfig,
+                                 {"command": "route", "tech": "Redis", "mode": "coaching"},
+                                 ["结束"])
+
+    assert interrupts, "应在执行工具前先向用户提问"
+    assert "留到下一步" in interrupts[0]["message"]
+    assert executed == []                      # 关键：工具一次都没执行，额度没烧
+    assert not any("⚙️" in m for m in seen)     # 也没有工具进度（因为没执行）
+    assert not final.get("coach_turn_heavy_count")
+
+
+def test_heavy_tool_progress_reaches_callback_in_real_turn(monkeypatch):
+    """真实回合里两个 collect 会执行，且每次前后都有进度（含耗时）——事故黑洞的正面用例。"""
+    calls = {"n": 0}
+
+    def scripted(system_prompt, messages, tools, **_kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"content": None, "tool_calls": [
+                {"id": "c1", "name": "collect", "arguments": {"tech": "A"}},
+                {"id": "c2", "name": "collect", "arguments": {"tech": "B"}}]}
+        return {"content": "（收尾）两个主题的资料都拿到了。", "tool_calls": []}
+
+    executed = []
+    monkeypatch.setattr(graph_mod, "chat_with_tools", scripted)
+    monkeypatch.setattr(graph_mod, "run_coach_tool",
+                        lambda name, args, ctx: (executed.append(args.get("tech")),
+                                                 {"status": "ok",
+                                                  "materials_path": "materials/x.md"})[1])
+
+    graph = build_graph(InMemorySaver())
+    gconfig = {"configurable": {"thread_id": "test-heavy-progress"}}
+    seen: list[str] = []
+    with graph_mod.web_progress("test-heavy-progress", seen.append):
+        _run(graph, gconfig, {"command": "route", "tech": "Redis", "mode": "coaching"}, ["结束"])
+
+    # 两个不同主题都放行（上限 2，合法需求不被砍）
+    assert executed == ["A", "B"]
+    assert sum(1 for m in seen if "⚙️ collect" in m) == 2
+    assert sum(1 for m in seen if "✅ collect" in m and "耗时" in m) == 2

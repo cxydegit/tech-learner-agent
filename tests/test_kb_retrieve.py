@@ -202,7 +202,7 @@ def test_node_clears_kb_context(monkeypatch):
 kb_seen = {}
 
 
-def _scripted_kb_chat(system_prompt, messages, tools):
+def _scripted_kb_chat(system_prompt, messages, tools, **_kw):
     if "水平探测助手" in system_prompt:
         if "正在收集字段：自评熟悉度" in system_prompt:
             return {"content": "你对该技术熟悉程度是几分（0-10）？", "tool_calls": []}

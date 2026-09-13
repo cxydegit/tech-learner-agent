@@ -58,3 +58,14 @@ def test_github_repo_with_path_suffix():
         fetch_star_count("https://github.com/psf/requests/tree/main", token="t")
         captured["url"] = mo.call_args.args[0].full_url
     assert captured["url"] == "https://api.github.com/repos/psf/requests"
+
+
+def test_is_repo_url_prefilter():
+    """星数查询的准入预筛：只看路径形状（/orgs/x 这类也会通过，靠 API 404 兜底）。"""
+    from src.adapters.github import is_repo_url
+
+    assert is_repo_url("https://github.com/langchain-ai/langgraph")
+    assert is_repo_url("https://www.github.com/a/b")
+    assert not is_repo_url("https://github.com/a")       # 路径只有一个段落
+    assert not is_repo_url("https://example.com/a/b")
+    assert not is_repo_url("")

@@ -254,6 +254,7 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
         for g in groups
     ]
     answer = _strip_source_appendix(
-        generate_text(QA_PROMPT, _build_qa_user(question, groups, history)).strip())
+        generate_text(QA_PROMPT, _build_qa_user(question, groups, history),
+                      call_site="qa.answer").strip())
     # no_hit：检索零命中，或模型明确表示「笔记里没有记录」（后者触发 CLI 的 collect 引导）
     return {"answer": answer, "sources": sources, "hits": hits, "no_hit": _says_not_covered(answer)}

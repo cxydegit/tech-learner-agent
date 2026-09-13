@@ -11,7 +11,8 @@ from firecrawl import FirecrawlApp
 from ..config import config
 
 
-def fetch_tool(url: str, max_chars: int = 0, timeout: float | None = None) -> dict:
+def fetch_tool(url: str, max_chars: int = 0, timeout: float | None = None,
+               max_retries: int | None = None) -> dict:
     """使用 Firecrawl 抓取网页内容为 Markdown。
 
     Args:
@@ -19,14 +20,21 @@ def fetch_tool(url: str, max_chars: int = 0, timeout: float | None = None) -> di
         max_chars: 截取的最大字符数；0 表示使用配置的 MAX_FETCH_CHARS
         timeout: 单次抓取超时上限（秒）；None 表示不额外约束（保持历史行为）。
             并发抓取 fetch_many 会显式传入 config.FETCH_TIMEOUT_SECONDS。
+            ⚠️ Firecrawl SDK 默认 max_retries=3：只设 timeout 而不限重试，最坏耗时是
+            timeout × 4。**单页调用（read_pipeline）必须同时给 max_retries**，否则没有
+            墙钟兜底——collect 那侧由 fetch_many 的共享 deadline 封顶，不受影响。
+        max_retries: 可选，覆盖 Firecrawl SDK 默认的 3 次重试；0 表示不重试。
 
     Returns:
-        dict: {"url": str, "markdown": str, "title": str}
+        dict: {"url": str, "markdown": str, "title": str, "truncated": bool}
+        失败（超时/网络/SDK 报错）会抛出异常，调用方自行处理。
     """
     limit = max_chars or config.MAX_FETCH_CHARS
     kwargs = {"api_key": config.FIRECRAWL_API_KEY}
     if timeout is not None:
         kwargs["timeout"] = timeout
+    if max_retries is not None:
+        kwargs["max_retries"] = max_retries
     app = FirecrawlApp(**kwargs)
     response = app.scrape_url(url)
 

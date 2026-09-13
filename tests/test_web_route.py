@@ -87,7 +87,7 @@ def test_runner_coach_flow_end_to_end(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "GRAPH_DB_PATH", tmp_path / "ckpt.sqlite")
     import src.graph as graph_mod
     monkeypatch.setattr(graph_mod, "chat_with_tools",
-                        lambda sp, msgs, tools: {"content": "你对这个技术熟悉程度是？0-10 打几分？",
+                        lambda sp, msgs, tools, **_kw: {"content": "你对这个技术熟悉程度是？0-10 打几分？",
                                                  "tool_calls": []})
 
     assert runner_mod.start_run("t-route", {"command": "route", "tech": "X"}) is None

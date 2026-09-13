@@ -5,12 +5,15 @@
 """
 
 import json
+import logging
 import random
 import re
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 
-from openai import APIConnectionError, APIStatusError, OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from ..config import config
 from ..domain.extraction import parse_json_object
@@ -29,33 +32,137 @@ def replace_time_line(report: str, label: str, now: str) -> str:
     return re.sub(rf"(?m)^>\s*{label}\s*[:：].*$", f"> {label}：{now}", report)
 
 
-def generate_text(system_prompt: str, user_content: str) -> str:
+# ============================================================
+# LLM 调用埋点
+# 一次尝试一行 JSON，只记元数据（耗时 / finish_reason / token 数 / 走哪条路），
+# **不记 prompt 与回复内容**：学的是用户自己的东西，内容不进日志。
+# 默认就开着、不设开关——没有它，「慢」与「截断」只能靠翻 checkpoint 数据库和看文件
+# 断口反推，而那正是 2026-09-09 collect 静默 22 分钟那次的定位成本所在。
+# ============================================================
+
+_LOGGER = logging.getLogger("tech_learner.llm")
+_LOGGER.setLevel(logging.INFO)
+_LOGGER.propagate = False  # 应用若另配了 root logger，不重复打印
+if not _LOGGER.handlers:
+    # 导入时就挂好：惰性挂载的「检查-再挂载」不是原子的，而后台沉淀线程与主线程可能同时
+    # 首次调用，各挂一个 handler 会让每行日志重复输出。
+    _HANDLER = logging.StreamHandler()
+    _HANDLER.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _LOGGER.addHandler(_HANDLER)
+
+
+def _log_call(call_site: str, attempt: int, elapsed: float, *, status: str,
+              kind: str = "ok", http: int | None = None,
+              finish_reason: str | None = None, usage=None,
+              fallback: bool = False, error: str = "") -> None:
+    """记一次 LLM 请求（含失败与降级）。
+
+    attempt=1..N 是工具调用通道的第几次尝试；attempt=0 且 fallback=True 表示降级那次请求。
+    finish_reason 是「截断」的直接实锤（length=撞 max_tokens），elapsed_s 是「慢」的直接实锤。
+    """
+    _LOGGER.info(json.dumps({
+        "event": "llm_call",
+        "site": call_site or "unknown",
+        "attempt": attempt,
+        "elapsed_s": round(elapsed, 1),
+        "status": status,
+        "kind": kind,
+        "http": http,
+        "finish_reason": finish_reason,
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+        "fallback": fallback,
+        "error": error[:200],
+    }, ensure_ascii=False))
+
+
+@contextmanager
+def _heartbeat(progress, label: str, interval: float):
+    """长调用期间每隔 interval 秒发一条「仍在进行…（已 Ns）」，退出时停掉旁路线程。
+
+    为什么需要：报告生成占整条管道耗时的 99%，而它期间没有任何中间信号——用户看到
+    「🧠 LLM 生成...」之后就是长时间静止（真实事故里静止了 22 分钟）。心跳把这段静默
+    变成可见的等待。interval<=0 或没有回调时完全不启动线程。
+    """
+    if not progress or interval <= 0:
+        yield
+        return
+    stop = threading.Event()
+    started = time.monotonic()
+
+    def _beat() -> None:
+        while not stop.wait(interval):
+            try:
+                progress(f"⏳ {label} 仍在进行...（已 {time.monotonic() - started:.0f}s）")
+            except Exception:  # noqa: BLE001 —— 进度回调异常绝不影响主流程
+                return
+
+    thread = threading.Thread(target=_beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()  # 无论成功/失败/异常都要停，否则会在调用结束后继续发消息
+
+
+def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | None = None,
+                  call_site: str = "", truncation_notice: str = "",
+                  progress=None, progress_label: str = "生成报告") -> str:
     """执行一次（非循环的）LLM 生成，返回响应文本。
 
     适用于"URL → 抓取 → 生成 → 保存"这类确定性管道任务，
     不需要 Agent 自主选择工具，因而跳过 ReAct 循环以降低开销和失败率。
 
+    只打一次、不重试：这是长任务（整篇报告），重发一遍等于再烧一份 token 再等一轮；
+    超时上限用 config.LLM_REPORT_TIMEOUT（远大于对话通道），失败由调用方决定如何降级。
+
     Args:
         system_prompt: 系统提示词
         user_content: 用户内容（已抓取的文档等）
+        max_tokens: 可选，覆盖 config.LLM_MAX_TOKENS（整篇报告用 config.REPORT_MAX_TOKENS）
+        call_site: 埋点用调用点标识（如 collect.report），用于从日志定位是谁在调
+        truncation_notice: 可选，被生成上限截断（`finish_reason == "length"`）时追加到正文
+            末尾的标注。**只给报告类调用点传**——判定类调用点（dedup / note / verify）输出
+            是 JSON，追加标注会破坏解析，它们的解析失败路径已各自处理。
+        progress: 可选进度回调；长调用期间会由心跳线程周期发"仍在进行"
+        progress_label: 心跳文案里的动作名（如「LLM 生成学习资料」）
 
     Returns:
-        LLM 生成的文本
+        LLM 生成的文本（若传入 truncation_notice 且被截断，末尾带该标注）
     """
-    client = OpenAI(
-        api_key=config.OPENAI_API_KEY,
-        base_url=config.OPENAI_BASE_URL,
-    )
-    response = client.chat.completions.create(
-        model=config.LLM_MODEL,
-        max_tokens=config.LLM_MAX_TOKENS,
-        temperature=0.5,
-        messages=[
+    kwargs: dict = {
+        "model": config.LLM_MODEL,
+        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+        "temperature": 0.5,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-    )
-    return response.choices[0].message.content
+    }
+    start = time.monotonic()
+    try:
+        with _heartbeat(progress, progress_label, config.LLM_HEARTBEAT_SECONDS):
+            response = _get_client().chat.completions.create(
+                **kwargs, timeout=config.LLM_REPORT_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 —— 记完就抛，由调用方决定降级（不在这里吞）
+        _log_call(call_site, 1, time.monotonic() - start, status="error",
+                  kind=_classify(e), http=getattr(e, "status_code", None),
+                  error=f"{type(e).__name__}: {e}")
+        raise
+    finish = response.choices[0].finish_reason
+    _log_call(call_site, 1, time.monotonic() - start, status="ok",
+              finish_reason=finish, usage=getattr(response, "usage", None))
+    text = response.choices[0].message.content
+    if finish == "length":
+        # 截断是数据质量事件，用 WARNING 让它从常规 INFO 里跳出来
+        _LOGGER.warning(json.dumps({
+            "event": "llm_truncated", "site": call_site or "unknown",
+            "completion_tokens": getattr(getattr(response, "usage", None), "completion_tokens", None),
+            "annotated": bool(truncation_notice),
+        }, ensure_ascii=False))
+        if truncation_notice:
+            text = f"{text}{truncation_notice}"
+    return text
 
 
 # ============================================================
@@ -87,6 +194,11 @@ FALLBACK_SYSTEM_SUFFIX = (
     "用户的要求若必须借助工具，就直接说明现在无法执行、建议稍后重试。"
 )
 
+# 报告被生成上限截断时追加到正文末尾的标注：残篇若被当作完整资料读进知识库，事后就分不清
+# 「原文没有」和「被切掉了」。宁可留一条丑标记，也不让半篇内容伪装成完篇（由报告调用点传入）。
+REPORT_TRUNCATION_NOTICE = ("\n\n---\n\n> ⚠️ **本报告未写完**：生成时达到长度上限被截断，"
+                            "以上内容不完整，请勿作为完整资料引用。")
+
 _client: OpenAI | None = None
 
 
@@ -108,8 +220,8 @@ def _get_client() -> OpenAI:
     return _client
 
 
-# 异常分档（见 _classify）：原样重试 / 不重试但可降级 / 两类都不做
-_RETRY, _DEGRADE, _ABORT = "retry", "degrade", "abort"
+# 异常分档（见 _classify）：原样重试 / 超时立即失败 / 不重试但可降级 / 两类都不做
+_RETRY, _TIMEOUT, _DEGRADE, _ABORT = "retry", "timeout", "degrade", "abort"
 
 # 可重试的状态码（超时 / 冲突 / 限流；≥500 另行判断）：其余 4xx 都是"请求本身不合法"
 _RETRY_STATUS = frozenset({408, 409, 429})
@@ -120,7 +232,11 @@ _PAYLOAD_STATUS = frozenset({400, 422})
 
 def _classify(e: Exception) -> str:
     """按「重试能不能改变结果」给异常分档。"""
-    if isinstance(e, APIConnectionError):  # 含 APITimeoutError：连接失败 / 超时
+    if isinstance(e, APITimeoutError):
+        # 超时既不重试也不降级：实测最坏合法生成 ≈23s，45s 超时是它的 2 倍，更像故障而不是
+        # "生成得慢"；重发（或降级再发）等于把整条 prompt 再烧一遍、再让用户等一遍。
+        return _TIMEOUT
+    if isinstance(e, APIConnectionError):  # 连接失败 / 重置 / DNS：便宜，且常是瞬时的
         return _RETRY
     if isinstance(e, APIStatusError):
         if e.status_code in _RETRY_STATUS or e.status_code >= 500:
@@ -181,7 +297,7 @@ def _parse_chat_response(msg) -> dict:
 
 
 def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
-                    *, max_tokens: int | None = None) -> dict:
+                    *, max_tokens: int | None = None, call_site: str = "") -> dict:
     """执行一次带原生工具定义的对话补全。
 
     与 generate_text 的定位不同：generate_text 是"单次生成"，适用于确定性管道；
@@ -193,6 +309,7 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
             格式对齐 openai 兼容接口（DashScope 支持原生 tool_calls）
         tools: OpenAI function 定义列表
         max_tokens: 可选，覆盖 config.LLM_MAX_TOKENS
+        call_site: 埋点用调用点标识（如 coach.chat），用于从日志定位是谁在调
 
     Returns:
         {"content": str | None, "tool_calls": [{id, name, arguments(dict)}], "fallback": bool}
@@ -202,6 +319,7 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
           调用方必须当降级处理——该回复**没有执行过任何工具动作**（路线/进度/笔记
           均未变更），要给用户显式提示，否则会被当成一条正常回复。
         - 确定性错误（key/模型名/无权限）：抛 ToolCallError（fatal=True），别建议重试
+        - 超时（LLM_REQUEST_TIMEOUT）：立即抛 ToolCallError，不重试也不降级
         - 代码 bug（响应解析等非 SDK 异常）：原样抛出，不包装、不重试
     """
     kwargs: dict = {
@@ -217,14 +335,25 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break  # 预算耗尽 → 立刻降级，不让用户继续干等
+        start = time.monotonic()
         try:
             response = client.chat.completions.create(
                 **kwargs, tools=tools, timeout=min(config.LLM_REQUEST_TIMEOUT, remaining))
             parsed = _parse_chat_response(response.choices[0].message)
+            _log_call(call_site, attempt + 1, time.monotonic() - start, status="ok",
+                      finish_reason=response.choices[0].finish_reason,
+                      usage=getattr(response, "usage", None))
             parsed["fallback"] = False
             return parsed
         except Exception as e:  # noqa: BLE001 —— 按错误性质分流，见 _classify
             kind = _classify(e)
+            _log_call(call_site, attempt + 1, time.monotonic() - start, status="error",
+                      kind=kind, http=getattr(e, "status_code", None),
+                      error=f"{type(e).__name__}: {e}")
+            if kind == _TIMEOUT:
+                # 超时直接失败：不重试、也不降级（降级仍是同一条流水线上的又一次完整生成）
+                raise ToolCallError(
+                    f"请求超时（{config.LLM_REQUEST_TIMEOUT:.0f}s）：{e}") from e
             if kind == _ABORT:
                 if isinstance(e, APIStatusError):
                     raise ToolCallError(_fatal_message(e), fatal=True) from e
@@ -237,14 +366,21 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
                 break  # 退避完就超预算：不如现在降级
             time.sleep(delay)
     if config.ROUTE_FALLBACK_TO_TEXT:
+        start = time.monotonic()
         try:
             fallback_kwargs = {**kwargs, "messages": _fallback_messages(system_prompt, messages)}
             response = client.chat.completions.create(
                 **fallback_kwargs, timeout=config.LLM_REQUEST_TIMEOUT)
             parsed = _parse_chat_response(response.choices[0].message)
+            _log_call(call_site, 0, time.monotonic() - start, status="ok", fallback=True,
+                      finish_reason=response.choices[0].finish_reason,
+                      usage=getattr(response, "usage", None))
             parsed["fallback"] = True
             return parsed
         except Exception as e:  # noqa: BLE001 —— 降级也失败，只能上报
+            _log_call(call_site, 0, time.monotonic() - start, status="error", fallback=True,
+                      kind=_classify(e), http=getattr(e, "status_code", None),
+                      error=f"{type(e).__name__}: {e}")
             last_err = e
     if last_err is None:  # 首次请求前预算就耗尽：没有真实错误可报，是配置问题
         raise ToolCallError("重试预算耗尽（请检查 LLM_RETRY_BUDGET_SECONDS）")
@@ -313,7 +449,7 @@ def judge_same_knowledge_point(topic: str, tags: list[str] | None, content: str 
         f"标题：{existing.get('topic') or ''}\n标签：{old_tag_str}\n"
         f"正文：{(existing.get('content') or '').strip()[:2000]}"
     )
-    raw = generate_text(DEDUP_JUDGE_SYSTEM_PROMPT, user_content)
+    raw = generate_text(DEDUP_JUDGE_SYSTEM_PROMPT, user_content, call_site="dedup.judge")
     obj = parse_json_object(raw)
     verdict = obj.get("verdict")
     if verdict not in ("same", "diff"):

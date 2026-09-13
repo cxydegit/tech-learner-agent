@@ -38,7 +38,7 @@ def _mem(over=None):
 
 def test_consolidate_applies_deltas(monkeypatch):
     """facts 追加、open 追加 id 连续、resolved 按 id 移除、context 覆盖。"""
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u: _OK_JSON)
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw: _OK_JSON)
     out = route_mod.consolidate_memory(_mem(), _MSGS, "Spring")
     assert out["facts"] == ["用户每天 2 小时", "用户偏好类比讲解"]
     # id=2 已解决被移除；新增 id 从现有最大（2）之后连续
@@ -49,7 +49,7 @@ def test_consolidate_applies_deltas(monkeypatch):
 
 def test_consolidate_dedups_facts(monkeypatch):
     """facts 精确去重：与现有重复（strip 后相同）不追加。"""
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": ["用户每天 2 小时", "  用户每天 2 小时  ", "新事实"], '
                         '"open_add": [], "resolved": [], "context": ""}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
@@ -58,7 +58,7 @@ def test_consolidate_dedups_facts(monkeypatch):
 
 def test_consolidate_resolved_unknown_id_ignored(monkeypatch):
     """resolved 含不存在的 id → 忽略，不误删、不报错。"""
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": [], "open_add": [], "resolved": [99, "x", 1], "context": ""}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
     assert out["open_items"] == [{"id": 2, "text": "待确认：路线是否跳过 Maven"}]
@@ -66,7 +66,7 @@ def test_consolidate_resolved_unknown_id_ignored(monkeypatch):
 
 def test_consolidate_empty_context_keeps_old_summary(monkeypatch):
     """context 为空（LLM 没给）→ 保留旧摘要，不莫名清空。"""
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": [], "open_add": [], "resolved": [], "context": ""}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
     assert out["summary"] == "旧摘要"
@@ -77,7 +77,7 @@ def test_consolidate_empty_context_keeps_old_summary(monkeypatch):
 def test_consolidate_facts_cap_drops_oldest(monkeypatch):
     """facts 超上限丢最旧。"""
     monkeypatch.setattr(config, "COACH_FACTS_MAX", 2)
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": ["事实A", "事实B"], "open_add": [], "resolved": [], "context": ""}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
     assert out["facts"] == ["事实A", "事实B"]  # 旧的「用户每天 2 小时」被挤出
@@ -86,7 +86,7 @@ def test_consolidate_facts_cap_drops_oldest(monkeypatch):
 def test_consolidate_open_cap_drops_oldest(monkeypatch):
     """未决超上限丢最旧（id 最小）。"""
     monkeypatch.setattr(config, "COACH_OPEN_MAX", 2)
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": [], "open_add": ["新未决A", "新未决B"], "resolved": [], "context": ""}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
     ids = [it["id"] for it in out["open_items"]]
@@ -97,7 +97,7 @@ def test_consolidate_open_cap_drops_oldest(monkeypatch):
 def test_consolidate_context_truncated(monkeypatch):
     """context 超 COACH_SUMMARY_MAX_CHARS 机械截断。"""
     monkeypatch.setattr(config, "COACH_SUMMARY_MAX_CHARS", 10)
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u:
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw:
                         '{"facts_add": [], "open_add": [], "resolved": [], '
                         '"context": "这是一个超过十个字的摘要内容用于测试截断行为"}')
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
@@ -110,7 +110,7 @@ def test_consolidate_context_truncated(monkeypatch):
 def test_consolidate_llm_failure_keeps_all(monkeypatch):
     """LLM 异常 → 三舱原样保留。"""
 
-    def boom(s, u):
+    def boom(s, u, **_kw):
         raise RuntimeError("LLM down")
     monkeypatch.setattr(route_mod, "generate_text", boom)
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
@@ -120,7 +120,7 @@ def test_consolidate_llm_failure_keeps_all(monkeypatch):
 
 def test_consolidate_parse_failure_keeps_all(monkeypatch):
     """JSON 解析失败（纯文本输出）→ 三舱原样保留。"""
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u: "这不是 JSON，是普通摘要文本。")
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw: "这不是 JSON，是普通摘要文本。")
     out = route_mod.consolidate_memory(_mem(), _MSGS, "X")
     assert out["facts"] == ["用户每天 2 小时"]
     assert out["summary"] == "旧摘要"
@@ -131,7 +131,7 @@ def test_consolidate_empty_messages_no_llm(monkeypatch):
     """无 user/assistant 文本消息 → 不调 LLM，三舱原样。"""
     called = {}
     monkeypatch.setattr(route_mod, "generate_text",
-                        lambda s, u: called.setdefault("c", True) or _OK_JSON)
+                        lambda s, u, **_kw: called.setdefault("c", True) or _OK_JSON)
     out = route_mod.consolidate_memory(_mem(), [{"role": "system", "content": "内部提示"}], "X")
     assert not called
     assert out["facts"] == ["用户每天 2 小时"]
@@ -173,7 +173,7 @@ def test_coaching_prompt_empty_tiers_not_rendered():
 def test_trim_writes_three_tiers(monkeypatch):
     """压缩触发：三舱都写入、消息裁剪；LLM 失败时三舱原样、消息仍裁剪。"""
     msgs = [{"role": "user", "content": f"消息{i}"} for i in range(config.COACH_COMPRESS_AT + 5)]
-    monkeypatch.setattr(route_mod, "generate_text", lambda s, u: _OK_JSON)
+    monkeypatch.setattr(route_mod, "generate_text", lambda s, u, **_kw: _OK_JSON)
     out = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,
                                 "coach_summary": "旧摘要", "tech": "X",
                                 "survey_answers": {},
@@ -184,7 +184,7 @@ def test_trim_writes_three_tiers(monkeypatch):
     assert all(it["id"] != 2 for it in out["coach_open_items"])
     assert len(out["coach_messages"]) <= config.COACH_HISTORY_KEEP * 2
 
-    def boom(s, u):
+    def boom(s, u, **_kw):
         raise RuntimeError("LLM down")
     monkeypatch.setattr(route_mod, "generate_text", boom)
     out2 = graph_mod.coach_trim({"mode": "coaching", "coach_messages": msgs,

@@ -8,6 +8,7 @@
 import json
 import operator
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
 from .pipelines.route import (
     COACH_TOOLS_BY_MODE,
+    HEAVY_TOOLS,
     CoachCtx,
     coach_system_prompt,
     consolidate_memory,
@@ -206,6 +208,12 @@ class LearnState(TypedDict):
     # 护栏：本用户回合已用工具调用数 + 最近几轮工具签名（重复检测）
     coach_turn_tool_count: int
     last_tool_signatures: list
+    # 护栏：本回合已执行的「贵工具」（collect/read）次数，超 ROUTE_MAX_HEAVY_TOOLS_PER_TURN
+    # 后停下问用户（这两个工具单次就烧搜索/抓取额度 + 分钟级耗时）
+    coach_turn_heavy_count: int
+    # 护栏：本回合失败过的贵工具 → {count, stage}。失败后拒绝重跑（重跑 = 搜索+抓取+生成全重演），
+    # 搜索段首次失败例外放行；每用户回合在 coach_human 清零
+    coach_heavy_failures: dict
     # note 工具暂存的相似笔记候选（note 提取后待用户决定，note_commit 提交后清空）
     coach_note_pending: dict | None
     # collect/read 工具最近一次产出的文档 {path, type}；coach_human 把它附到对话记录（查看完整文档 chip），用后即清
@@ -500,6 +508,7 @@ def coach_llm(state: LearnState) -> dict:
             coach_system_prompt(state),
             msgs,
             COACH_TOOLS_BY_MODE.get(state.get("mode") or "survey", []),
+            call_site="coach.chat",
         )
     except ToolCallError as e:
         if e.fatal:
@@ -549,24 +558,40 @@ def _assistant_tool_calls(assistant_msg: dict) -> list[dict]:
 
 
 def coach_tool(state: LearnState) -> dict:
-    """执行模型请求的工具调用；工具异常回喂模型修正（LLM 可恢复错误，官方推荐模式）。"""
+    """执行模型请求的工具调用；工具异常回喂模型修正（LLM 可恢复错误，官方推荐模式）。
+
+    每个工具前后各发一条进度（工具名 + 已耗时）：贵工具要跑几分钟，而没有这条信号时用户
+    看到的就是「长时间什么都没发生」——真实事故里正是这样静默了 22 分钟。
+    """
     tool_calls = _assistant_tool_calls(state["coach_messages"][-1])
-    ctx = CoachCtx(state, progress=_get_progress(), thread_id=_coach_thread_id())
+    progress = _get_progress()
+    ctx = CoachCtx(state, progress=progress, thread_id=_coach_thread_id())
     results = []
     signatures = []
+    heavy = 0
     for tc in tool_calls:
         args = tc["arguments"]
         signatures.append(f"{tc['name']}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
+        if tc["name"] in HEAVY_TOOLS:
+            heavy += 1
+        if progress:
+            progress(f"⚙️ {tc['name']} 执行中...")
+        started = time.monotonic()
         try:
             out = run_coach_tool(tc["name"], args, ctx)
         except Exception as e:  # noqa: BLE001 —— 工具异常回喂模型修正
             out = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        if progress:
+            mark = "✅" if out.get("status") == "ok" else "⚠️"
+            progress(f"{mark} {tc['name']} 耗时 {time.monotonic() - started:.0f}s"
+                     f"（{out.get('status')}）")
         results.append({"role": "tool", "tool_call_id": tc["id"],
                         "name": tc["name"], "content": json.dumps(out, ensure_ascii=False)})
     updates: dict = {
         "coach_messages": state["coach_messages"] + results,
         "last_tool_signatures": (state.get("last_tool_signatures") or []) + [signatures],
         "coach_turn_tool_count": (state.get("coach_turn_tool_count") or 0) + len(tool_calls),
+        "coach_turn_heavy_count": (state.get("coach_turn_heavy_count") or 0) + heavy,
     }
     for k, v in ctx.updates.items():  # 工具请求的状态变更（如 confirm_roadmap → mode=coaching）
         updates[k] = v
@@ -601,6 +626,8 @@ def coach_human(state: LearnState) -> dict:
     updates: dict = {
         "coach_messages": [*msgs, {"role": "user", "content": reply}],
         "coach_turn_tool_count": 0,
+        "coach_turn_heavy_count": 0,
+        "coach_heavy_failures": {},  # 贵工具失败闸每回合清零（同回合内才拦重跑）
         "last_tool_signatures": [],
         "coach_verify_rejects": 0,  # 里程碑验收拒绝计数每回合清零（节流只限本回合）
         "last_output": "",
@@ -850,12 +877,20 @@ def coach_guard(state: LearnState) -> dict:
 
 
 def _coach_guard(state: LearnState) -> str | None:
-    """工具护栏判定：预算耗尽 / 连续重复调用 → 返回诊断消息；无违规返回 None。"""
+    """工具护栏判定：预算耗尽 / 贵工具超限 / 连续重复调用 → 返回诊断消息；无违规返回 None。"""
     count = state.get("coach_turn_tool_count") or 0
     if count >= config.ROUTE_MAX_TOOL_CALLS_PER_TURN:
         return ("本轮工具调用次数已达上限，我暂时停一下。请告诉我下一步方向，"
                 "或直接说「结束」。")
     last_tc = _assistant_tool_calls(state["coach_messages"][-1])
+    # 贵工具单轮上限：collect/read 单次就烧搜索/抓取额度 + 分钟级耗时。超限不硬拒，
+    # 停下问用户先做哪个（两个不同主题是合法需求，见 ROUTE_MAX_HEAVY_TOOLS_PER_TURN 注释）
+    pending_heavy = sum(1 for tc in last_tc if tc["name"] in HEAVY_TOOLS)
+    if pending_heavy and (state.get("coach_turn_heavy_count") or 0) + pending_heavy > \
+            config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN:
+        return (f"本轮收集/解读资料已经做了 {config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN} 次，"
+                "一次做太多会拖很久。请先就用现有资料继续，把剩下的主题留到下一步——"
+                "或者告诉我先做哪一个。")
     cur = [f"{tc['name']}:{json.dumps(tc['arguments'], sort_keys=True, ensure_ascii=False)}"
            for tc in last_tc]
     sigs = state.get("last_tool_signatures") or []

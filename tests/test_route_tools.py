@@ -484,3 +484,76 @@ def test_update_roadmap_blocks_after_two_rejections(monkeypatch):
     assert "停止调用 update_roadmap" in out3["instruction"]
     assert len(calls) == 2  # 第 3 次未调 LLM 验收
     assert ctx.updates["coach_verify_rejects"] == 2
+
+# ---------- 贵工具失败闸：失败后不许同回合重跑（重跑 = 搜索+抓取+生成全重演） ----------
+
+def _failed_collect(stage):
+    from src.pipelines.collect import CollectStageError
+    return CollectStageError(stage, RuntimeError("boom"))
+
+
+def test_collect_generate_failure_blocks_rerun(monkeypatch):
+    """生成段失败（搜索与抓取都已成功过）→ 同回合第二次 collect 被拒。"""
+    def fake_collect(*a, **kw):
+        raise _failed_collect("generate")
+
+    monkeypatch.setattr(route_mod, "collect_pipeline", fake_collect)
+    ctx = _ctx()
+    assert run_coach_tool("collect", {"tech": "Redis"}, ctx)["status"] == "error"
+    assert ctx.updates["coach_heavy_failures"]["collect"] == {"count": 1, "stage": "generate"}
+
+    ctx2 = _ctx({"tech": "Redis", "coach_heavy_failures": ctx.updates["coach_heavy_failures"]})
+    blocked = run_coach_tool("collect", {"tech": "Redis"}, ctx2)
+    assert blocked["status"] == "blocked"
+    assert "不要再调用" in blocked["hint"]
+
+
+def test_collect_search_failure_allows_one_rerun(monkeypatch):
+    """搜索段首次失败放行重跑一次（流水线还没烧抓取与生成）；第二次失败起拦。"""
+    def fake_collect(*a, **kw):
+        raise _failed_collect("search")
+
+    monkeypatch.setattr(route_mod, "collect_pipeline", fake_collect)
+    ctx = _ctx()
+    run_coach_tool("collect", {"tech": "Redis"}, ctx)
+    rec = ctx.updates["coach_heavy_failures"]["collect"]
+    assert rec == {"count": 1, "stage": "search"}
+    # 第二次：仍放行（早期失败 + 只失败过一次）
+    ctx2 = _ctx({"tech": "Redis", "coach_heavy_failures": {"collect": rec}})
+    assert run_coach_tool("collect", {"tech": "Redis"}, ctx2)["status"] == "error"
+    # 第三次：已失败两次 → 拦
+    ctx3 = _ctx({"tech": "Redis", "coach_heavy_failures": {"collect": {"count": 2, "stage": "search"}}})
+    assert run_coach_tool("collect", {"tech": "Redis"}, ctx3)["status"] == "blocked"
+
+
+def test_collect_param_error_allows_retry(monkeypatch):
+    """参数错误（缺 tech）不记失败：模型补上参数再调是正当的。"""
+    ctx = _ctx({"tech": "", "survey_answers": {}, "learner_profile": {}})
+    assert run_coach_tool("collect", {}, ctx)["status"] == "error"
+    assert not ctx.updates.get("coach_heavy_failures")
+
+
+def test_read_failure_blocks_rerun(monkeypatch):
+    """read 的 LLM 段失败（抓取额度已烧）→ 同回合不再放行。"""
+    from src.pipelines.read import ReadStageError
+
+    def fake_read(url, progress=None):
+        raise ReadStageError("generate", RuntimeError("boom"))
+
+    monkeypatch.setattr(route_mod, "read_pipeline", fake_read)
+    ctx = _ctx()
+    assert run_coach_tool("read", {"url": "http://x"}, ctx)["status"] == "error"
+    ctx2 = _ctx({"tech": "t", "coach_heavy_failures": ctx.updates["coach_heavy_failures"]})
+    assert run_coach_tool("read", {"url": "http://x"}, ctx2)["status"] == "blocked"
+
+
+def test_collect_tool_surfaces_incomplete_resources(monkeypatch):
+    """资料没取到（resource_ok=False）必须透给模型，别让它当资料齐全继续推进。"""
+    monkeypatch.setattr(route_mod, "collect_pipeline",
+                        lambda tech, focus=None, progress=None: {
+                            "urls": [], "report": "残缺报告",
+                            "materials_path": "materials/x.md", "resource_ok": False})
+    out = run_coach_tool("collect", {"tech": "Redis"}, _ctx())
+    assert out["status"] == "ok"
+    assert out["resource_ok"] is False
+    assert "没有取到文档正文" in out["note"]

@@ -168,7 +168,8 @@ def note_pipeline(tech: str, conversation_log: str,
     # 2. 差量提取：只输出新增知识点（可输出 []）
     if progress:
         progress("🧠 LLM 差量提取知识点...")
-    raw = generate_text(EXTRACT_SYSTEM_PROMPT, _build_extraction_user(tech, conversation_log, existing))
+    raw = generate_text(EXTRACT_SYSTEM_PROMPT, _build_extraction_user(tech, conversation_log, existing),
+                        call_site="note.extract")
     entries = parse_entries(raw)
 
     existing_all = get_existing_notes(tech)
@@ -249,7 +250,7 @@ def suggest_directions(tech: str, materials_path: str | None, existing_topics: l
         f"===== 已有学习资料摘录 =====\n{materials}\n"
         f"===== 知识库已覆盖的主题 =====\n{topics_block}"
     )
-    suggestion = generate_text(SUGGEST_SYSTEM_PROMPT, user_content)
+    suggestion = generate_text(SUGGEST_SYSTEM_PROMPT, user_content, call_site="note.suggest")
     return suggestion.strip()
 
 
@@ -273,7 +274,7 @@ def merge_notes(old_content: str, new_content: str, topic: str) -> dict:
         f"===== 已有笔记正文 =====\n{old_body}\n\n"
         f"===== 新提取的知识点（主题：{topic}） =====\n{new_content}"
     )
-    raw = generate_text(MERGE_SYSTEM_PROMPT, user_content).strip()
+    raw = generate_text(MERGE_SYSTEM_PROMPT, user_content, call_site="note.merge").strip()
     obj = parse_json_object(raw)
     content = obj.get("content")
     if not content or not str(content).strip():

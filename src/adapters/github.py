@@ -12,6 +12,16 @@ import urllib.request
 _GITHUB_RE = re.compile(r"https?://(?:www\.)?github\.com/([^/]+)/([^/?#]+)")
 
 
+def is_repo_url(url: str) -> bool:
+    """形如 github.com/{owner}/{repo} 的链接（星数查询的准入预筛）。
+
+    只是粗筛（看路径形状）：`/orgs/x`、`/a/issues` 这类同样会通过——真正的判定在
+    `fetch_star_count`（拿到 404 返回 None）。预筛的价值是别把明显不是 github 的链接
+    塞进有限的查询名额（`GITHUB_STAR_MAX_LOOKUPS`）。
+    """
+    return bool(_GITHUB_RE.match(url or ""))
+
+
 def fetch_star_count(url: str, token: str | None = None) -> int | None:
     """查询 GitHub 仓库的 star 数。
 

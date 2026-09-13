@@ -3,20 +3,50 @@
 运行：PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -m pytest tests/test_llm_chat_tools.py -v
 """
 
+import json
+import logging
 import sys
+import time
 from pathlib import Path
 
 import httpx
 import pytest
-from openai import APIConnectionError, APIStatusError
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.adapters import llm as llm_mod
-from src.adapters.llm import ToolCallError, chat_with_tools
+from src.adapters.llm import ToolCallError, chat_with_tools, generate_text
 from src.config import config
 
 _REQ = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+
+
+def _resp(msg, finish_reason="stop", prompt_tokens=100, completion_tokens=20):
+    """造贴近真实 SDK 的响应对象：埋点要读 finish_reason 与 usage。"""
+    usage = type("Usage", (), {"prompt_tokens": prompt_tokens,
+                               "completion_tokens": completion_tokens})()
+    choice = type("Choice", (), {"message": msg, "finish_reason": finish_reason})()
+    return type("Resp", (), {"choices": [choice], "usage": usage})()
+
+
+class _Capture(logging.Handler):
+    """收集本模块 logger 输出的 JSON 行（验证真实产出路径）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.lines: list[dict] = []
+
+    def emit(self, record):
+        self.lines.append(json.loads(record.getMessage()))
+
+
+@pytest.fixture
+def log_capture(monkeypatch):
+    """替换 logger 的 handler 列表：既捕获日志，也避免 _ensure_handler 挂 stderr。"""
+    cap = _Capture()
+    monkeypatch.setattr(llm_mod._LOGGER, "handlers", [cap])
+    return cap
 
 
 def _status_error(code: int) -> APIStatusError:
@@ -26,6 +56,10 @@ def _status_error(code: int) -> APIStatusError:
 
 def _conn_error() -> APIConnectionError:
     return APIConnectionError(request=_REQ)
+
+
+def _timeout_error() -> APITimeoutError:
+    return APITimeoutError(request=_REQ)
 
 
 class _FakeTime:
@@ -70,11 +104,12 @@ def _tc(call_id, name, arguments):
 
 
 class _FakeClient:
-    """按序弹出预置消息；记录每次 create 的 kwargs。"""
+    """按序弹出预置消息；记录每次 create 的 kwargs。delay > 0 时模拟慢调用。"""
 
-    def __init__(self, responses):
+    def __init__(self, responses, delay=0.0):
         self.responses = list(responses)
         self.calls = []
+        self.delay = delay
 
     @property
     def chat(self):
@@ -86,8 +121,10 @@ class _FakeClient:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        msg = self.responses.pop(0)
-        return type("Resp", (), {"choices": [type("Choice", (), {"message": msg})()]})()
+        if self.delay:
+            time.sleep(self.delay)
+        item = self.responses.pop(0)
+        return item if hasattr(item, "choices") else _resp(item)
 
 
 class _FlakyClient:
@@ -111,7 +148,7 @@ class _FlakyClient:
         self.calls.append(kwargs)
         if len(self.calls) <= self.fail_times:
             raise self.exc
-        return type("Resp", (), {"choices": [type("Choice", (), {"message": self.response})()]})()
+        return _resp(self.response)
 
 
 class _SlowFailClient:
@@ -218,6 +255,18 @@ def test_retry_budget_cuts_retries_short(monkeypatch, fake_time):
     assert len(client.calls) == 3
 
 
+def test_timeout_fails_fast_without_retry_or_degrade(monkeypatch):
+    """超时立即失败：不重试、也不降级——重发等于把整条 prompt 再烧一遍、再让用户等一遍。"""
+    client = _FlakyClient(fail_times=99, response=_msg("x"), exc=_timeout_error())
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    with pytest.raises(ToolCallError) as ei:
+        chat_with_tools("s", [], _TOOLS)
+    assert ei.value.fatal is False          # 不是配置错，别让用户去查 key/模型名
+    assert "超时" in str(ei.value)
+    assert len(client.calls) == 1           # 不重试
+    assert "tools" in client.calls[0]       # 也没走降级
+
+
 def test_raises_tool_call_error_when_fallback_disabled(monkeypatch):
     client = _FlakyClient(fail_times=100, response=_msg("x"))
     monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
@@ -316,3 +365,164 @@ def test_unexpected_exception_propagates(monkeypatch):
     with pytest.raises(TypeError):
         chat_with_tools("s", [], _TOOLS)
     assert len(client.calls) == 1
+
+
+# ---------- generate_text：报告通道的超时与埋点 ----------
+
+def test_generate_text_uses_report_timeout(monkeypatch):
+    """报告通道用独立超时（远大于对话通道）：输入数万字符、输出整篇资料，对话级的 45s 不够。"""
+    client = _FakeClient([_msg("报告正文")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    out = generate_text("sys", "content", call_site="collect.report")
+    assert out == "报告正文"
+    assert client.calls[0]["timeout"] == config.LLM_REPORT_TIMEOUT
+    assert client.calls[0]["timeout"] > config.LLM_REQUEST_TIMEOUT
+
+
+def test_generate_text_single_attempt_no_retry(monkeypatch):
+    """只打一次、不重试：长任务重发等于再烧一份 token 再等一轮（SDK 重试也已被关掉）。"""
+    client = _FlakyClient(fail_times=99, response=_msg("x"), exc=_status_error(503))
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    with pytest.raises(Exception):
+        generate_text("sys", "content")
+    assert len(client.calls) == 1
+
+
+def test_generate_text_logs_finish_reason_and_usage(monkeypatch, log_capture):
+    """埋点要能直接读出「截断」：finish_reason=length + token 数 + 调用点。"""
+    client = _FakeClient([_resp(_msg("被截断的正文"), finish_reason="length",
+                                prompt_tokens=3912, completion_tokens=4096)])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    generate_text("sys", "content", call_site="collect.report")
+    line = next(ln for ln in log_capture.lines if ln["event"] == "llm_call")
+    assert line["site"] == "collect.report"
+    assert line["status"] == "ok" and line["fallback"] is False
+    assert line["finish_reason"] == "length"
+    assert line["prompt_tokens"] == 3912 and line["completion_tokens"] == 4096
+    assert line["elapsed_s"] >= 0
+
+
+def test_generate_text_logs_error_with_kind_and_http(monkeypatch, log_capture):
+    client = _FlakyClient(fail_times=99, response=_msg("x"), exc=_status_error(429))
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    with pytest.raises(Exception):
+        generate_text("sys", "content", call_site="read.report")
+    line = log_capture.lines[-1]
+    assert line["site"] == "read.report"
+    assert line["status"] == "error" and line["kind"] == "retry" and line["http"] == 429
+    assert "APIStatusError" in line["error"]
+
+
+def test_chat_logs_every_attempt_and_fallback(monkeypatch, log_capture):
+    """重试路径可数：每次尝试一行，降级那次 attempt=0 + fallback=true。"""
+    client = _FlakyClient(fail_times=config.LLM_MAX_ATTEMPTS, response=_msg("降级答复"))
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    out = chat_with_tools("s", [], _TOOLS, call_site="coach.chat")
+    assert out["fallback"] is True
+    assert [line["attempt"] for line in log_capture.lines] == [1, 2, 3, 0]
+    assert [line["fallback"] for line in log_capture.lines] == [False, False, False, True]
+    assert all(line["site"] == "coach.chat" for line in log_capture.lines)
+
+
+def test_log_never_contains_prompt_or_output(monkeypatch, log_capture):
+    """日志只记元数据：学习内容（提示词 / 正文 / 回复）一律不进日志。"""
+    secret = "用户的私有笔记内容-SECRET-42"
+    client = _FakeClient([_msg("回复里的私有内容-SECRET-99")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    generate_text(f"系统提示-{secret}", f"用户内容-{secret}", call_site="qa.answer")
+    dump = json.dumps(log_capture.lines, ensure_ascii=False)
+    assert secret not in dump
+    assert "SECRET-99" not in dump
+
+
+# ---------- 报告 token 预算与截断标注 ----------
+
+def test_generate_text_max_tokens_override(monkeypatch):
+    """整篇报告要能要独立预算：对话级的 4096 装不下（实测最长报告约 5K token）。"""
+    client = _FakeClient([_msg("报告")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    generate_text("s", "u", max_tokens=config.REPORT_MAX_TOKENS)
+    assert client.calls[0]["max_tokens"] == config.REPORT_MAX_TOKENS
+    assert client.calls[0]["max_tokens"] > config.LLM_MAX_TOKENS
+
+
+def test_generate_text_max_tokens_defaults_to_conversation_budget(monkeypatch):
+    """不传就还是对话级预算：判定类调用点（dedup / note / verify）不受影响。"""
+    client = _FakeClient([_msg("ok")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    generate_text("s", "u")
+    assert client.calls[0]["max_tokens"] == config.LLM_MAX_TOKENS
+
+
+def test_truncation_appends_notice_and_warns(monkeypatch, log_capture):
+    """被截断：正文末尾挂显式标注 + WARNING 级日志（残篇不能伪装成完篇）。"""
+    client = _FakeClient([_resp(_msg("半篇正文"), finish_reason="length",
+                                prompt_tokens=100, completion_tokens=8000)])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    out = generate_text("s", "u", max_tokens=config.REPORT_MAX_TOKENS,
+                        call_site="collect.report",
+                        truncation_notice=llm_mod.REPORT_TRUNCATION_NOTICE)
+    assert out.startswith("半篇正文")
+    assert out.endswith(llm_mod.REPORT_TRUNCATION_NOTICE)
+    assert "未写完" in out
+    assert any(line.get("event") == "llm_truncated" for line in log_capture.lines)
+
+
+def test_truncation_not_annotated_when_caller_omits_notice(monkeypatch):
+    """判定类调用点不传标注 → 正文原样返回（它们的输出是 JSON，加了标注会破坏解析）。"""
+    client = _FakeClient([_resp(_msg('{"verdict": "same"}'), finish_reason="length")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    out = generate_text("s", "u", call_site="dedup.judge")
+    assert out == '{"verdict": "same"}'
+
+
+def test_no_notice_when_not_truncated(monkeypatch):
+    """正常收尾（stop）不加任何标注，即使调用点传了标注文本。"""
+    client = _FakeClient([_resp(_msg("完整报告"), finish_reason="stop")])
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    out = generate_text("s", "u", truncation_notice=llm_mod.REPORT_TRUNCATION_NOTICE)
+    assert out == "完整报告"
+
+
+# ---------- 长调用心跳（报告生成期间的可见性） ----------
+
+def test_heartbeat_emits_while_call_runs(monkeypatch):
+    """慢调用期间要周期发「仍在进行…（已 Ns）」：报告生成占管道耗时 99%，原本全静默。"""
+    monkeypatch.setattr(config, "LLM_HEARTBEAT_SECONDS", 0.05)
+    client = _FakeClient([_msg("# 报告")], delay=0.2)
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    seen: list[str] = []
+    generate_text("s", "u", progress=seen.append, progress_label="LLM 生成学习资料")
+
+    beats = [m for m in seen if "仍在进行" in m]
+    assert beats, f"未发出心跳：{seen}"
+    assert "LLM 生成学习资料" in beats[0]
+    assert "已" in beats[0] and "s）" in beats[0]
+
+
+def test_heartbeat_stops_after_call_returns(monkeypatch):
+    """调用返回后心跳必须停：否则会在工具已结束之后继续往会话里塞消息。"""
+    import time as _t
+
+    monkeypatch.setattr(config, "LLM_HEARTBEAT_SECONDS", 0.05)
+    client = _FakeClient([_msg("# 报告")], delay=0.15)
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    seen: list[str] = []
+    generate_text("s", "u", progress=seen.append)
+
+    n_after_return = len(seen)
+    _t.sleep(0.2)                        # 等 4 个心跳周期，若没停就会继续增长
+    assert len(seen) == n_after_return
+
+
+def test_heartbeat_disabled_without_progress_or_interval(monkeypatch):
+    """没有回调、或间隔为 0 时不启动心跳（不留旁路线程）。"""
+    monkeypatch.setattr(config, "LLM_HEARTBEAT_SECONDS", 0.05)
+    client = _FakeClient([_msg("a"), _msg("b")], delay=0.1)
+    monkeypatch.setattr(llm_mod, "OpenAI", lambda **kw: client)
+    assert generate_text("s", "u") == "a"           # 无回调：不炸
+
+    monkeypatch.setattr(config, "LLM_HEARTBEAT_SECONDS", 0)
+    seen: list[str] = []
+    assert generate_text("s", "u", progress=seen.append) == "b"
+    assert seen == []                                # 关掉心跳：一条不发

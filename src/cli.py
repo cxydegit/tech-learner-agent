@@ -432,12 +432,23 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
     """
     from langgraph.types import Command
 
+    from .graph import web_progress
+
+    thread_id = (gconfig.get("configurable") or {}).get("thread_id")
     while True:
         # recursion_limit 是运行 config 的一部分（防 coach 循环失控打转）
         run_config = {**gconfig, "recursion_limit": gconfig.get("recursion_limit", config.ROUTE_RECURSION_LIMIT)}
-        stream = graph.stream_events(payload, run_config, version="v3")
-        if not stream.interrupted:
-            final = stream.output
+        # 注册进度回调：collect/read 这类贵工具要跑几分钟，没有它 CLI 会长时间静默
+        # （收集/抓取/生成各阶段的进度都经这个回调打出来）。与 Web 走同一套注册表。
+        # ⚠️ .interrupted / .interrupts / .output 必须在 with 内读：v3 流式的节点可能仍在
+        # 后台线程跑，出了 with 注册表就被注销，进度会丢。
+        with web_progress(thread_id, lambda m: console.print(f"[dim]{m}[/dim]")):
+            stream = graph.stream_events(payload, run_config, version="v3")
+            interrupted = stream.interrupted
+            interrupts = stream.interrupts
+            output = stream.output
+        if not interrupted:
+            final = output
             last = (final or {}).get("last_output")
             if last:
                 if render == "markdown":
@@ -446,7 +457,7 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
                     console.print(last)
             return final
         resumed = False
-        for intr in stream.interrupts:
+        for intr in interrupts:
             val = intr.value
             if isinstance(val, dict) and val.get("type") == "coach_question":
                 # coach 循环：interrupt 负载是结构化问题（mode / tech / message）
@@ -461,7 +472,7 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
             resumed = True
         if not resumed:
             # 理论不可达：interrupted 却无 interrupt 负载，避免死循环
-            return stream.output
+            return output
 
 
 def _print_graph_status(graph, gconfig) -> None:

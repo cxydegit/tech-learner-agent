@@ -32,7 +32,7 @@ def _seed_hits():
 def test_grouping_by_path(monkeypatch):
     """同 path 多条命中归为一组，best_similarity 取最大，组按相似度降序。"""
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
-    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u: "答案：两种分块方式")
+    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u, **_kw: "答案：两种分块方式")
     res = qa_mod.qa_pipeline("分块方式", top_k=8)
     assert res["no_hit"] is False
     # 3 条命中跨 2 篇笔记 → 2 组，不重复计数同篇片段
@@ -98,7 +98,7 @@ def test_no_hit_when_model_says_not_recorded(monkeypatch):
     """检索有命中，但模型明确说「笔记里没有记录」→ no_hit=True（触发 collect 引导）。"""
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
     monkeypatch.setattr(qa_mod, "generate_text",
-                        lambda s, u: "笔记里没有记录 Redis 分布式锁的实现原理。")
+                        lambda s, u, **_kw: "笔记里没有记录 Redis 分布式锁的实现原理。")
     res = qa_mod.qa_pipeline("Redis分布式锁的实现原理")
     assert res["no_hit"] is True
     assert "笔记里没有记录" in res["answer"]
@@ -108,7 +108,7 @@ def test_no_hit_false_when_covered(monkeypatch):
     """检索有命中且模型正常回答 → no_hit=False（不触发 collect 引导）。"""
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
     monkeypatch.setattr(qa_mod, "generate_text",
-                        lambda s, u: "笔记提到两种分块方式：（来源：knowledge/rag/文档分块，相关度 0.93）")
+                        lambda s, u, **_kw: "笔记提到两种分块方式：（来源：knowledge/rag/文档分块，相关度 0.93）")
     res = qa_mod.qa_pipeline("分块方式")
     assert res["no_hit"] is False
 
@@ -123,7 +123,7 @@ def test_tech_passthrough(monkeypatch):
         captured.update(question=question, top_k=top_k, tech=tech)
         return _seed_hits()
     monkeypatch.setattr(qa_mod, "_search_notes", fake_search)
-    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u: "ok")
+    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u, **_kw: "ok")
     res = qa_mod.qa_pipeline("分块", tech="fastapi", top_k=8)
     assert res["no_hit"] is False
     assert captured["tech"] == "fastapi"
@@ -134,7 +134,7 @@ def test_answer_cites_source(monkeypatch):
     """答案能引用对应笔记（canned 答案原样回传，验证来源标注路径打通）。"""
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
     canned = "笔记中提到两种分块方式……（来源：knowledge/rag/文档分块，相关度 0.93）"
-    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u: canned)
+    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u, **_kw: canned)
     res = qa_mod.qa_pipeline("分块")
     assert res["answer"] == canned
     assert "knowledge/rag" in res["answer"]
@@ -144,7 +144,7 @@ def test_history_in_user_content(monkeypatch):
     """对话历史 prepend 进 user_content（多轮上下文生效）；QA_PROMPT 作 system。"""
     captured = {}
 
-    def fake_generate(system, user):
+    def fake_generate(system, user, **_kw):
         captured["system"] = system
         captured["user"] = user
         return "ok"
@@ -163,7 +163,7 @@ def test_history_answer_appendix_stripped(monkeypatch):
     captured = {}
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
     monkeypatch.setattr(qa_mod, "generate_text",
-                        lambda s, u: captured.update(user=u) or "ok")
+                        lambda s, u, **_kw: captured.update(user=u) or "ok")
     history = [{"question": "旧问题",
                 "answer": "旧答案。\n\n📚 来源笔记\n• knowledge/old.md（主题：x，相关度 0.9）"}]
     qa_mod.qa_pipeline("分块", history=history)
@@ -205,6 +205,6 @@ def test_pipeline_strips_appendix(monkeypatch):
     monkeypatch.setattr(qa_mod, "_search_notes", lambda q, k, t: _seed_hits())
     monkeypatch.setattr(
         qa_mod, "generate_text",
-        lambda s, u: "答案正文。\n\n📚 来源笔记\n• knowledge/redis/xxx.md（主题：x，相关度 0.9）")
+        lambda s, u, **_kw: "答案正文。\n\n📚 来源笔记\n• knowledge/redis/xxx.md（主题：x，相关度 0.9）")
     res = qa_mod.qa_pipeline("分块")
     assert res["answer"] == "答案正文。"

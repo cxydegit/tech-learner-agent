@@ -15,7 +15,7 @@ from ..config import config
 from ..domain import exit_intent, survey
 from ..domain import roadmap as roadmap_domain
 from ..domain.extraction import parse_json_object
-from .collect import collect_pipeline
+from .collect import CollectStageError, collect_pipeline
 from .note import (
     format_merge_candidates,
     note_pipeline,
@@ -23,7 +23,7 @@ from .note import (
     persist_points,
 )
 from .qa import _search_notes, qa_pipeline
-from .read import read_pipeline
+from .read import ReadStageError, read_pipeline
 
 # ============================================================
 # coach 系统提示词（按 mode）
@@ -445,24 +445,42 @@ def _collect(args: dict, ctx: CoachCtx) -> dict:
     tech = str(args.get("tech") or "").strip() or ctx.tech
     if not tech:
         return {"status": "error", "error": "collect 需要 tech"}
+    blocked = _heavy_blocked(ctx, "collect")
+    if blocked:
+        return blocked
     focus = str(args.get("focus") or "").strip() or None
     try:
         result = collect_pipeline(tech, focus, progress=ctx.progress)
+    except CollectStageError as e:
+        _record_heavy_failure(ctx, "collect", e.stage)
+        return {"status": "error", "error": str(e)}
     except Exception as e:  # noqa: BLE001 —— 回喂模型修正
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
     ctx.updates["coach_doc"] = {"path": result["materials_path"], "type": "collect"}
-    return {"status": "ok", "materials_path": result["materials_path"],
-            "url_count": len(result["urls"]),
-            "report_excerpt": (result["report"] or "")[:800],
-            "note": "资料报告已保存，可据此推进学习。"}
+    out = {"status": "ok", "materials_path": result["materials_path"],
+           "url_count": len(result["urls"]),
+           "report_excerpt": (result["report"] or "")[:800],
+           "note": "资料报告已保存，可据此推进学习。"}
+    if not result.get("resource_ok", True):
+        # 这次没拿到资料（抓取全失败 / 搜索无结果）：报告里已如实标注，明确要求模型别当资料齐全
+        out["resource_ok"] = False
+        out["note"] = ("本次没有取到文档正文（报告里已如实标注资料不完整）。"
+                       "请向用户说明情况并建议稍后重试，不要据此推进学习内容。")
+    return out
 
 
 def _read(args: dict, ctx: CoachCtx) -> dict:
     url = str(args.get("url") or "").strip()
     if not url:
         return {"status": "error", "error": "read 需要 url"}
+    blocked = _heavy_blocked(ctx, "read")
+    if blocked:
+        return blocked
     try:
         result = read_pipeline(url, progress=ctx.progress)
+    except ReadStageError as e:
+        _record_heavy_failure(ctx, "read", e.stage)
+        return {"status": "error", "error": str(e)}
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
     if result.get("error"):
@@ -740,7 +758,7 @@ def verify_milestone(milestone_desc: str, transcript: str) -> dict:
     """
     payload = VERIFY_MILESTONE_PROMPT.format(milestone=milestone_desc, transcript=transcript)
     try:
-        raw = generate_text(payload, "请按要求只输出 JSON。")
+        raw = generate_text(payload, "请按要求只输出 JSON。", call_site="verify.milestone")
     except Exception:  # noqa: BLE001 —— 验收器故障降级放行
         return {"verified": None, "missing": [], "reason": "验收器异常，本次跳过验收"}
     obj = parse_json_object(raw)
@@ -886,6 +904,40 @@ _TOOL_IMPL = {
     "revise_roadmap": _revise_roadmap,
 }
 
+# 「贵工具」：单次执行会烧外部额度（Tavily 搜索 / Firecrawl 抓取）+ 分钟级耗时。
+# ask（本地 RAG + 一次 LLM）与 note（本地沉淀）不算贵，不进这个集合。
+# 用途：① 单轮上限（graph._coach_guard）② 失败后拒绝同回合重跑（见 _heavy_blocked）。
+HEAVY_TOOLS = frozenset({"collect", "read"})
+
+# 早期阶段：流水线还没烧抓取与生成，允许放行一次重跑；其余阶段失败即拒（重跑要全部重演）
+_EARLY_STAGES = frozenset({"search"})
+
+
+def _heavy_blocked(ctx: CoachCtx, tool: str) -> dict | None:
+    """贵工具失败闸：同回合内失败过的贵工具不再让它重跑。
+
+    重跑 = 重新搜索 + 重新抓取 + 重新生成（含外部额度与分钟级耗时），而这些在失败前大多
+    已经成功过。搜索段的首次失败例外放行（早期失败，流水线未烧）。
+    """
+    rec = (ctx.state.get("coach_heavy_failures") or {}).get(tool) or {}
+    count, stage = int(rec.get("count") or 0), rec.get("stage")
+    if count == 0 or (count == 1 and stage in _EARLY_STAGES):
+        return None
+    return {
+        "status": "blocked",
+        "hint": (f"{tool} 本回合已经失败过一次（{stage} 阶段），不要再调用它：重跑会重新搜索、"
+                 "重新抓取、重新生成，白烧搜索/抓取额度。请直接把情况告诉用户，建议稍后再试。"),
+    }
+
+
+def _record_heavy_failure(ctx: CoachCtx, tool: str, stage: str) -> None:
+    """记下贵工具的失败（同回合后续调用据 _heavy_blocked 拦截）。"""
+    prior = dict(ctx.state.get("coach_heavy_failures") or {})
+    rec = prior.get(tool) or {}
+    ctx.updates["coach_heavy_failures"] = {
+        **prior, tool: {"count": int(rec.get("count") or 0) + 1, "stage": stage},
+    }
+
 
 def run_coach_tool(name: str, args: dict, ctx: CoachCtx) -> dict:
     """按名分发工具；未知工具返回错误（护栏层保证不会出现）。"""
@@ -959,7 +1011,7 @@ def consolidate_memory(existing: dict, messages: list[dict], tech: str) -> dict:
                     f"===== 现有未决事项 =====\n{open_txt}\n"
                     f"===== 刚发生的对话 =====\n{block}")
     try:
-        raw = generate_text(CONSOLIDATE_MEMORY_PROMPT, user_content)
+        raw = generate_text(CONSOLIDATE_MEMORY_PROMPT, user_content, call_site="coach.consolidate")
     except Exception:  # noqa: BLE001 —— LLM 不可用时三舱原样保留
         return {"facts": facts, "open_items": open_items, "summary": old_summary}
     obj = parse_json_object(raw)

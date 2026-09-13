@@ -184,7 +184,7 @@ def test_write_pending_sets_state(monkeypatch):
 
 # ============ 图级 e2e：coach 对话积累触发自动沉淀 ============
 
-def _scripted_sweep_chat(system_prompt, messages, tools):
+def _scripted_sweep_chat(system_prompt, messages, tools, **_kw):
     """问卷固定提问 + planning 工具脚本 + coaching 纯讲解（无工具调用）。"""
     if "水平探测助手" in system_prompt:
         if "正在收集字段：自评熟悉度" in system_prompt:

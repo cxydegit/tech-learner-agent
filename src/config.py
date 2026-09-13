@@ -22,8 +22,25 @@ class Config:
     # LLM 配置
     LLM_MODEL: str = os.getenv("MODEL_NAME", "")
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "4096"))
-    # 单次请求超时（秒）：SDK 默认 600s（10 分钟），交互式 coach 循环会被挂死，必须收紧
+    # 报告类生成（collect 资料报告 / read 解读报告）的独立 token 预算：对话级的 4096 对整篇
+    # 报告不够。实测 29 篇资料 + 26 篇解读报告：token 中位数 ~1.8K、p90 ~3.5K、最大 ~5.0K
+    # （估算值），超过 4096 的 4 篇全在长尾，而长尾正是被硬截断的那批。
+    # ⚠️ 本值必须与 LLM_REPORT_TIMEOUT 联立：最坏耗时 ≈ 本值 ÷ 实测吞吐（184 tok/s 下
+    # 8000 token ≈ 43s，对 120s 超时留 2.8× 余量）；换更慢的模型要同时调这两个数，否则就是
+    # 「上限抬了、超时没抬」——旧事故的形态。
+    REPORT_MAX_TOKENS: int = int(os.getenv("REPORT_MAX_TOKENS", "8000"))
+    # 工具调用通道单次请求超时（秒）。SDK 默认 600s（10 分钟），交互式 coach 循环会被挂死。
+    # 45s 的依据是实测（deepseek-flash / 腾讯 MaaS）：满 4096 token 输出实测
+    # 22.8s（≈180 tok/s），即最坏合法时长 ≈ 23s，45s 留约 2× 余量。
+    # ⚠️ 本文件所有超时数字都绑定当时的模型速度，换模型/网关必须重测
     LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "45"))
+    # 报告生成通道（generate_text）单次请求超时（秒）：输入是数万字符抓取正文、输出是整篇
+    # 学习资料，一次性长任务，失败代价高（整轮 collect 白做）。
+    LLM_REPORT_TIMEOUT: float = float(os.getenv("LLM_REPORT_TIMEOUT", "120"))
+    # 长调用心跳间隔（秒）：报告生成是整条管道耗时占 99% 的一步，而它期间原本没有任何中间信号
+    # （用户看到「🧠 LLM 生成...」之后长时间静止）。挂心跳后每隔这么久发一条「仍在进行…（已 Ns）」。
+    # 0 表示关闭。
+    LLM_HEARTBEAT_SECONDS: float = float(os.getenv("LLM_HEARTBEAT_SECONDS", "30"))
     # 重试预算（工具调用通道）：瞬时错误（连接/超时/429/5xx）最多尝试 LLM_MAX_ATTEMPTS 次，
     # 且全部尝试合计不超过 LLM_RETRY_BUDGET_SECONDS（从首次请求起算，超预算立即降级）。
     # 退避 = LLM_RETRY_BASE_DELAY × 2^第几次 + 抖动。确定性错误（key/模型名/请求体不合法）
@@ -88,6 +105,10 @@ class Config:
     # 定制化学习路线（模块 2）：coach agent 循环配置
     # 工具调用护栏：每用户回合最大连续工具调用数（超限强制 interrupt 找用户确认方向，防死循环）
     ROUTE_MAX_TOOL_CALLS_PER_TURN: int = int(os.getenv("ROUTE_MAX_TOOL_CALLS_PER_TURN", "8"))
+    # 贵工具（collect / read）单轮上限：这两个工具单次要烧搜索/抓取额度 + 分钟级耗时。
+    # 取 2 是依据真实事故形态——模型一轮里要了两个不同主题的 collect（是合法需求，不该禁），
+    # 但再往上就只是把最坏回合时长线性拉长（每次约 +3.75 分钟）。超限不硬拒，改为停下来问用户。
+    ROUTE_MAX_HEAVY_TOOLS_PER_TURN: int = int(os.getenv("ROUTE_MAX_HEAVY_TOOLS_PER_TURN", "2"))
 
     # 图级执行硬上限（LangGraph recursion_limit，防 agent 失控打转）
     ROUTE_RECURSION_LIMIT: int = int(os.getenv("ROUTE_RECURSION_LIMIT", "50"))
@@ -159,6 +180,12 @@ class Config:
     QA_RERANK_LEXICAL: bool = os.getenv("QA_RERANK_LEXICAL", "true").lower() == "true"
     QA_RERANK_LEXICAL_W: float = float(os.getenv("QA_RERANK_LEXICAL_W", "0.5"))
     QA_RERANK_MIN_HITS: int = int(os.getenv("QA_RERANK_MIN_HITS", "3"))
+
+    # GitHub 星数查询（质量预筛的加分信号）：并发查询 + 条数上限。
+    # 上限是硬要求——预筛的输入是全部去重后的搜索结果（最多 3~4 条 query × 10 条），
+    # 逐条串行查最坏几百秒，而星数只是个加分项，不值得拖慢 collect。
+    GITHUB_STAR_MAX_LOOKUPS: int = int(os.getenv("GITHUB_STAR_MAX_LOOKUPS", "10"))
+    GITHUB_STAR_WORKERS: int = int(os.getenv("GITHUB_STAR_WORKERS", "5"))
 
     # 质量筛选（screen_results 预筛阈值与名单，全进 config 不进代码）
     QUALITY_DOMAIN_BONUS_OFFICIAL: int = int(os.getenv("QUALITY_DOMAIN_BONUS_OFFICIAL", "20"))

@@ -9,8 +9,9 @@ from collections.abc import Callable
 from datetime import datetime
 
 from ..adapters.fetch import fetch_tool
-from ..adapters.llm import current_time_label, generate_text, replace_time_line
+from ..adapters.llm import REPORT_TRUNCATION_NOTICE, current_time_label, generate_text, replace_time_line
 from ..adapters.store import index_file_lazy, save_file_tool
+from ..config import config
 from ..domain.dedup import sanitize_filename
 from ..domain.extraction import parse_classify
 
@@ -93,6 +94,7 @@ flowchart TD
 - 如果内容不完整或抓取失败，诚实标注"待验证"
 - 如果内容过长需要取舍，优先保留核心概念、关键步骤和可运行代码
 - 报告中的「解读时间」必须使用我提供的当前系统时间（{now}），不要自行推断或编造日期
+- 报告不要太过冗长，字数控制在 800~2000 汉字
 """
 
 
@@ -115,6 +117,7 @@ def _classify_technical(url: str, title: str, markdown: str) -> tuple[bool, str]
         CLASSIFY_DOC_PROMPT,
         f"文档标题：{title or '未知'}\n链接：{url}\n\n"
         f"===== 内容片段 =====\n{markdown[:3000]}\n===== 内容结束 =====",
+        call_site="read.classify",
     )
     decision = parse_classify(raw)
     is_tech = str(decision.get("is_technical", "true")).strip().lower() in ("true", "1", "yes")
@@ -125,6 +128,19 @@ def _classify_technical(url: str, title: str, markdown: str) -> tuple[bool, str]
 # ============================================================
 # read_pipeline
 # ============================================================
+
+class ReadStageError(Exception):
+    """read 失败带阶段标签：stage ∈ {"classify", "generate"}。
+
+    抓取段失败不抛错（`fetch_tool` 返回 error dict），能走到这两个阶段的都已经烧过一次抓取
+    额度，所以**任一阶段失败都不值重跑**（调用方据此拒绝同回合重试）。
+    """
+
+    def __init__(self, stage: str, original: Exception) -> None:
+        super().__init__(f"{stage} 阶段失败：{type(original).__name__}: {original}")
+        self.stage = stage
+        self.original = original
+
 
 def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> dict:
     """确定性管道核心：抓取 → 技术文档分类 → LLM 解读 → 保存 reports/。
@@ -144,7 +160,10 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
         - index_ok 表示报告是否已写入 RAG 索引（失败不阻断保存，缺口由对账补齐）
     """
     # 1. 抓取文档内容
-    fetched = fetch_tool(url)
+    # 必须显式给超时并关掉 SDK 重试：read 是单页、直接阻塞在工具路径上，没有 fetch_many 那样的
+    # 墙钟兜底；不给的话 Firecrawl 客户端 timeout=None（不设 HTTP 超时）+ SDK 默认重试 3 次，
+    # 最坏可以长时间挂住。给 timeout=45 + max_retries=0 → 最坏 45s 后抛错。
+    fetched = fetch_tool(url, timeout=config.FETCH_TIMEOUT_SECONDS, max_retries=0)
     if not fetched.get("markdown"):
         err = fetched.get("error") or "抓取文档内容失败，请检查 URL 是否有效。"
         return {"report": "", "title": "", "report_path": "", "notes": [], "error": f"抓取失败：{err}",
@@ -156,7 +175,11 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
     # 1.5 技术文档识别（LLM 分类门）：非技术文档则中止，不进入解读
     if progress:
         progress("🔍 识别是否为技术文档...")
-    is_technical, reason = _classify_technical(url, fetched.get("title") or "", fetched["markdown"])
+    try:
+        is_technical, reason = _classify_technical(url, fetched.get("title") or "",
+                                                   fetched["markdown"])
+    except Exception as e:  # noqa: BLE001 —— 打阶段标签，供调用方决定"重跑值不值"
+        raise ReadStageError("classify", e) from e
     if not is_technical:
         return {
             "report": "", "title": fetched.get("title") or "", "report_path": "", "notes": [],
@@ -168,14 +191,21 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
     if progress:
         progress("🧠 LLM 生成解读报告...")
     now = current_time_label()
-    report = generate_text(
-        READ_SYSTEM_PROMPT.format(now=now),
-        f"当前系统时间：{now}（报告中的「解读时间」必须使用此时间，不要自行推断或编造日期）\n"
-        f"请解读以下文档内容，生成结构化解读报告。\n"
-        f"原文地址：{url}\n"
-        f"文档标题：{fetched.get('title') or '未知'}\n\n"
-        f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
-    )
+    try:
+        report = generate_text(
+            READ_SYSTEM_PROMPT.format(now=now),
+            f"当前系统时间：{now}（报告中的「解读时间」必须使用此时间，不要自行推断或编造日期）\n"
+            f"请解读以下文档内容，生成结构化解读报告。\n"
+            f"原文地址：{url}\n"
+            f"文档标题：{fetched.get('title') or '未知'}\n\n"
+            f"===== 文档内容开始 =====\n{fetched['markdown']}\n===== 文档内容结束 =====",
+            max_tokens=config.REPORT_MAX_TOKENS,
+            call_site="read.report",
+            truncation_notice=REPORT_TRUNCATION_NOTICE,
+            progress=progress, progress_label="LLM 生成解读报告",
+        )
+    except Exception as e:  # noqa: BLE001 —— 打阶段标签，供调用方决定"重跑值不值"
+        raise ReadStageError("generate", e) from e
     report = replace_time_line(report, "解读时间", now)
 
     # 3. 保存报告 + 写后单文件立即索引（read 缓存命中即时生效；失败不阻断，对账兜底）

@@ -36,7 +36,7 @@ def test_merge_notes_parses_json(monkeypatch):
            '"report": "发现 1 处矛盾：旧笔记说 8080，新内容说 3.x 起为 8081，已按新内容改为 8081。"}')
     captured = {}
 
-    def _generate(s, u):
+    def _generate(s, u, **_kw):
         captured["n"] = (s, u)
         return raw
 
@@ -53,7 +53,7 @@ def test_merge_notes_parses_json(monkeypatch):
 
 def test_merge_notes_no_conflict_empty_report(monkeypatch):
     """无矛盾 → report 为空字符串、content 正常。"""
-    monkeypatch.setattr(note_mod, "generate_text", lambda s, u: '{"content": "合并后正文", "report": ""}')
+    monkeypatch.setattr(note_mod, "generate_text", lambda s, u, **_kw: '{"content": "合并后正文", "report": ""}')
     out = note_mod.merge_notes("旧正文", "新正文", "主题")
     assert out["content"] == "合并后正文"
     assert out["report"] == ""
@@ -62,7 +62,7 @@ def test_merge_notes_no_conflict_empty_report(monkeypatch):
 def test_merge_notes_wraps_code_fence(monkeypatch):
     """兼容 ```json 代码块包裹（parse_json_object 的容错路径）。"""
     raw = '```json\n{"content": "正文", "report": "发现矛盾"}```'
-    monkeypatch.setattr(note_mod, "generate_text", lambda s, u: raw)
+    monkeypatch.setattr(note_mod, "generate_text", lambda s, u, **_kw: raw)
     out = note_mod.merge_notes("旧", "新", "主题")
     assert out["content"] == "正文"
     assert out["report"] == "发现矛盾"
@@ -71,7 +71,7 @@ def test_merge_notes_wraps_code_fence(monkeypatch):
 def test_merge_notes_fallback_plain_markdown(monkeypatch):
     """解析失败（输出纯 markdown）→ 降级 content=原始输出、report=""（与旧行为一致）。"""
     raw = "这是 LLM 直接输出的合并正文，没有 JSON。"
-    monkeypatch.setattr(note_mod, "generate_text", lambda s, u: raw)
+    monkeypatch.setattr(note_mod, "generate_text", lambda s, u, **_kw: raw)
     out = note_mod.merge_notes("旧正文", "新正文", "主题")
     assert out["content"] == raw
     assert out["report"] == ""
@@ -80,7 +80,7 @@ def test_merge_notes_fallback_plain_markdown(monkeypatch):
 def test_merge_notes_fallback_malformed_json(monkeypatch):
     """解析失败（非法 JSON 且含未转义引号）→ 降级 content=原始输出、report=""。"""
     raw = '{"content": "正文里有一个未转义的双引号"没说全'
-    monkeypatch.setattr(note_mod, "generate_text", lambda s, u: raw)
+    monkeypatch.setattr(note_mod, "generate_text", lambda s, u, **_kw: raw)
     out = note_mod.merge_notes("旧正文", "新正文", "主题")
     assert out["content"] == raw
     assert out["report"] == ""

@@ -224,7 +224,7 @@ def test_start_sweep_thread_error_recorded(monkeypatch):
 
 # ============ 图级 e2e：fire（后台 mock 为同步落结果）→ 下一回合排水生效 ============
 
-def _scripted_chat(system_prompt, messages, tools):
+def _scripted_chat(system_prompt, messages, tools, **_kw):
     if "水平探测助手" in system_prompt:
         if "自评熟悉度" in system_prompt:
             return {"content": "你对该技术熟悉程度是几分（0-10）？", "tool_calls": []}
