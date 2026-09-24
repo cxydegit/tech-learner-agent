@@ -48,6 +48,7 @@ cp .env.example .env    # 变量说明见 README「配置 API Keys」
 - 想理解架构：看 README 的架构图，再对照 `src/` 目录（`adapters/` 封装外部服务、`domain/` 领域逻辑、`pipelines/` 编排流程、`web/` Web 界面、`cli.py` 命令行入口）。
 - 想改某块行为：先在 issue 里说明你的方案再动手，避免实现方向与预期不符后返工。
 - 拿不准的改动：提一个最小可行 PR 讨论，比一次提交大而全的改动更容易被合入。
+- 想看工程记录：`docs/` 下有事故复盘、评测报告与优化日志。注意其中的数字是**当时实测的历史记录**（评测与标定脚本未随仓库分发，无法直接复跑），阅读须知见 [`docs/README.md`](docs/README.md)。
 
 ## 代码规范
 
@@ -60,6 +61,7 @@ ruff check src tests
 约定与注意事项：
 
 - **检查范围**是 `src/` 与 `tests/`；`scripts/` 是内部工具脚本，不随仓库分发，不在门禁内。
+- **文档**：工程记录放 `docs/`（随仓库公开）；私有内容一律放 `docs/internal/`（已被 `.gitignore` 排除），不要在 `docs/` 根目录写私人内容。新增公开文档后请同步更新 `docs/README.md` 的索引。
 - 导入排序、过时语法、盲捕获、datetime 时区等由规则自动把关。个别刻意放行的写法用 `# noqa: <规则名>` **就地**标注并说明理由，不全局屏蔽。
 - `src/baselines/react_agent.py` 是冻结的 benchmark 基线（方法体零漂移），非必要不要改动。
 - 新代码请补全类型注解（参数与返回值）。
