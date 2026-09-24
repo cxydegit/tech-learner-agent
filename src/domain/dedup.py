@@ -55,7 +55,7 @@ def _with_header(topic: str, tags: list[str] | None, content: str) -> str:
 # ============================================================
 # 去重「标题 fast-path」纯函数
 # 旧的标签 / 内容 overlap 确认层（_same_knowledge_point 及其信号）在 LLM 合成
-# 压力测试（scripts/eval_dedup_synth.json）中被证明无法识别真正措辞不同的同义改写
+# 合成压力测试中被证明无法识别真正措辞不同的同义改写
 # （对源笔记方向确认率仅 9%），且标签信号会撞到错误候选造成错合并，已整体删除。
 # 新方案：候选召回 → 标题 fast-path（省一次 LLM 调用）→ LLM 判定（judge 见 adapters/llm.py）。
 # ============================================================

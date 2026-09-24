@@ -144,7 +144,7 @@ class Config:
     # 记忆系统：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
     # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
     # 注入阈值（可标定余弦，见 route.py::_hit_relevance）：hybrid 的归一化 similarity（top 恒 1.0）
-    # 不能当绝对门槛，run_kb_retrieve 用 dense 原始余弦过闸。标定依据 scripts/calibrate_inject_threshold.py：
+    # 不能当绝对门槛，run_kb_retrieve 用 dense 原始余弦过闸。标定依据（一次性的离线标定实验）：
     # 正样本（coach 应注入）余弦 0.58~0.87，负样本（笔记里没有）top-1 余弦 0.45~0.62；0.65 时注入召回 90%、
     # 误注入 0/6（0.5 时误注入 3/6——22 篇语料里 0.5 过松）。
     ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.65"))
