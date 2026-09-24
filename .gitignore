@@ -34,14 +34,13 @@ learner/
 .leamsessions/
 .graph
 
-# 内部开发文档与脚本（未追踪但可能存在，避免误入）
-docs/
+# 内部开发文档与脚本：docs/ 除 internal/ 外随仓库公开（工程记录），
+# 私有内容一律放 docs/internal/；scripts/ 是内部工具脚本，不随仓库分发
+docs/internal/
 scripts/
 
 # Python 构建产物（pip install -e . 生成的 egg-info / build / dist）
 *.egg-info/
 build/
 dist/
-__pycache__/
-*.pyc
 
