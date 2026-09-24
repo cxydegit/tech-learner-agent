@@ -56,7 +56,9 @@ def test_advance_directive_accepts_contextual_false_positive():
 def test_completion_claim_phrases():
     """明确声明完成 / 要求直接勾选 → True（对话外完成的里程碑豁免验收）。"""
     for t in ["都搞定了", "我学会了", "本地跑通了", "装好了", "都做完了",
-              "直接勾吧", "勾了吧", "我在本地都搞定了，直接勾吧"]:
+              "直接勾吧", "勾了吧", "我在本地都搞定了，直接勾吧",
+              # 认知型待办（「能说清 XX」）的完成只在用户脑子里，自述是唯一证据形态
+              "我会了", "这块我掌握了", "我脑子里过了一遍，就不一一回答你了"]:
         assert is_completion_claim(t), t
 
 
@@ -64,3 +66,12 @@ def test_not_completion_claim():
     """否定 / 疑问 / 普通讨论 → False（仍走验收）。"""
     for t in ["还没搞定", "还没做完", "先别勾", "搞定了没？", "完成了吗", "这个怎么搞定？", ""]:
         assert not is_completion_claim(t), t
+    # 新增的自评/免答词同样要过否定守卫：否定式不能因为含关键词就豁免验收
+    assert not is_completion_claim("我脑子里还没过一遍")
+
+
+def test_advance_only_is_not_completion_claim():
+    """只说「往下走」不构成完成声明：打不打得勾交给验收员按证据判。"""
+    assert is_advance_directive("直接下一步")
+    assert not is_completion_claim("直接下一步")
+    assert not is_completion_claim("直接进入下一阶段")

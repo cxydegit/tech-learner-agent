@@ -431,6 +431,30 @@ def test_update_roadmap_claim_exempts_verification(monkeypatch):
     assert ctx.updates["coach_milestone_pending"] == "s1-m1"
 
 
+def test_update_roadmap_self_report_exempts_verification(monkeypatch):
+    """认知型待办的自述证据（「我脑子里过了一遍」）→ 跳过验收直接勾选。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t: (_ for _ in ()).throw(AssertionError("豁免时不应调 LLM 验收")))
+    ctx = _gate_ctx(user_msg="我脑子里过了一遍，就不一一回答你了")
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out["status"] == "ok"
+    assert ctx.updates["coach_milestone_pending"] == "s1-m1"
+
+
+def test_update_roadmap_advance_only_returns_not_checked(monkeypatch):
+    """用户只给推进指令、没声明掌握 → 不勾选，返回「未勾选 + 可随时命令勾选」话术。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t: {"verified": False, "missing": ["安装依赖未完成"],
+                                      "reason": "只有推进指令，无掌握证据"})
+    ctx = _gate_ctx(user_msg="直接下一步")
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out["status"] == "not_checked"
+    assert "roadmap" not in ctx.updates and "coach_milestone_pending" not in ctx.updates
+    assert "未勾选" in out["note"] and "不要向用户索要措辞" in out["note"]
+
+
 def test_update_roadmap_disabled_by_config(monkeypatch):
     """ROUTE_MILESTONE_VERIFY=False → 跳过验收（旁路开关，便于不依赖 LLM 的集成测试）。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
