@@ -270,10 +270,12 @@ def _fallback_messages(system_prompt: str, messages: list[dict]) -> list[dict]:
     return [{"role": "system", "content": system_prompt + FALLBACK_SYSTEM_SUFFIX}, *messages]
 
 
-def _parse_chat_response(msg) -> dict:
+def _parse_chat_response(msg, *, call_site: str = "") -> dict:
     """把 openai 响应消息转成统一 dict：{content, tool_calls:[{id,name,arguments}]}。
 
-    arguments 是 JSON 字符串，解析失败兜底为 {}（graph 层护栏会拦截异常参数）。
+    arguments 是 JSON 字符串，解析失败兜底为 {}（graph 层护栏会拦截异常参数）——
+    但兜底必须留痕：不然"工具被空参数调用"在日志里看起来像模型的决定，实际是解析失败。
+    非法 JSON 的可疑对象是**被截断的参数**（撞 max_tokens），所以记长度便于事后对照。
     """
     tool_calls = []
     for tc in (getattr(msg, "tool_calls", None) or []):
@@ -281,6 +283,8 @@ def _parse_chat_response(msg) -> dict:
         try:
             args_obj = json.loads(args) if args.strip() else {}
         except Exception:  # noqa: BLE001 —— 模型给的 arguments 不合法 JSON，兜底空 dict
+            audit("args_parse_failed", site=call_site or "unknown",
+                  tool=getattr(tc.function, "name", None), raw_chars=len(args))
             args_obj = {}
         tool_calls.append({"id": tc.id, "name": tc.function.name, "arguments": args_obj})
     return {"content": msg.content, "tool_calls": tool_calls}
@@ -329,7 +333,7 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
         try:
             response = client.chat.completions.create(
                 **kwargs, tools=tools, timeout=min(config.LLM_REQUEST_TIMEOUT, remaining))
-            parsed = _parse_chat_response(response.choices[0].message)
+            parsed = _parse_chat_response(response.choices[0].message, call_site=call_site)
             _log_call(call_site, attempt + 1, time.monotonic() - start, status="ok",
                       finish_reason=response.choices[0].finish_reason,
                       usage=getattr(response, "usage", None))
@@ -361,7 +365,7 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
             fallback_kwargs = {**kwargs, "messages": _fallback_messages(system_prompt, messages)}
             response = client.chat.completions.create(
                 **fallback_kwargs, timeout=config.LLM_REQUEST_TIMEOUT)
-            parsed = _parse_chat_response(response.choices[0].message)
+            parsed = _parse_chat_response(response.choices[0].message, call_site=call_site)
             _log_call(call_site, 0, time.monotonic() - start, status="ok", fallback=True,
                       finish_reason=response.choices[0].finish_reason,
                       usage=getattr(response, "usage", None))

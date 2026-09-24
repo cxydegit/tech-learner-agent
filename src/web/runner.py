@@ -10,11 +10,14 @@
 本模块顶层不 import langgraph（SqliteSaver / build_graph / Command 全函数内 lazy）。
 """
 
+import json
 import queue
 import threading
 from typing import Any
 
+from ..adapters.audit import audit, audit_context
 from ..config import config
+from ..pipelines.note import decision_kind
 
 # 事件类型：progress(进度) / interrupt(合并确认，等 resume) / final(成功) / error / done(收尾)
 _EVENT_QUEUE_TIMEOUT = 15.0
@@ -74,35 +77,44 @@ def _worker(thread_id: str, payload: Any) -> None:
     def progress(msg: str) -> None:
         job.queue.put({"type": "progress", "message": msg})
 
-    try:
-        config.GRAPH_DB_DIR.mkdir(parents=True, exist_ok=True)
-        with SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH)) as saver:
-            saver.setup()
-            graph = build_graph(saver)
-            cfg = {"configurable": {"thread_id": thread_id},
-                   "recursion_limit": config.ROUTE_RECURSION_LIMIT}
-            # ⚠️ stream_events(v3) 是异步后台执行：返回时节点可能仍在 ThreadPoolExecutor 线程跑。
-            # 必须在 with 内立即访问 .interrupted/.output（会阻塞等待后台完成），
-            # 否则 web_progress 的 finally 会在节点执行前注销注册表，进度全部丢失。
-            with web_progress(thread_id, progress):
-                stream = graph.stream_events(payload, cfg, version="v3")
-                interrupted = stream.interrupted
-                interrupts = stream.interrupts
-                output = stream.output
-            if interrupted:
-                # coach 循环的 interrupt 负载是结构化 dict（coach_question）；其余视为 note 合并确认
-                value = interrupts[0].value if interrupts else ""
-                if isinstance(value, dict) and value.get("type") == "coach_question":
-                    job.queue.put({"type": "interrupt", "kind": "coach_question", "payload": value})
+    # 本线程是**普通线程**：threading.Thread 不复制 contextvars，langgraph 的 config 在这里
+    # 读不到。不显式声明的话，这一层发出的事件（中断 / 错误）全会退化成 "local"。
+    with audit_context(thread_id):
+        try:
+            config.GRAPH_DB_DIR.mkdir(parents=True, exist_ok=True)
+            with SqliteSaver.from_conn_string(str(config.GRAPH_DB_PATH)) as saver:
+                saver.setup()
+                graph = build_graph(saver)
+                cfg = {"configurable": {"thread_id": thread_id},
+                       "recursion_limit": config.ROUTE_RECURSION_LIMIT}
+                # ⚠️ stream_events(v3) 是异步后台执行：返回时节点可能仍在 ThreadPoolExecutor 线程跑。
+                # 必须在 with 内立即访问 .interrupted/.output（会阻塞等待后台完成），
+                # 否则 web_progress 的 finally 会在节点执行前注销注册表，进度全部丢失。
+                with web_progress(thread_id, progress):
+                    stream = graph.stream_events(payload, cfg, version="v3")
+                    interrupted = stream.interrupted
+                    interrupts = stream.interrupts
+                    output = stream.output
+                if interrupted:
+                    # coach 循环的 interrupt 负载是结构化 dict（coach_question）；其余视为 note 合并确认
+                    value = interrupts[0].value if interrupts else ""
+                    kind = "coach_question" if (isinstance(value, dict)
+                                               and value.get("type") == "coach_question") \
+                        else "merge_candidates"
+                    # 人工中断在**宿主侧**记事件：图里的 interrupt() 恢复时会重跑节点，
+                    # 在节点里埋点会把同一次暂停写两遍。这里天然只经过一次，且已经知道 kind。
+                    audit("interrupt", kind=kind,
+                          payload_chars=len(json.dumps(value, ensure_ascii=False, default=str)))
+                    job.queue.put({"type": "interrupt", "kind": kind, "payload": value})
                 else:
-                    job.queue.put({"type": "interrupt", "kind": "merge_candidates", "payload": value})
-            else:
-                job.queue.put({"type": "final", "output": output})
-    except Exception as exc:  # noqa: BLE001 —— 线程内兜底，事件里透传错误给前端
-        job.queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-    finally:
-        job.queue.put({"type": "done"})
-        job.thread = None
+                    job.queue.put({"type": "final", "output": output})
+        except Exception as exc:  # noqa: BLE001 —— 线程内兜底，事件里透传错误给前端
+            audit("error", kind=type(exc).__name__, stage="web.graph_run",
+                  message=str(exc)[:200])
+            job.queue.put({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+        finally:
+            job.queue.put({"type": "done"})
+            job.thread = None
 
 
 def _start(thread_id: str, payload: Any) -> str | None:
@@ -138,4 +150,11 @@ def start_run(thread_id: str, payload: dict) -> str | None:
 def resume_run(thread_id: str, answer: str) -> str | None:
     """恢复 note interrupt：提交合并决策（all / 编号逗号分隔 / skip）。"""
     from langgraph.types import Command
-    return _start(thread_id, Command(resume=answer))
+    err = _start(thread_id, Command(resume=answer))
+    if err is None:
+        # 恢复事件与被恢复的那次 interrupt 同 thread_id，等待时长（wait_s）由日志侧配对算出：
+        # 写入侧算不了——Web 重启后进程里已经没有"什么时候开始等的"了，而日志一直都在。
+        # 本函数跑在 FastAPI 的请求线程里（同样没有图上下文），会话标识要显式声明。
+        with audit_context(thread_id):
+            audit("resume", answer_kind=decision_kind(answer), answer_chars=len(answer or ""))
+    return err

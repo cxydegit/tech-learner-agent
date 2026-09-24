@@ -1,5 +1,6 @@
 """CLI 命令行入口"""
 
+import json
 import shlex
 import sys
 from datetime import datetime
@@ -10,11 +11,11 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
-from .adapters.audit import boot
+from .adapters.audit import audit, audit_context, boot
 from .config import config
 from .domain.card_input import parse_card_input
 from .pipelines.collect import collect_pipeline
-from .pipelines.note import note_pipeline, parse_merge_decision, persist_points
+from .pipelines.note import decision_kind, note_pipeline, parse_merge_decision, persist_points
 from .pipelines.read import read_pipeline
 
 # Windows 原生控制台默认 GBK 编码，无法输出 emoji/部分中文符号。
@@ -444,11 +445,18 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
         # （收集/抓取/生成各阶段的进度都经这个回调打出来）。与 Web 走同一套注册表。
         # ⚠️ .interrupted / .interrupts / .output 必须在 with 内读：v3 流式的节点可能仍在
         # 后台线程跑，出了 with 注册表就被注销，进度会丢。
-        with web_progress(thread_id, lambda m: console.print(f"[dim]{m}[/dim]")):
-            stream = graph.stream_events(payload, run_config, version="v3")
-            interrupted = stream.interrupted
-            interrupts = stream.interrupts
-            output = stream.output
+        try:
+            with web_progress(thread_id, lambda m: console.print(f"[dim]{m}[/dim]")):
+                stream = graph.stream_events(payload, run_config, version="v3")
+                interrupted = stream.interrupted
+                interrupts = stream.interrupts
+                output = stream.output
+        except Exception as exc:
+            # 记完再抛：CLI 的报错栈照旧给用户看（不吞），但日志里要留下这是哪次会话的什么错
+            with audit_context(thread_id):
+                audit("error", kind=type(exc).__name__, stage="cli.graph_run",
+                      message=str(exc)[:200])
+            raise
         if not interrupted:
             final = output
             last = (final or {}).get("last_output")
@@ -461,16 +469,26 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
         resumed = False
         for intr in interrupts:
             val = intr.value
-            if isinstance(val, dict) and val.get("type") == "coach_question":
-                # coach 循环：interrupt 负载是结构化问题（mode / tech / message）
-                mode = val.get("mode") or ""
-                tech = val.get("tech") or ""
-                badge = f"🧭 [{mode}]{(' ' + tech) if tech else ''}"
-                console.print(f"\n[bold cyan]{badge}[/bold cyan]")
-                console.print(Markdown(val.get("message") or ""))
-            else:
-                console.print(f"\n[bold cyan]🧭 {val}[/bold cyan]")
-            payload = Command(resume=input("> ").strip())
+            is_question = isinstance(val, dict) and val.get("type") == "coach_question"
+            # 显式声明会话标识：这里是 CLI 主线程，没有图上下文，不声明的话中断/恢复
+            # 两类事件会退化成 "local"——而它们正是"人在哪儿接管了机器"的唯一记录
+            with audit_context(thread_id):
+                # 中断事件在宿主侧记：图里的 interrupt() 恢复时会重跑节点，节点里埋点会写两遍
+                audit("interrupt",
+                      kind="coach_question" if is_question else "merge_candidates",
+                      payload_chars=len(json.dumps(val, ensure_ascii=False, default=str)))
+                if is_question:
+                    # coach 循环：interrupt 负载是结构化问题（mode / tech / message）
+                    mode = val.get("mode") or ""
+                    tech = val.get("tech") or ""
+                    badge = f"🧭 [{mode}]{(' ' + tech) if tech else ''}"
+                    console.print(f"\n[bold cyan]{badge}[/bold cyan]")
+                    console.print(Markdown(val.get("message") or ""))
+                else:
+                    console.print(f"\n[bold cyan]🧭 {val}[/bold cyan]")
+                answer = input("> ").strip()
+                audit("resume", answer_kind=decision_kind(answer), answer_chars=len(answer))
+            payload = Command(resume=answer)
             resumed = True
         if not resumed:
             # 理论不可达：interrupted 却无 interrupt 负载，避免死循环

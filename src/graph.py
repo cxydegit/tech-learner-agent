@@ -5,7 +5,9 @@
 - ``StateGraph(LearnState)``：按 ``command`` 条件路由到对应管道节点
 """
 
+import hashlib
 import json
+import logging
 import operator
 import threading
 import time
@@ -19,7 +21,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from .adapters.audit import audit_context
+from .adapters.audit import audit, audit_context
 from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
 from .domain import exit_intent, survey
@@ -41,6 +43,7 @@ from .pipelines.route import (
     run_coach_tool,
     run_kb_retrieve,
     run_memory_sweep,
+    tool_arg_fields,
 )
 
 # langgraph 1.0 的 v3 流式协议是实验性的，会打 LangChainBetaWarning；CLI 里主动过滤
@@ -480,6 +483,11 @@ def coach_trim(state: LearnState) -> dict:
     if len(msgs) > config.COACH_COMPRESS_AT:
         cut = _turn_cut_index(msgs, config.COACH_HISTORY_KEEP)
         if cut is None:
+            # 消息数已超阈值却找不到 user 切点：按 _turn_cut_index 的说明，这会卡在
+            # 「触发却不裁」的空转里让窗口无界增长。用 WARNING 让它从常规 INFO 里跳出来——
+            # 这条风险此前只写在注释里，埋点后才谈得上"实测有没有发生"。
+            audit("ctx_compact", level=logging.WARNING, cut="none",
+                  before=len(msgs), after=len(msgs), dropped=0)
             return updates  # 保留窗口覆盖全部消息（没超过 N 轮），不裁
         mem = consolidate_memory(
             {"facts": state.get("coach_facts") or [],
@@ -490,6 +498,10 @@ def coach_trim(state: LearnState) -> dict:
         updates["coach_open_items"] = mem["open_items"]
         updates["coach_summary"] = mem["summary"]
         updates["coach_messages"] = msgs[cut:]
+        # 压缩是"模型为什么突然变傻 / 重复问"的唯一解释源：它决定模型这一刻能看见什么。
+        # 记下裁掉多少、切在哪，才谈得上回答"这次变傻是不是刚压缩过"。
+        audit("ctx_compact", cut=cut, before=len(msgs), after=len(msgs) - cut,
+              dropped=cut, summary_chars=len(mem["summary"] or ""))
     return updates
 
 
@@ -558,11 +570,27 @@ def _assistant_tool_calls(assistant_msg: dict) -> list[dict]:
     return out
 
 
+def _tool_signature(name: str, args: dict) -> str:
+    """工具调用的规范化签名（名字 + 排序后的参数）。
+
+    护栏判「连续重复」与事件里的 `sig` 共用这一个来源：分别手写两份的话，
+    日志里的 `sig` 就对不上护栏实际用的判据，两个事件也就 join 不起来了。
+    """
+    return f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+
+
+def _tool_sig_hash(name: str, args: dict) -> str:
+    """签名的短哈希：日志里只留 12 位十六进制，够 join、不占体积。"""
+    return hashlib.sha256(_tool_signature(name, args).encode("utf-8")).hexdigest()[:12]
+
+
 def coach_tool(state: LearnState) -> dict:
     """执行模型请求的工具调用；工具异常回喂模型修正（LLM 可恢复错误，官方推荐模式）。
 
     每个工具前后各发一条进度（工具名 + 已耗时）：贵工具要跑几分钟，而没有这条信号时用户
     看到的就是「长时间什么都没发生」——真实事故里正是这样静默了 22 分钟。
+    与此同时落一条 `tool_call` 审计事件，**用户看到的那行由同一个事件派生**（同一份耗时、
+    同一个 status），避免埋点与进度文案各算一遍后悄悄漂移。
     """
     tool_calls = _assistant_tool_calls(state["coach_messages"][-1])
     progress = _get_progress()
@@ -572,7 +600,7 @@ def coach_tool(state: LearnState) -> dict:
     heavy = 0
     for tc in tool_calls:
         args = tc["arguments"]
-        signatures.append(f"{tc['name']}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}")
+        signatures.append(_tool_signature(tc["name"], args))
         if tc["name"] in HEAVY_TOOLS:
             heavy += 1
         if progress:
@@ -582,10 +610,21 @@ def coach_tool(state: LearnState) -> dict:
             out = run_coach_tool(tc["name"], args, ctx)
         except Exception as e:  # noqa: BLE001 —— 工具异常回喂模型修正
             out = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        elapsed = time.monotonic() - started
+        # status 原样透传工具返回值（ok / error / blocked / rejected / not_checked）：
+        # 后三种是「代码否决了模型」的实锤，折叠成 error 就把最值钱的信息丢了
+        event = {
+            "name": tc["name"],
+            "sig": _tool_sig_hash(tc["name"], args),
+            "elapsed_s": round(elapsed, 1),
+            "status": str(out.get("status") or "unknown"),
+            "error": str(out.get("error") or "")[:200],
+            **tool_arg_fields(tc["name"], args),
+        }
+        audit("tool_call", **event)
         if progress:
-            mark = "✅" if out.get("status") == "ok" else "⚠️"
-            progress(f"{mark} {tc['name']} 耗时 {time.monotonic() - started:.0f}s"
-                     f"（{out.get('status')}）")
+            mark = "✅" if event["status"] == "ok" else "⚠️"
+            progress(f"{mark} {tc['name']} 耗时 {elapsed:.0f}s（{event['status']}）")
         results.append({"role": "tool", "tool_call_id": tc["id"],
                         "name": tc["name"], "content": json.dumps(out, ensure_ascii=False)})
     updates: dict = {
@@ -763,6 +802,15 @@ def _start_sweep_thread(tech: str, buffer: list[dict], tid: str) -> None:
     threading.Thread(target=worker, daemon=True).start()
 
 
+def _sweep_elapsed_s(inflight: dict) -> float | None:
+    """后台沉淀从 fire 到排水的墙钟耗时（秒）。fired_at 是本地 naive ISO 字符串，两边同语义。"""
+    try:
+        fired = datetime.fromisoformat(inflight["fired_at"])
+        return round((datetime.now() - fired).total_seconds(), 1)  # noqa: DTZ005 —— 本地 naive 语义
+    except Exception:  # noqa: BLE001 —— 老会话可能没有该字段：宁可缺耗时也不报错
+        return None
+
+
 def coach_memory_write(state: LearnState) -> dict:
     """确定性写触发：coach 对话积累超阈值 → 自动沉淀学习内容进知识库。
 
@@ -792,9 +840,15 @@ def coach_memory_write(state: LearnState) -> dict:
             return {}  # 后台线程仍在跑：不阻塞、不重复 fire，保留 inflight 等下一回合
         if result is None or result.get("action") == "error":
             # 线程失败 / 超时 / 进程重启：不重跑不阻塞——快照并回 buffer，未来正常 fire 重扫
+            audit("sweep_drain", result="stale" if result is None else "error",
+                  elapsed_s=_sweep_elapsed_s(inflight),
+                  items=len(inflight.get("buffer") or []))
             return {"memory_sweep_buffer": (inflight.get("buffer") or []) + (state.get("memory_sweep_buffer") or []),
                     "memory_sweep_inflight": None}
         updates: dict = {"memory_sweep_inflight": None}
+        audit("sweep_drain", result=str(result.get("action") or "unknown"),
+              elapsed_s=_sweep_elapsed_s(inflight),
+              items=len(inflight.get("buffer") or []), count=result.get("count"))
         if result.get("action") == "persisted":
             _emit_sweep_feedback(f"🗂️ 已自动沉淀 {result.get('count', 0)} 个新知识点")
             msgs = state.get("coach_messages") or []
@@ -816,9 +870,15 @@ def coach_memory_write(state: LearnState) -> dict:
                                       "fired_at": datetime.now().isoformat(timespec="seconds")},  # noqa: DTZ005 —— 本地 naive 语义
             "memory_sweep_buffer": [],
         }
+        audit("sweep_fire", items=len(snapshot), mode="async")
         _start_sweep_thread(tech, snapshot, tid)
         return updates
+    audit("sweep_fire", items=len(buffer), mode="sync")
+    sweep_started = time.monotonic()
     sweep = run_memory_sweep(tech, buffer, progress=_get_progress())
+    audit("sweep_drain", result=str(sweep.get("action") or "unknown"), mode="sync",
+          elapsed_s=round(time.monotonic() - sweep_started, 1), items=len(buffer),
+          count=sweep.get("count"))
     updates: dict = {"memory_sweep_buffer": []}  # 触发后清空，下一窗口重新积累
     _apply_sweep_result(updates, state, sweep)
     return updates
@@ -877,33 +937,50 @@ def coach_kb_retrieve(state: LearnState) -> dict:
 
 def coach_guard(state: LearnState) -> dict:
     """护栏节点：把诊断消息作为 assistant 消息插入，随后 coach_human 展示并等用户输入。"""
-    msg = _coach_guard(state)
-    if not msg:
+    violation = _guard_violation(state)
+    if violation is None:
         return {}  # 理论不可达（只在护栏触发时路由到本节点）
+    kind, msg, context = violation
+    audit("guard_trigger", kind=kind, **context)
     return {"coach_messages": state["coach_messages"] + [{"role": "assistant", "content": msg}]}
 
 
-def _coach_guard(state: LearnState) -> str | None:
-    """工具护栏判定：预算耗尽 / 贵工具超限 / 连续重复调用 → 返回诊断消息；无违规返回 None。"""
+def _guard_violation(state: LearnState) -> tuple[str, str, dict] | None:
+    """工具护栏判定：预算耗尽 / 贵工具超限 / 连续重复调用。
+
+    返回 (kind, 诊断消息, 上下文计数) 或 None。**事件不在这里记**：本函数被条件边
+    （_route_coach 判去向）与护栏节点各调一次，在这里记会让同一次违规写两行日志。
+    """
     count = state.get("coach_turn_tool_count") or 0
     if count >= config.ROUTE_MAX_TOOL_CALLS_PER_TURN:
-        return ("本轮工具调用次数已达上限，我暂时停一下。请告诉我下一步方向，"
-                "或直接说「结束」。")
+        return "budget", ("本轮工具调用次数已达上限，我暂时停一下。请告诉我下一步方向，"
+                          "或直接说「结束」。"), {"turn_count": count}
     last_tc = _assistant_tool_calls(state["coach_messages"][-1])
+    context = {"tool_calls": len(last_tc), "names": [tc["name"] for tc in last_tc],
+               "sigs": [_tool_sig_hash(tc["name"], tc["arguments"]) for tc in last_tc],
+               "turn_count": count,
+               "heavy_count": state.get("coach_turn_heavy_count") or 0}
     # 贵工具单轮上限：collect/read 单次就烧搜索/抓取额度 + 分钟级耗时。超限不硬拒，
     # 停下问用户先做哪个（两个不同主题是合法需求，见 ROUTE_MAX_HEAVY_TOOLS_PER_TURN 注释）
     pending_heavy = sum(1 for tc in last_tc if tc["name"] in HEAVY_TOOLS)
     if pending_heavy and (state.get("coach_turn_heavy_count") or 0) + pending_heavy > \
             config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN:
-        return (f"本轮收集/解读资料已经做了 {config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN} 次，"
-                "一次做太多会拖很久。请先就用现有资料继续，把剩下的主题留到下一步——"
-                "或者告诉我先做哪一个。")
-    cur = [f"{tc['name']}:{json.dumps(tc['arguments'], sort_keys=True, ensure_ascii=False)}"
-           for tc in last_tc]
+        return "heavy_cap", (
+            f"本轮收集/解读资料已经做了 {config.ROUTE_MAX_HEAVY_TOOLS_PER_TURN} 次，"
+            "一次做太多会拖很久。请先就用现有资料继续，把剩下的主题留到下一步——"
+            "或者告诉我先做哪一个。"), {**context, "pending_heavy": pending_heavy}
+    cur = [_tool_signature(tc["name"], tc["arguments"]) for tc in last_tc]
     sigs = state.get("last_tool_signatures") or []
     if len(sigs) >= 2 and sigs[-1] == cur and sigs[-2] == cur:
-        return ("我连续在重复做同一件事，可能卡住了。请帮我确认接下来该怎么做"
-                "（或说「结束」退出）。")
+        return "repeat", ("我连续在重复做同一件事，可能卡住了。请帮我确认接下来该怎么做"
+                          "（或说「结束」退出）。"), context
+    return None
+
+
+def _coach_guard(state: LearnState) -> str | None:
+    """护栏判定（只要消息，供条件边用）；判定本身见 _guard_violation。"""
+    violation = _guard_violation(state)
+    return violation[1] if violation else None
     return None
 
 

@@ -4,11 +4,13 @@
 纯数据进出（返回 dict），不打印、不写会话；进度交给 progress 回调。
 """
 
+import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
+from ..adapters.audit import audit
 from ..adapters.fetch import fetch_many
 from ..adapters.github import fetch_star_count, is_repo_url
 from ..adapters.llm import REPORT_TRUNCATION_NOTICE, current_time_label, generate_text, replace_time_line
@@ -16,6 +18,31 @@ from ..adapters.search import search_tool
 from ..adapters.store import save_file_tool
 from ..config import config
 from ..domain.quality import screen_results
+
+
+def _step_recorder(pipeline: str, forward: Callable[[str], None] | None) -> Callable[[str], None]:
+    """把管道进度回调包成「分段计时器」：原样转发给 UI（有的话），同时落一条 pipeline_step。
+
+    为什么要它：collect 的事故形态是"静默 22 分钟"，而 tool_call 只给得到一个总耗时，
+    读不出搜索 / 预筛 / 抓取 / 生成各占多少——分步耗时此前只能靠翻终端回滚。
+
+    为什么包在管道里而不是调用侧：collect 有三个入口（图节点 / CLI 直调 / coach 工具），
+    在调用侧包一层就要包三处，漏一处就少一段覆盖。**埋点也不能依附于 UI 回调**——
+    CLI 下 progress 为 None，事件若挂在回调上，CLI 跑出来的事故反而没有分步数据。
+    """
+    started = time.monotonic()
+    state = {"seq": 0, "last": started}
+
+    def emit(message: str) -> None:
+        now = time.monotonic()
+        state["seq"] += 1
+        audit("pipeline_step", pipeline=pipeline, seq=state["seq"],
+              label=str(message)[:24], elapsed_s=round(now - state["last"], 1))
+        state["last"] = now
+        if forward:
+            forward(message)
+
+    return emit
 
 # ============================================================
 # 合成报告提示词
@@ -157,6 +184,9 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
           调用方应把这一点透给模型，别让它当成资料齐全
         - 失败抛 CollectStageError（带阶段标签），而非裸异常——阶段决定重跑值不值
     """
+    # 进度出口：分段计时事件 + 原样转发给 UI（见 _step_recorder 的说明）
+    emit = _step_recorder("collect", progress)
+
     # 1. 生成搜索词：默认三组 + focus 时追加一条（纯增量，无 focus 零变化）
     base = tech_name.strip()
     queries = [
@@ -171,8 +201,7 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
     raw_results: list[dict] = []
     try:
         for q in queries:
-            if progress:
-                progress(f"🔍 搜索: {q}")
+            emit(f"🔍 搜索: {q}")
             raw_results.extend(search_tool(q).get("results", []))
     except Exception as e:  # noqa: BLE001
         raise CollectStageError("search", e) from e
@@ -186,8 +215,7 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
             results.append(r)
 
     # 2.5 质量预筛：丢明显垃圾（内容农场/低分），只抓通过的高质量结果
-    if progress:
-        progress("🛡️ 预筛低质量链接...")
+    emit("🛡️ 预筛低质量链接...")
     star_cache = _prefetch_star_counts(results)
     kept, excluded = screen_results(
         results,
@@ -209,8 +237,7 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
     fetched_blocks: list[str] = []
     targets = kept[: config.MAX_FETCH_PAGES]
     if targets:
-        if progress:
-            progress(f"🛰️ 并发抓取 {len(targets)} 个页面（超时 {config.FETCH_TIMEOUT_SECONDS:.0f}s）...")
+        emit(f"🛰️ 并发抓取 {len(targets)} 个页面（超时 {config.FETCH_TIMEOUT_SECONDS:.0f}s）...")
         try:
             for r, f in zip(targets, fetch_many([r["url"] for r in targets])):
                 if f.get("markdown"):
@@ -235,8 +262,7 @@ def collect_pipeline(tech_name: str, focus: str | None = None,
         resource_note = ""
 
     # 4. 单次 LLM 生成报告（无工具，无循环）；focus 作为用户提示词进 user 消息
-    if progress:
-        progress("🧠 LLM 生成学习资料...")
+    emit("🧠 LLM 生成学习资料...")
     now = current_time_label()
     prompt = (COLLECT_PROMPT_FOCUS if focus else COLLECT_PROMPT_DEFAULT).format(now=now)
     resource_lines = [

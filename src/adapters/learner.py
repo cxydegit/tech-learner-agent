@@ -11,6 +11,7 @@ from pathlib import Path
 from ..config import config
 from ..domain.dedup import sanitize_filename
 from ..domain.roadmap import roadmap_to_markdown
+from .audit import audit
 
 
 def profile_path() -> Path:
@@ -78,5 +79,11 @@ def save_roadmap(roadmap: dict) -> Path:
     jp = roadmap_json_path(roadmap["tech"])
     jp.parent.mkdir(parents=True, exist_ok=True)
     jp.write_text(json.dumps(roadmap, ensure_ascii=False, indent=2), encoding="utf-8")
-    roadmap_md_path(roadmap["tech"]).write_text(roadmap_to_markdown(roadmap), encoding="utf-8")
+    md = roadmap_to_markdown(roadmap)
+    roadmap_md_path(roadmap["tech"]).write_text(md, encoding="utf-8")
+    # 路线写盘（JSON 机器态 + Markdown 源）也属于"改了世界"的副作用：会话时间线里
+    # 应当能看到"这一轮改了路线"，而不是只有工具调用、看不到产物
+    audit("artifact_write", kind="roadmap", tech=roadmap.get("tech"),
+          bytes=len(md.encode("utf-8")),
+          stages=len(roadmap.get("stages") or []))
     return jp

@@ -10,6 +10,7 @@ schema、工具执行（大内容写文件、出入参短，工具可经 ctx.upd
 import re
 
 from ..adapters import learner
+from ..adapters.audit import audit
 from ..adapters.llm import generate_text
 from ..config import config
 from ..domain import exit_intent, survey
@@ -346,6 +347,56 @@ COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
     "coaching": [COLLECT_SCHEMA, READ_SCHEMA, ASK_SCHEMA,
                  GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA, REVISE_ROADMAP_SCHEMA],
 }
+
+
+# ============================================================
+# 工具参数的审计白名单（tool_call 事件用）
+# **绝不整包 json.dumps(args)**：revise_roadmap 的 stages 是嵌套大数组、note 的 content
+# 上限 2000 字，整包落盘等于把学习内容写进日志。白名单与工具定义放在同一个文件，
+# 加新工具时一眼能看到要不要补；漏补的方向是"少记"而不是"泄露"。
+# ============================================================
+
+# 短标识字段：原样记
+_PLAIN_ARG_FIELDS: dict[str, tuple[str, ...]] = {
+    "collect": ("tech", "focus"),
+    "read": ("url",),
+    "update_roadmap": ("milestone_id", "done"),
+    "note": ("tech",),
+    "note_commit": ("decision",),
+}
+# 自由文本字段：只记长度 + 首 N 字（用户原话，全文不进日志）
+_PREVIEW_ARG_FIELDS: dict[str, tuple[str, ...]] = {
+    "ask": ("question",),
+    "generate_roadmap": ("goal",),
+    "revise_roadmap": ("goal", "revision"),
+}
+# 计数/数值字段：列表只记条数，不记内容（stages 里是整份学习计划）
+_SCALAR_ARG_FIELDS: dict[str, tuple[str, ...]] = {
+    "generate_roadmap": ("total_hours", "stages"),
+    "revise_roadmap": ("total_hours", "stages"),
+}
+_ARG_PREVIEW_CHARS = 20
+
+
+def tool_arg_fields(name: str, args: dict) -> dict:
+    """把工具入参压成可落盘的元数据（白名单 + 自由文本只留长度与首 N 字）。"""
+    out: dict = {}
+    for key in _PLAIN_ARG_FIELDS.get(name, ()):
+        value = args.get(key)
+        if value not in (None, ""):
+            out[key] = str(value)[:200]
+    for key in _PREVIEW_ARG_FIELDS.get(name, ()):
+        text = str(args.get(key) or "")
+        if text:
+            out[f"{key}_preview"] = text[:_ARG_PREVIEW_CHARS]
+            out[f"{key}_chars"] = len(text)
+    for key in _SCALAR_ARG_FIELDS.get(name, ()):
+        value = args.get(key)
+        if isinstance(value, (list, tuple)):
+            out[f"{key}_count"] = len(value)
+        elif value is not None:
+            out[key] = value
+    return out
 
 
 # ============================================================
@@ -800,9 +851,11 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
         pending_now = ctx.updates.get("coach_milestone_pending",
                                       ctx.state.get("coach_milestone_pending"))
         if pending_now:
-            return {"status": "rejected",
-                    "error": f"里程碑「{pending_now}」刚勾选、尚在等用户确认推进，"
-                             f"一轮只能勾一个。请先等用户确认后再勾选下一个。"}
+            return _gate_event("milestone_batch", {
+                "status": "rejected",
+                "error": f"里程碑「{pending_now}」刚勾选、尚在等用户确认推进，"
+                         f"一轮只能勾一个。请先等用户确认后再勾选下一个。",
+            }, milestone=milestone_id, pending=pending_now)
         # 闸 2（确定性）豁免：用户明确声明完成（对话外完成的动作）或验收开关关闭 → 跳过验收
         latest_user = _recent_user_text(ctx.state.get("coach_messages"))
         verify_enabled = config.ROUTE_MILESTONE_VERIFY and not exit_intent.is_completion_claim(latest_user)
@@ -814,10 +867,12 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
             rejects = int(ctx.updates.get("coach_verify_rejects",
                                           ctx.state.get("coach_verify_rejects") or 0))
             if rejects >= 2:
-                return {"status": "blocked",
-                        "error": "本回合 update_roadmap 已被验收拒绝 2 次，不再受理。",
-                        "instruction": "停止调用 update_roadmap。立刻把缺失的内容作为回复完整讲给用户"
-                                       "（内容只有发到对话里才算数）；下一轮用户回复后再勾选。"}
+                return _gate_event("milestone_throttle", {
+                    "status": "blocked",
+                    "error": "本回合 update_roadmap 已被验收拒绝 2 次，不再受理。",
+                    "instruction": "停止调用 update_roadmap。立刻把缺失的内容作为回复完整讲给用户"
+                                   "（内容只有发到对话里才算数）；下一轮用户回复后再勾选。",
+                }, milestone=milestone_id, rejects=rejects)
             # 闸 4（语义）LLM 验收：独立验收员只看「里程碑标准 + 对话记录」——宣布完成/布置未做/
             # 转交无回应都不算完成。模型无注入通道（无 evidence 参数），想通过只能真把内容讲进对话。
             if ctx.progress:
@@ -825,6 +880,12 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
             verdict = verify_milestone(_milestone_desc(updated, milestone_id),
                                        _transcript_text(ctx.state.get("conversation"),
                                                         config.ROUTE_VERIFY_TRANSCRIPT_CHARS))
+            # 验收结论本身要留痕：通过对/拒绝都是信号（"模型宣布完成但被独立验收员否掉"
+            # 正是里程碑事故的形态），只记被拒那次会让"验收几乎从没触发"这类问题查不出来
+            audit("milestone_verify", milestone=milestone_id, verified=verdict["verified"],
+                  missing_count=len(verdict.get("missing") or []),
+                  reason=str(verdict.get("reason") or "")[:200],
+                  rejects=rejects, advance_directive=exit_intent.is_advance_directive(latest_user))
             if verdict["verified"] is False:
                 ctx.updates["coach_verify_rejects"] = rejects + 1
                 # 用户只授权「往下走」、没声明掌握：验收判不了完成是预期结果，不是待补的作业。
@@ -933,6 +994,17 @@ HEAVY_TOOLS = frozenset({"collect", "read"})
 _EARLY_STAGES = frozenset({"search"})
 
 
+def _gate_event(kind: str, payload: dict, **fields) -> dict:
+    """记一条「代码否决模型」的事件，并原样返回工具回执。
+
+    否决族（贵工具失败闸 / 里程碑各闸）是行为信号里最值钱的一类：出问题时用户只看到
+    一句话，而这里留下的是"模型想做什么、被哪条闸拦下、当时计数多少"——没有它，
+    「模型宣布完成 → 代码否决 → 换措辞重试 → 烧光预算」这条链在日志里完全不可见。
+    """
+    audit("tool_gate", kind=kind, status=payload.get("status"), **fields)
+    return payload
+
+
 def _heavy_blocked(ctx: CoachCtx, tool: str) -> dict | None:
     """贵工具失败闸：同回合内失败过的贵工具不再让它重跑。
 
@@ -943,11 +1015,11 @@ def _heavy_blocked(ctx: CoachCtx, tool: str) -> dict | None:
     count, stage = int(rec.get("count") or 0), rec.get("stage")
     if count == 0 or (count == 1 and stage in _EARLY_STAGES):
         return None
-    return {
+    return _gate_event("heavy_blocked", {
         "status": "blocked",
         "hint": (f"{tool} 本回合已经失败过一次（{stage} 阶段），不要再调用它：重跑会重新搜索、"
                  "重新抓取、重新生成，白烧搜索/抓取额度。请直接把情况告诉用户，建议稍后再试。"),
-    }
+    }, tool=tool, stage=stage, failures=count)
 
 
 def _record_heavy_failure(ctx: CoachCtx, tool: str, stage: str) -> None:
@@ -1032,10 +1104,17 @@ def consolidate_memory(existing: dict, messages: list[dict], tech: str) -> dict:
                     f"===== 刚发生的对话 =====\n{block}")
     try:
         raw = generate_text(CONSOLIDATE_MEMORY_PROMPT, user_content, call_site="coach.consolidate")
-    except Exception:  # noqa: BLE001 —— LLM 不可用时三舱原样保留
+    except Exception as exc:  # noqa: BLE001 —— LLM 不可用时三舱原样保留
+        # 静默降级也要留痕：不然"记忆没涨"看起来像"这轮确实没有新事实"，
+        # 而实际是每次压缩都在丢增量
+        audit("error", kind=type(exc).__name__, stage="coach.consolidate",
+              message=str(exc)[:200])
         return {"facts": facts, "open_items": open_items, "summary": old_summary}
     obj = parse_json_object(raw)
     if not obj:
+        # 只记长度不记原文：这段 raw 是记忆增量（学习内容），绝不能进日志
+        audit("error", kind="unparsable_output", stage="coach.consolidate",
+              message=f"记忆增量解析失败（{len(raw or '')} 字符）")
         return {"facts": facts, "open_items": open_items, "summary": old_summary}
 
     # 确定性应用：facts 去重追加

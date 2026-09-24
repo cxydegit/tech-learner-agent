@@ -18,6 +18,7 @@ from ..domain.dedup import (
     _with_header,
     sanitize_filename,
 )
+from .audit import audit
 
 
 def ensure_knowledge_base() -> None:
@@ -366,6 +367,15 @@ def save_file_tool(path: str, content: str) -> dict:
     full_path = config.BASE_DIR / path
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
+    # 产物落盘在这里收口（materials/ 与 reports/ 的唯一写点），所以事件也记在这里——
+    # 记在调用侧就得每加一个产物类型都记得补一次，漏了就是静默的缺口。
+    if path.startswith("materials/"):
+        kind = "materials"
+    elif path.startswith("reports/"):
+        kind = "reports"
+    else:
+        kind = "other"
+    audit("artifact_write", kind=kind, path=path, bytes=len(content.encode("utf-8")))
     return {
         "path": str(full_path),
         "size": len(content),

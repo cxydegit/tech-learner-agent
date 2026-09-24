@@ -9,6 +9,7 @@ note_pipeline 只做「召回已有笔记 → 差量提取（只写增量，可�
 import re
 from collections.abc import Callable
 
+from ..adapters.audit import audit
 from ..adapters.llm import generate_text
 from ..adapters.store import (
     find_note_match,
@@ -304,6 +305,10 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
     conflict_reports: list[dict] = []
     for np_ in new_points:
         r = persist_note(tech, np_["topic"], np_["content"], np_["tags"])
+        # 逐篇记账（不是逐批）：知识库的每一次变更都要能追到"哪次会话、新建还是合并"，
+        # 批次计数从事件条数就能读出来，多一个 count 字段反而要求读者知道批次边界
+        audit("note_persist", tech=tech, path=r.get("path"), kind=r.get("action"),
+              index_ok=r.get("index_ok"))
         results.append(r)
         new_count += 1
     for idx in sorted(merge_indices):
@@ -312,6 +317,8 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
         # 合并保留旧笔记的标题（identity 属于被合并的旧笔记），标题/文件名/INDEX 保持一致；
         # 若用新点 topic 当标题，会篡改已有笔记的主题（文件名还是旧的，标题却变了）
         r = persist_note(tech, c["old_topic"], merged["content"], c["tags"], replace_path=c["old_path"])
+        audit("note_persist", tech=tech, path=r.get("path"), kind=r.get("action"),
+              index_ok=r.get("index_ok"), conflict=bool(merged["report"]))
         results.append(r)
         merged_count += 1
         if merged["report"]:
@@ -334,6 +341,24 @@ def format_merge_candidates(candidates: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# 合并决策的同义词表：解析（parse_merge_decision）与审计归类（decision_kind）共用，
+# 避免"日志里说的"和"代码实际认的"分叉——两处各写一份的话，加一个同义词就会只改一边。
+_MERGE_ALL_WORDS = frozenset({"all", "a", "y", "yes", "全合并", "全部合并", "都合并"})
+_MERGE_SKIP_WORDS = frozenset({"skip", "s", "n", "no", "跳过", "全部跳过", "none", ""})
+
+
+def decision_kind(decision: str | None) -> str:
+    """把用户的合并决策归一成审计用的类别：all / numbered / skip / free_text。"""
+    text = (decision or "").strip().lower()
+    if text in _MERGE_ALL_WORDS:
+        return "all"
+    if text in _MERGE_SKIP_WORDS:
+        return "skip"
+    if all(part.isdigit() or not part for part in re.split(r"[,，\s]+", text)):
+        return "numbered"
+    return "free_text"
+
+
 def parse_merge_decision(answer: str | None, n: int) -> set[int]:
     """解析用户对合并候选的决定：all 全合并 / 编号逗号分隔逐条 / skip 或空全部跳过。
 
@@ -341,9 +366,9 @@ def parse_merge_decision(answer: str | None, n: int) -> set[int]:
         要合并的候选 0-based 索引集合；空集表示全部跳过。
     """
     text = (answer or "").strip().lower()
-    if text in ("all", "a", "y", "yes", "全合并", "全部合并", "都合并"):
+    if text in _MERGE_ALL_WORDS:
         return set(range(n))
-    if text in ("skip", "s", "n", "no", "跳过", "全部跳过", "none", ""):
+    if text in _MERGE_SKIP_WORDS:
         return set()
     picked: set[int] = set()
     for part in re.split(r"[,，\s]+", text):

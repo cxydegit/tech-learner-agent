@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 from pathlib import Path
@@ -29,6 +30,7 @@ import chromadb
 from ..config import config
 from ..domain.chunking import _content_digest, chunk_markdown
 from ..domain.hybrid import build_bm25, lexical_rerank, rrf_fuse
+from .audit import audit
 from .embedding import DashScopeEmbeddingFunction
 
 _COLLECTION_NAME = "knowledge_base"
@@ -288,6 +290,14 @@ def reconcile_orphans(force: bool = False) -> dict:
     if rec.get("warn"):
         import warnings
         warnings.warn(rec["warn"], stacklevel=2)
+    # 只在真的动了索引 / 触发安全闸时记：日常"扫了一遍没问题"不记（噪声）。
+    # 安全闸那次用 WARNING —— RAG_RECONCILE_MIN_DISK_RATIO 是"防全库被清空"的最后一道防线，
+    # 它被触发意味着索引差点被整库误删，是全项目最该响铃的地方。
+    if rec.get("orphans") or rec.get("backfilled") or rec.get("warn"):
+        audit("index_reconcile",
+              level=logging.WARNING if rec.get("warn") else logging.INFO,
+              orphans=rec.get("orphans"), backfilled=rec.get("backfilled"),
+              gate_tripped=bool(rec.get("warn")), warn=str(rec.get("warn") or "")[:200])
     return rec
 
 
