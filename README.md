@@ -368,7 +368,7 @@ docs/        工程记录（事故复盘 / 评测报告 / 优化日志，见 doc
 | -------------------------------------- | -------------------- | ----------------------------------- |
 | `ROUTE_MAX_TOOL_CALLS_PER_TURN`        | `8`                  | 每用户回合工具调用预算                         |
 | `ROUTE_RECURSION_LIMIT`                | `50`                 | 图级执行硬上限                             |
-| `COACH_HISTORY_KEEP`                   | `10`                 | 上下文保留最近对话轮数                         |
+| `COACH_HISTORY_KEEP`                   | `5`                  | 上下文保留最近对话轮数                         |
 | `COACH_COMPRESS_AT`                    | `40`                 | 消息数压缩阈值                             |
 | `ROUTE_MEMORY_SWEEP_TURNS`             | `6`                  | 沉淀触发：累计用户回合数                        |
 | `ROUTE_MEMORY_SWEEP_CHARS`             | `2500`               | 沉淀触发：累计对话字符数                        |
@@ -384,6 +384,7 @@ docs/        工程记录（事故复盘 / 评测报告 / 优化日志，见 doc
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | 回落 `OPENAI_*`    | 独立 embedding 端点（chat / embedding 异源，可选）    |
 | `EMBEDDING_BATCH_SIZE`                 | `10`                  | embedding 单请求批量上限（10=百炼限额，换服务可调大）        |
 | `WEB_HOST` / `WEB_PORT`                | `127.0.0.1` / `8000` | Web 服务地址                            |
+| `AUDIT_LOG_MAX_BYTES` / `AUDIT_LOG_BACKUPS` | `5242880` / `5` | 审计日志（`logs/audit.jsonl`）单文件上限与轮转保留数          |
 
 ***
 

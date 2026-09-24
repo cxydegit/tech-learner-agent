@@ -17,6 +17,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 
 from ..config import config
 from ..domain.extraction import parse_json_object
+from .audit import audit
 
 
 def current_time_label() -> str:
@@ -34,21 +35,13 @@ def replace_time_line(report: str, label: str, now: str) -> str:
 
 # ============================================================
 # LLM 调用埋点
-# 一次尝试一行 JSON，只记元数据（耗时 / finish_reason / token 数 / 走哪条路），
+# 一次尝试一个事件，只记元数据（耗时 / finish_reason / token 数 / 走哪条路），
 # **不记 prompt 与回复内容**：学的是用户自己的东西，内容不进日志。
+# 事件经 adapters.audit 统一出口落盘（logs/audit.jsonl）+ stderr，公共字段
+# （ts / thread_id / step）由那一层注入，这里只填业务字段。
 # 默认就开着、不设开关——没有它，「慢」与「截断」只能靠翻 checkpoint 数据库和看文件
 # 断口反推，而那正是 2026-09-09 collect 静默 22 分钟那次的定位成本所在。
 # ============================================================
-
-_LOGGER = logging.getLogger("tech_learner.llm")
-_LOGGER.setLevel(logging.INFO)
-_LOGGER.propagate = False  # 应用若另配了 root logger，不重复打印
-if not _LOGGER.handlers:
-    # 导入时就挂好：惰性挂载的「检查-再挂载」不是原子的，而后台沉淀线程与主线程可能同时
-    # 首次调用，各挂一个 handler 会让每行日志重复输出。
-    _HANDLER = logging.StreamHandler()
-    _HANDLER.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    _LOGGER.addHandler(_HANDLER)
 
 
 def _log_call(call_site: str, attempt: int, elapsed: float, *, status: str,
@@ -60,20 +53,18 @@ def _log_call(call_site: str, attempt: int, elapsed: float, *, status: str,
     attempt=1..N 是工具调用通道的第几次尝试；attempt=0 且 fallback=True 表示降级那次请求。
     finish_reason 是「截断」的直接实锤（length=撞 max_tokens），elapsed_s 是「慢」的直接实锤。
     """
-    _LOGGER.info(json.dumps({
-        "event": "llm_call",
-        "site": call_site or "unknown",
-        "attempt": attempt,
-        "elapsed_s": round(elapsed, 1),
-        "status": status,
-        "kind": kind,
-        "http": http,
-        "finish_reason": finish_reason,
-        "prompt_tokens": getattr(usage, "prompt_tokens", None),
-        "completion_tokens": getattr(usage, "completion_tokens", None),
-        "fallback": fallback,
-        "error": error[:200],
-    }, ensure_ascii=False))
+    audit("llm_call",
+          site=call_site or "unknown",
+          attempt=attempt,
+          elapsed_s=round(elapsed, 1),
+          status=status,
+          kind=kind,
+          http=http,
+          finish_reason=finish_reason,
+          prompt_tokens=getattr(usage, "prompt_tokens", None),
+          completion_tokens=getattr(usage, "completion_tokens", None),
+          fallback=fallback,
+          error=error[:200])
 
 
 @contextmanager
@@ -155,11 +146,10 @@ def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | No
     text = response.choices[0].message.content
     if finish == "length":
         # 截断是数据质量事件，用 WARNING 让它从常规 INFO 里跳出来
-        _LOGGER.warning(json.dumps({
-            "event": "llm_truncated", "site": call_site or "unknown",
-            "completion_tokens": getattr(getattr(response, "usage", None), "completion_tokens", None),
-            "annotated": bool(truncation_notice),
-        }, ensure_ascii=False))
+        audit("llm_truncated", level=logging.WARNING,
+              site=call_site or "unknown",
+              completion_tokens=getattr(getattr(response, "usage", None), "completion_tokens", None),
+              annotated=bool(truncation_notice))
         if truncation_notice:
             text = f"{text}{truncation_notice}"
     return text

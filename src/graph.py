@@ -19,6 +19,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from .adapters.audit import audit_context
 from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
 from .domain import exit_intent, survey
@@ -745,10 +746,16 @@ def _apply_sweep_result(updates: dict, state: LearnState, sweep: dict) -> None:
 
 def _start_sweep_thread(tech: str, buffer: list[dict], tid: str) -> None:
     """fire 后台沉淀线程：纯读 + LLM（run_memory_sweep，progress=None 后台静默），
-    结果写入进程内侧信道 _sweep_results。daemon 硬约束：绝不写文件 / Chroma / 图状态。"""
+    结果写入进程内侧信道 _sweep_results。daemon 硬约束：绝不写文件 / Chroma / 图状态。
+
+    审计事件的会话标识在这里显式声明：本线程是节点里新起的普通线程，而 `threading.Thread`
+    不复制 contextvars——langgraph 的 config 在那个线程里读不到。不声明的话，这条链上的
+    LLM 调用与副作用事件会全部退化成无归属，而它们恰是最需要归属的一类事件。
+    """
     def worker():
         try:
-            result = run_memory_sweep(tech, buffer)
+            with audit_context(tid):
+                result = run_memory_sweep(tech, buffer)
         except Exception as e:  # noqa: BLE001 —— 后台失败记 error，排水时同步兜底重跑
             result = {"action": "error", "error": f"{type(e).__name__}: {e}"}
         with _sweep_results_lock:

@@ -10,6 +10,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 
+from .adapters.audit import boot
 from .config import config
 from .domain.card_input import parse_card_input
 from .pipelines.collect import collect_pipeline
@@ -38,6 +39,7 @@ def cli():
         sys.exit(1)
 
     config.ensure_dirs()
+    boot("cli")
 
 
 @cli.command()

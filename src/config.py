@@ -102,6 +102,15 @@ class Config:
     GRAPH_DB_DIR: Path = BASE_DIR / ".graph"
     GRAPH_DB_PATH: Path = GRAPH_DB_DIR / "checkpoints.sqlite"
 
+    # 审计日志（结构化事件）：一行一个 JSON，见 adapters/audit.py。
+    # 落本机、已 gitignore，用来把"定位一次事故"从翻 checkpoint 反推降成按会话查日志。
+    # 单文件按**大小**轮转，文件名不带日期——带日期会和按大小轮转打架（轮转出来的
+    # `audit-09-24.jsonl.1` 里可能装着 09-25 的行），而且日期只在进程启动时算一次，
+    # Web 服务跨零点会继续写昨天那个文件。时间过滤按每行的 `ts` 字段做，能力一样。
+    AUDIT_LOG_DIR: Path = BASE_DIR / "logs"  # 绝对锚点：CWD 相对路径会在换目录跑 CLI 时写飞
+    AUDIT_LOG_MAX_BYTES: int = int(os.getenv("AUDIT_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+    AUDIT_LOG_BACKUPS: int = int(os.getenv("AUDIT_LOG_BACKUPS", "5"))
+
     # 定制化学习路线（模块 2）：coach agent 循环配置
     # 工具调用护栏：每用户回合最大连续工具调用数（超限强制 interrupt 找用户确认方向，防死循环）
     ROUTE_MAX_TOOL_CALLS_PER_TURN: int = int(os.getenv("ROUTE_MAX_TOOL_CALLS_PER_TURN", "8"))
@@ -237,7 +246,7 @@ class Config:
     def ensure_dirs(cls) -> None:
         """确保输出目录存在"""
         for d in [cls.MATERIALS_DIR, cls.REPORTS_DIR, cls.KNOWLEDGE_DIR,
-                  cls.LEARNER_DIR, cls.ROADMAP_DIR]:
+                  cls.LEARNER_DIR, cls.ROADMAP_DIR, cls.AUDIT_LOG_DIR]:
             d.mkdir(parents=True, exist_ok=True)
 
 

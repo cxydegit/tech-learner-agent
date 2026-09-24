@@ -15,6 +15,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.adapters import audit as audit_mod
 from src.adapters import llm as llm_mod
 from src.adapters.llm import ToolCallError, chat_with_tools, generate_text
 from src.config import config
@@ -43,9 +44,9 @@ class _Capture(logging.Handler):
 
 @pytest.fixture
 def log_capture(monkeypatch):
-    """替换 logger 的 handler 列表：既捕获日志，也避免 _ensure_handler 挂 stderr。"""
+    """替换审计 logger 的 handler 列表：既捕获事件，也避免写 stderr / 落盘。"""
     cap = _Capture()
-    monkeypatch.setattr(llm_mod._LOGGER, "handlers", [cap])
+    monkeypatch.setattr(audit_mod.LOGGER, "handlers", [cap])
     return cap
 
 

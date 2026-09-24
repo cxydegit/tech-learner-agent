@@ -20,6 +20,9 @@ __pycache__/
 CLAUDE.md
 .workbuddy/
 
+# 审计日志（运行时生成，可能含本机路径与会话标识，不进仓库）
+logs/
+
 # 运行时生成的资料缓存
 materials/
 reports/

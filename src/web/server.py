@@ -172,6 +172,11 @@ app = create_app()
 def main() -> None:
     """`python -m src.web.server` 启动入口。"""
     import uvicorn
+
+    from ..adapters.audit import boot  # 顶层不 import 子模块（见模块 docstring 的依赖约定）
+
+    # 进程启动快照：给之后每一行审计日志提供"当时的模型与阈值是什么"这个背景
+    boot("web")
     uvicorn.run(app, host=config.WEB_HOST, port=config.WEB_PORT)
 
 
