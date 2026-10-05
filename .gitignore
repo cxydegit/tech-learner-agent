@@ -17,7 +17,6 @@ __pycache__/
 
 # Claude Code 本地缓存与本地开发规范（仅本地使用，不随仓库分发）
 .claude/
-CLAUDE.md
 .workbuddy/
 
 # 运行时生成的资料缓存

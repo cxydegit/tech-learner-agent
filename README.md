@@ -355,7 +355,7 @@ knowledge/   知识笔记           learner/    用户画像
 roadmaps/    学习路线           .graph/     会话状态（checkpointer）
 .chroma/     语义向量库
 
-docs/        工程记录（事故复盘 / 评测报告 / 优化日志，见 docs/README.md）
+docs/        工程记录（事故复盘 / 评测报告 / 优化日志，见 docs/INDEX.md）
 ```
 
 ***
@@ -402,11 +402,11 @@ pytest
 
 ## 工程记录
 
-`docs/` 保存开发过程中的工程记录。其中的数字与结论都是**当时实测的历史记录**（评测与标定脚本未随仓库分发），阅读须知见 [`docs/README.md`](docs/README.md)。
+`docs/` 保存开发过程中的工程记录。其中的数字与结论都是**当时实测的历史记录**（评测与标定脚本未随仓库分发），阅读须知见 [`docs/INDEX.md`](docs/INDEX.md)。
 
-- **事故复盘**——[裁剪把 tool 回执和它的 assistant 切散](docs/coach_trim-tool-accident.md)、[collect 静默 22 分钟与报告被硬截断](docs/llm-timeout-and-truncation-accident.md)
+- **事故复盘**——[裁剪把 tool 回执和它的 assistant 切散](docs/incidents/coach-trim-tool.md)、[collect 静默 22 分钟与报告被硬截断](docs/incidents/llm-timeout-and-truncation.md)
 - **基准对比**——[自建 ReAct 循环 vs 确定性管道 + 图编排](docs/report/reAct-vs-graph-report.md)：同任务 16 次/侧，平均 prompt token 5,898 vs 15,734
-- **检索评测**——[56 条场景查询的 dense vs hybrid 评估](docs/eval_retrieval_scenarios.md)：hit-rate@8 86%→98%、MRR 0.737→0.920
+- **检索评测**——[56 条场景查询的 dense vs hybrid 评估](docs/benchmarks/eval_retrieval_scenarios.md)：hit-rate@8 86%→98%、MRR 0.737→0.920
 - **迭代链**——[混合检索的四次修复](docs/report/rag-hybrid-scenario-eval-v1.3.md)，其中包含一次**被后续数据推翻的错误诊断**（[v1.2](docs/report/rag-hybrid-scenario-eval-v1.2.md)）
 
 ***
