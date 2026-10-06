@@ -636,6 +636,46 @@ def _sweep_buffer_text(buffer: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _buffer_query_segments(buffer: list[dict]) -> list[str]:
+    """把沉淀缓冲按**助手消息**分组，每组是要拿去检索的一段文本。
+
+    为什么以助手消息为界：要被提取成笔记的是**助手讲出来的知识点**，用户的输入多半是贴回来
+    的运行结果 / 报错 / 配置。按"助手 + 用户回复"合成一组会让粘贴把查询预算吃掉——实测
+    有这么一批：8 次查询里 6 次花在一份 `--dump-config` 输出上，而 2672 字的讲解只占 1 次。
+
+    用户消息只在**短**的时候并入当前组（≤ NOTE_RECALL_USER_MSG_CHARS）：短回是主题信号
+    （"Context 和 useMemo 有什么区别？"），长的是素材，整条不进查询。
+
+    为什么要分组（而不是整批查一次）：一批缓冲常跨多个主题，整批文本会被平均成一个向量，
+    后出现的主题在查询里没有表示，对应笔记召不回来——差量提取于是看不见它们，把已覆盖的
+    内容当新知识重提。
+
+    从**结构化缓冲**取，不从拼好的字符串里正则切——缓冲本来就是 [{role, content}]。
+    组内文本过长时再由管道按 1500 字切块（见 note._recall_queries）；整组短于
+    NOTE_RECALL_MIN_SEGMENT_CHARS 的是寒暄，单独查一次只会带回噪声，丢掉。
+    """
+    segs: list[str] = []
+    cur: list[str] = []
+    has_assistant = False
+    for m in buffer:
+        role = m.get("role")
+        content = (m.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if role == "assistant":
+            if has_assistant:  # 这一组里已经有一条助手讲解 → 收束，另起一组
+                segs.append("\n".join(cur))
+                cur, has_assistant = [], False
+            cur.append(f"assistant：{content}")
+            has_assistant = True
+        elif len(content) <= config.NOTE_RECALL_USER_MSG_CHARS:
+            cur.append(f"user：{content}")
+        # 超长的用户消息（粘贴）整条不进查询：它是要讲解的素材，不是会被提取的知识
+    if cur:
+        segs.append("\n".join(cur))
+    return [s for s in segs if len(s) >= config.NOTE_RECALL_MIN_SEGMENT_CHARS]
+
+
 def run_memory_sweep(tech: str, buffer: list[dict], progress=None) -> dict:
     """确定性写触发：把自上次沉淀以来的对话文本喂给 note 管道沉淀。
 
@@ -659,7 +699,9 @@ def run_memory_sweep(tech: str, buffer: list[dict], progress=None) -> dict:
         return {"action": "skip", "count": 0, "pending": None, "message": None}
     if progress:
         progress("🗂️ 正在沉淀学习内容...")
-    result = note_pipeline(tech, text, progress=progress)
+    # 分段只作召回查询用；喂给差量提取的正文仍是整批 text（提取要看全部内容，召回只看"像不像"）
+    result = note_pipeline(tech, text, progress=progress,
+                           query_segments=_buffer_query_segments(buffer))
     if result.get("empty_reason"):
         return {"action": "skip", "count": 0, "pending": None, "message": None}
     # LLM 输出条目全无效（topic/正文为空被过滤）→ 两个桶都空，等价于无新内容，按 skip 处理

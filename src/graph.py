@@ -756,11 +756,16 @@ def _sweep_fired_stale(inflight: dict) -> bool:
     return (datetime.now() - fired).total_seconds() > config.ROUTE_MEMORY_SWEEP_TIMEOUT  # noqa: DTZ005 —— fired_at 为本地 naive 时间戳
 
 
+def _buffer_chars(buffer: list[dict]) -> int:
+    """缓冲的字符数。触发判定与 sweep_fire 事件共用同一把尺——分开各算一遍，
+    日志里的批次大小就会和"当时为什么触发"对不上。"""
+    return sum(len(m.get("content") or "") for m in buffer)
+
+
 def _threshold_met(buffer: list[dict]) -> bool:
     """沉淀触发阈值：自上次沉淀以来累计用户回合数 / 字符数（任一达标即触发）。"""
     turns = sum(1 for m in buffer if m.get("role") == "user")
-    chars = sum(len(m.get("content") or "") for m in buffer)
-    return turns >= config.ROUTE_MEMORY_SWEEP_TURNS or chars >= config.ROUTE_MEMORY_SWEEP_CHARS
+    return turns >= config.ROUTE_MEMORY_SWEEP_TURNS or _buffer_chars(buffer) >= config.ROUTE_MEMORY_SWEEP_CHARS
 
 
 def _emit_sweep_feedback(message: str) -> None:
@@ -870,10 +875,10 @@ def coach_memory_write(state: LearnState) -> dict:
                                       "fired_at": datetime.now().isoformat(timespec="seconds")},  # noqa: DTZ005 —— 本地 naive 语义
             "memory_sweep_buffer": [],
         }
-        audit("sweep_fire", items=len(snapshot), mode="async")
+        audit("sweep_fire", items=len(snapshot), chars=_buffer_chars(snapshot), mode="async")
         _start_sweep_thread(tech, snapshot, tid)
         return updates
-    audit("sweep_fire", items=len(buffer), mode="sync")
+    audit("sweep_fire", items=len(buffer), chars=_buffer_chars(buffer), mode="sync")
     sweep_started = time.monotonic()
     sweep = run_memory_sweep(tech, buffer, progress=_get_progress())
     audit("sweep_drain", result=str(sweep.get("action") or "unknown"), mode="sync",

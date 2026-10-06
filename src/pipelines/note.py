@@ -20,6 +20,7 @@ from ..adapters.store import (
     recall_existing_notes,
 )
 from ..config import config
+from ..domain.chunking import chunk_text
 from ..domain.dedup import strip_note_header
 from ..domain.extraction import parse_entries, parse_json_object
 
@@ -116,19 +117,20 @@ SUGGEST_SYSTEM_PROMPT = """你是一个学习规划助手。某个技术领域�
 def _build_extraction_user(tech: str, conversation_log: str, existing: list[dict]) -> str:
     """组装差量提取的 user_content：技术 + 已有笔记上下文(限量) + 学习内容。
 
-    Token 预算：已有笔记每条截断 ~500 字、top 3~5 条，
-    学习内容截断 12000 字，避免长对话直接把提示词撑爆。
+    Token 预算：已有笔记每条截断 NOTE_CONTEXT_LIMIT 字，**篇数由召回侧限量**
+    （recall_existing_notes 的 top_k），这里不再二次截断——两处各截一次的话，
+    改动哪一处都不会生效。学习内容按 NOTE_CONTENT_CHARS 截断。
     """
     if existing:
         blocks = []
-        for n in existing[: config.NOTE_RECALL_TOP_K]:
+        for n in existing:
             topic = n.get("topic") or ""
             body = (n.get("content") or "")[: config.NOTE_CONTEXT_LIMIT]
             blocks.append(f"### {topic}\n{body}")
         existing_ctx = "\n\n".join(blocks)
     else:
         existing_ctx = "（本技术暂无已有笔记，正常提取全部知识点）"
-    content = conversation_log[:12000]
+    content = conversation_log[: config.NOTE_CONTENT_CHARS]
     return (
         f"技术领域：{tech}\n\n"
         f"===== 已有知识笔记 =====\n{existing_ctx}\n"
@@ -136,9 +138,84 @@ def _build_extraction_user(tech: str, conversation_log: str, existing: list[dict
     )
 
 
+def _sim_of(note: dict) -> float | None:
+    """召回条目的相似度（保留三位）；RAG 不可用走"最近 top-k"回退时没有分数 → None。
+
+    None 是回退路径的标记，不是"相似度为零"——两者在日志里必须能分开。
+    """
+    sim = note.get("similarity")
+    return round(float(sim), 3) if isinstance(sim, (int, float)) else None
+
+
+def _recall_queries(conversation_log: str, query_segments: list[str] | None) -> list[str]:
+    """把每组文本切成要拿去检索的查询：一次查询一块。
+
+    一组查一次是**必需**而不是讲究：一批对话常跨多个主题，只拿开头的文本查一次，后出现的
+    主题在查询向量里没有任何分量，对应笔记必然召不回来——差量提取于是看不见它，把已覆盖的
+    内容当新知识重提。
+
+    一条助手讲解经常超过 1500 字（实测 60 条里 22 条超过，最长 3162 字）。超过的部分不是丢掉，
+    是**切开、每块各查一次**：只取开头 1500 字的话，后面的内容在查询里没有表示。
+    切块用 chunk_text（尽量切在段落边界，段落本身就超长才硬切；相邻块留一点重叠，
+    避免把一句话从中间切断）。
+
+    名额分配：**每组的第一块一定发出去**（讲解的开头信息最密），剩下的名额再按顺序补给长消息
+    后面的块。之前是"所有块拉平了均匀取样"，实测会把某组的第一块正好跳过——那一组等于在
+    查询里没有表示，正是分组要修的问题。
+
+    没有分组时（交互式的三个调用点）退回旧行为：整批取开头 1500 字查一次。
+    """
+    # 重叠不能大过块本身：chunk_text 在 overlap ≥ chunk_size 时按 0 步长切分，直接抛异常
+    overlap = min(config.RAG_CHUNK_OVERLAP, config.NOTE_QUERY_CHARS // 2)
+    blocks_by_msg = [chunk_text(seg.strip(), chunk_size=config.NOTE_QUERY_CHARS, overlap=overlap)
+                     for seg in (query_segments or []) if (seg or "").strip()]
+    first_of_each = [blocks[0] for blocks in blocks_by_msg if blocks]
+    if not first_of_each:
+        head = conversation_log[: config.NOTE_QUERY_CHARS]
+        return [head] if head.strip() else []
+    limit = max(1, config.NOTE_RECALL_MAX_QUERIES)
+    if len(first_of_each) > limit:  # 消息条数本身就超上限（罕见）：均匀取样，保住首尾
+        span = len(first_of_each) - 1
+        first_of_each = ([first_of_each[round(i * span / (limit - 1))] for i in range(limit)]
+                         if limit >= 2 else first_of_each[:1])
+    rest = [b for blocks in blocks_by_msg for b in blocks[1:]]
+    return (first_of_each + rest)[:limit]
+
+
+def _audit_recall(tech: str, *, batch_chars: int, queries: list[str], kb_notes: int,
+                  recalled: list[dict]) -> None:
+    """记一条召回现场：批次多大、切了几段、召回了哪几篇（**只记路径与分数**）。
+
+    这是「召回窄了」和「提取质量差」唯一能分开的证据来源：没有它，两种现象在日志里长得一样
+    ——都是"该抑制的没抑制住"。
+
+    kb_notes（该技术笔记总篇数）必须和召回结果一起记：召回为空有两种完全不同的成因——
+    库里本来就没有笔记（正常），和库里有笔记但都被相似度下限滤掉了。少了总数这两个状态分不开
+    （但**分辨不了后者是哪一种**：被挡下那批的最高余弦现在没有读数，见计划文档的待测项）。
+
+    sim_min 一并记下，读日志时不必回头查当时的配置。
+
+    提取正文的长度也记在这里：它只在管道内部拿得到，且一次运行一条记录最便于对齐。
+    """
+    query_chars = sum(len(q) for q in queries)
+    audit("note_recall",
+          tech=tech,
+          batch_chars=batch_chars,
+          query_count=len(queries),
+          query_chars=query_chars,
+          query_truncated=batch_chars > query_chars,
+          kb_notes=kb_notes,
+          sim_min=config.NOTE_RECALL_SIM_MIN,
+          content_chars=min(batch_chars, config.NOTE_CONTENT_CHARS),
+          content_truncated=batch_chars > config.NOTE_CONTENT_CHARS,
+          recalled_count=len(recalled),
+          recalled=[{"path": n.get("path") or "", "sim": _sim_of(n)} for n in recalled])
+
+
 def note_pipeline(tech: str, conversation_log: str,
                   materials_path: str | None = None,
-                  progress: Callable[[str], None] | None = None) -> dict:
+                  progress: Callable[[str], None] | None = None,
+                  query_segments: list[str] | None = None) -> dict:
     """差量提取管道：召回已有笔记 → LLM 只输出新增点 → 匹配生成 merge_candidates。
 
     与交互层的区别：只返回数据（new_points / merge_candidates / empty_reason /
@@ -149,6 +226,8 @@ def note_pipeline(tech: str, conversation_log: str,
         conversation_log: 本轮学习的对话记录或文档内容
         materials_path: 可选，该技术的 materials 报告路径（"无新内容"时推荐未覆盖方向用）
         progress: 可选回调，接收进度消息；None 则静默
+        query_segments: 可选，召回用的查询段（一段一次检索）。**调用方手里有结构化对话时
+            才给**（自动沉淀的缓冲就是）；不给则退回"批次开头截一段"的旧行为
 
     Returns:
         {
@@ -161,10 +240,18 @@ def note_pipeline(tech: str, conversation_log: str,
           "new_count": int, "merged_count": int,
         }
     """
-    # 1. 语义召回：该 tech 下与学习内容最相关的已有笔记 top-k（差量上下文）
+    # 1. 语义召回：该 tech 下与学习内容最相关的已有笔记（差量上下文）
     if progress:
         progress("🔎 召回已有笔记...")
-    existing = recall_existing_notes(tech, conversation_log[:1500], config.NOTE_RECALL_TOP_K)
+    existing_all = get_existing_notes(tech)  # 全量（逐条匹配用），同时给召回日志一个"库里有几篇"的底
+    queries = _recall_queries(conversation_log, query_segments)
+    # 下限一律生效，不看库大小："小库就全给"曾实现过又撤掉——低相似度的笔记就是噪声，
+    # 给出去可能诱发过抑制（模型判"已覆盖"→ 输出 [] → 静默丢内容），而下面限清空上下文
+    # 只会多提取（下游 find_note_match 与用户闸门兜底，最坏是一篇可见的重复笔记）。
+    existing = recall_existing_notes(tech, queries, config.NOTE_RECALL_TOP_K,
+                                     sim_min=config.NOTE_RECALL_SIM_MIN)
+    _audit_recall(tech, batch_chars=len(conversation_log), queries=queries,
+                  kb_notes=len(existing_all), recalled=existing)
 
     # 2. 差量提取：只输出新增知识点（可输出 []）
     if progress:
@@ -173,7 +260,6 @@ def note_pipeline(tech: str, conversation_log: str,
                         call_site="note.extract")
     entries = parse_entries(raw)
 
-    existing_all = get_existing_notes(tech)
     if not entries:
         # 4. 无新内容路径：不沉淀；有 materials 则轻量 LLM 推荐未覆盖方向，否则只如实告知
         topics = [n["topic"] for n in existing_all]

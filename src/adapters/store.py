@@ -99,42 +99,62 @@ def find_note_match(tech: str, topic: str, existing: list[dict],
     return None, None, None
 
 
-def recall_existing_notes(tech: str, query: str, top_k: int = 3) -> list[dict]:
-    """语义召回该技术领域下与学习内容最相关的已有笔记 top-k（差量提取的对比上下文）。
+def recall_existing_notes(tech: str, query: str | list[str], top_k: int = 3,
+                          *, sim_min: float | None = None) -> list[dict]:
+    """语义召回该技术领域下与学习内容最相关的已有笔记（差量提取的对比上下文）。
 
     复用 semantic_search_knowledge 限定 knowledge 源 + tech 目录（lazy import）；
     RAG 未索引 / 不可用时回退到最近 top_k 篇，保证提取提示词至少有一点对比对象。
 
     Args:
         tech: 技术名称（原始大小写，如 "FastAPI"）
-        query: 语义检索查询文本（本轮学习内容截断）
-        top_k: 返回条数
+        query: 查询文本；给列表时**逐条各查一次**再并集——一批学习内容常跨多个主题，
+            拼成一条长查询会把主题平均成一个向量，等于没分段
+        top_k: 返回**笔记篇数**（不是分块条数）；同一篇的多个命中分块只占一个名额
+        sim_min: 可选相似度下限（余弦）。低于它的候选直接丢弃——宁可"不给对比对象"
+            （下游多提取一次，有匹配与用户确认兜底），也不要给一篇不相关的笔记诱发过抑制。
+            **只作用于检索命中的候选**：RAG 不可用时的"最近 top_k 篇"回退不受它约束
 
     Returns:
-        [{"path", "topic", "date", "content", "similarity"}, ...]
-        无笔记时返回 []；content 来自 get_existing_notes（前 2000 字，供提取提示词自行截断）。
+        [{"path", "topic", "date", "content", "similarity"}, ...]，按相似度降序；
+        同分/回退条目的 similarity 为 None（= 没有分数，不是"相似度为零"）。
+        无笔记时返回 []；**可能返回空**——那是"这批内容在本技术下没有相关笔记"，
+        不是故障，调用方不要拿回退去填满它。
     """
     all_notes = get_existing_notes(tech)
     if not all_notes:
         return []
+    queries = [query] if isinstance(query, str) else list(query)
+    by_path = {n["path"]: n for n in all_notes}
+    # path → 最高余弦：同一篇笔记被多个分块 / 多段查询命中时只留最高分，也只占一个名额
+    best: dict[str, float] = {}
     try:
         from .vector import semantic_search_knowledge
-        hits = semantic_search_knowledge(query, top_k=top_k, tech=sanitize_filename(tech))
+        for q in queries:
+            if not (q or "").strip():
+                continue
+            for h in semantic_search_knowledge(q, top_k=top_k, tech=sanitize_filename(tech)):
+                # RAG 索引路径相对 BASE_DIR（knowledge/rag/xxx.md），
+                # 而 all_notes 路径相对 KNOWLEDGE_DIR（rag/xxx.md），归一化后比较
+                path = (h.get("path") or "").removeprefix("knowledge/")
+                if path not in by_path:
+                    continue
+                sim = h.get("similarity")
+                sim = float(sim) if isinstance(sim, (int, float)) else 0.0
+                if sim > best.get(path, -1.0):
+                    best[path] = sim
     except Exception:  # noqa: BLE001 —— RAG 不可用时回退
-        hits = []
+        best = {}
 
-    by_path = {n["path"]: n for n in all_notes}
-    recalled: list[dict] = []
-    for h in hits:
-        path = h.get("path") or ""
-        path = path.removeprefix("knowledge/")
-        n = by_path.get(path)
-        if n and n not in recalled:
-            recalled.append({**n, "similarity": h.get("similarity", 0)})
-    if not recalled:
-        # 回退：最近 top_k 篇（RAG 未索引 / 空索引）
-        recalled = [{**n, "similarity": None} for n in all_notes[-top_k:]]
-    return recalled
+    if not best:
+        # 回退：最近 top_k 篇（RAG 未索引 / 空索引 / 检索不可用）。判据是"一个候选都没有"，
+        # 而不是"过滤后为空"——否则下限会被这条回退整个抵消掉。
+        return [{**n, "similarity": None} for n in all_notes[-top_k:]]
+
+    if sim_min is not None:
+        best = {p: s for p, s in best.items() if s >= sim_min}
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
+    return [{**by_path[p], "similarity": s} for p, s in ranked]
 
 
 def read_knowledge_note(rel_path: str) -> str:

@@ -169,8 +169,35 @@ class Config:
     ROADMAP_DIR: Path = BASE_DIR / "roadmaps"
 
     # Note 模块（差量提取）：召回已有笔记作上下文的预算参数
-    NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "3"))  # 召回该 tech 已有笔记 top-k 作差量上下文
+    # 召回上限是**笔记篇数**，不是检索分块条数：一篇笔记常切成多块，按块计数会让"top-3"
+    # 实际只覆盖 1–2 篇（实测 51 个名额里 18–20 个被同一篇的多个分块重复占用）。
+    # 实测单批最多 9 篇相关笔记（修好 embedding 索引后的读数；此前那个"最多 4 篇"是在
+    # 索引半个库取不回来的状态下测的，偏小），取 10 覆盖全部实测批次。
+    # 上下文成本：10 篇 × NOTE_CONTEXT_LIMIT 字 = 5000 字，相对 NOTE_CONTENT_CHARS 仍小。
+    NOTE_RECALL_TOP_K: int = int(os.getenv("NOTE_RECALL_TOP_K", "10"))
+    # 召回笔记的相似度下限（余弦）：低于它宁可"不给对比对象"。给错的代价是模型倾向判
+    # "已被覆盖"→ 输出空数组，静默丢内容且不经过任何确认；少给的代价只是多提取一次，
+    # 下游还有逐条匹配与用户确认兜底。实测两段分布是分开的：库里确实没有相关笔记时
+    # 余弦 0.04–0.09，而实际召回到的笔记 0.48–0.885——0.4 落在这段空隙里。
+    NOTE_RECALL_SIM_MIN: float = float(os.getenv("NOTE_RECALL_SIM_MIN", "0.4"))
     NOTE_CONTEXT_LIMIT: int = int(os.getenv("NOTE_CONTEXT_LIMIT", "500"))  # 每条已有笔记在提取提示词里的截断字数
+    # 召回查询窗口（字符）：**单段**查询文本的截断长度。一段 = 一个对话回合，每段各查一次；
+    # 整批只取开头（旧行为）会让后出现的主题在查询里没有任何表示——实测真实批次中位 3522 字，
+    # 中位有 2 个用户回合完全落在 1500 字窗口外，对应笔记必然召不回。
+    NOTE_QUERY_CHARS: int = int(os.getenv("NOTE_QUERY_CHARS", "1500"))
+    # 单批最多发几次召回查询（每次一段文本、一次 embedding 调用）。超过时摊平取样，
+    # 不截掉一头——被整段丢掉的那部分在查询里就彻底没有表示，正是分段要修的问题。
+    # 8 × 单段 1500 字 = 12000 字，与差量提取正文的上限同量级：查询能覆盖的范围
+    # 不必超过提取看得见的范围，所以次数上限这一个旋钮就够了。
+    NOTE_RECALL_MAX_QUERIES: int = int(os.getenv("NOTE_RECALL_MAX_QUERIES", "8"))
+    # 段长下限（字符）：更短的段是寒暄（"继续""懂了"），单独查一次只会带回噪声。
+    NOTE_RECALL_MIN_SEGMENT_CHARS: int = int(os.getenv("NOTE_RECALL_MIN_SEGMENT_CHARS", "30"))
+    # 用户消息并入查询的字数上限：短回是主题信号（"Context 和 useMemo 有什么区别"），
+    # 超过它的是素材——用户贴回来的运行结果 / 报错 / 配置。实测最长的一条用户消息 15421 字
+    # （一份 --dump-config 输出），它不是待提取的知识，却会让查询预算全花在它身上。
+    NOTE_RECALL_USER_MSG_CHARS: int = int(os.getenv("NOTE_RECALL_USER_MSG_CHARS", "200"))
+    # 差量提取正文的字符上限（超出即截断）。实测 17 个真实批次只有 1 个触发过，属观测项。
+    NOTE_CONTENT_CHARS: int = int(os.getenv("NOTE_CONTENT_CHARS", "12000"))
 
     # QA 模块（联想检索）：检索与提示词预算参数
     QA_TOP_K: int = int(os.getenv("QA_TOP_K", "8"))  # 召回笔记片段条数

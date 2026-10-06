@@ -316,7 +316,85 @@ def test_sweep_fire_and_drain_sync_path(monkeypatch, audit_events):
     fire = _events(audit_events, "sweep_fire")[-1]
     drain = _events(audit_events, "sweep_drain")[-1]
     assert fire["items"] == 1 and fire["mode"] == "sync"
+    assert fire["chars"] == 3000  # 与触发判定共用 _buffer_chars：日志里的批次大小要能和"为什么触发"对上
     assert drain["result"] == "persisted" and drain["count"] == 2 and drain["mode"] == "sync"
+
+
+def test_sweep_fire_async_records_chars(monkeypatch, audit_events):
+    monkeypatch.setattr(config, "ROUTE_MEMORY_SWEEP_ASYNC", True)
+    monkeypatch.setattr(graph_mod, "_start_sweep_thread", lambda tech, buffer, tid: None)
+    buffer = [{"role": "assistant", "content": "讲" * 3000}, {"role": "user", "content": "问" * 200}]
+    graph_mod.coach_memory_write({"mode": "coaching", "tech": "Redis", "memory_sweep_buffer": buffer})
+
+    fire = _events(audit_events, "sweep_fire")[-1]
+    assert fire["mode"] == "async" and fire["items"] == 2 and fire["chars"] == 3200
+
+
+def test_note_recall_event_records_sizes_without_content(monkeypatch, audit_events):
+    """召回现场必须留痕：批次/查询长度、召回了哪几篇（路径 + 分数）；正文一律不进日志。
+
+    没有这条事件，「召回窄了」与「提取质量差」在日志里长得一样——都是"该抑制的没抑制住"。
+    """
+    monkeypatch.setattr(config, "NOTE_QUERY_CHARS", 500)
+    monkeypatch.setattr(config, "NOTE_CONTENT_CHARS", 1800)
+    monkeypatch.setattr(note_mod, "recall_existing_notes",
+                        lambda tech, query, top_k, **k: [
+                            {"path": "redis/缓存.md", "similarity": 0.8123},
+                            {"path": "redis/持久化.md", "similarity": None},  # RAG 不可用回退
+                        ])
+    monkeypatch.setattr(note_mod, "generate_text", lambda *a, **k: "[]")
+    monkeypatch.setattr(note_mod, "get_existing_notes", lambda tech: [])
+    secret = "学习内容" * 400  # 1600 字：超查询窗口、未超内容上限
+
+    note_mod.note_pipeline("redis", secret)
+
+    event = _events(audit_events, "note_recall")[-1]
+    assert event["tech"] == "redis"
+    assert event["batch_chars"] == 1600 and event["content_chars"] == 1600
+    assert event["content_truncated"] is False
+    assert event["query_count"] == 1 and event["query_chars"] == 500
+    assert event["query_truncated"] is True
+    assert event["kb_notes"] == 0
+    assert event["recalled_count"] == 2
+    assert event["recalled"] == [{"path": "redis/缓存.md", "sim": 0.812},
+                                 {"path": "redis/持久化.md", "sim": None}]
+    assert "学习内容" not in json.dumps(event, ensure_ascii=False)
+
+
+def test_note_recall_marks_content_truncation(monkeypatch, audit_events):
+    """批次超过 NOTE_CONTENT_CHARS 时报出来——`[:12000]` 是否真触发过只能靠这个字段回答。"""
+    monkeypatch.setattr(config, "NOTE_CONTENT_CHARS", 100)
+    monkeypatch.setattr(note_mod, "recall_existing_notes", lambda tech, query, top_k, **k: [])
+    monkeypatch.setattr(note_mod, "generate_text", lambda *a, **k: "[]")
+    monkeypatch.setattr(note_mod, "get_existing_notes", lambda tech: [])
+
+    note_mod.note_pipeline("redis", "x" * 250)
+
+    event = _events(audit_events, "note_recall")[-1]
+    assert event["batch_chars"] == 250 and event["content_chars"] == 100
+    assert event["content_truncated"] is True
+    assert event["recalled_count"] == 0 and event["recalled"] == []
+
+
+def test_note_recall_event_records_query_count_and_kb_size(monkeypatch, audit_events):
+    """按段召回要留下读数：发了几次查询、库里本来有几篇。
+
+    召回为空时，"库里本来就没有笔记"和"有笔记但都被相似度下限滤掉了"是两种状态
+    （后者是过抑制的现实来源），只有 kb_notes 能把它们分开。
+    """
+    monkeypatch.setattr(config, "NOTE_QUERY_CHARS", 100)
+    monkeypatch.setattr(note_mod, "recall_existing_notes",
+                        lambda tech, query, top_k, **k: [])
+    monkeypatch.setattr(note_mod, "generate_text", lambda *a, **k: "[]")
+    monkeypatch.setattr(note_mod, "get_existing_notes",
+                        lambda tech: [{"path": f"redis/{i}.md", "topic": f"t{i}"} for i in range(9)])
+
+    note_mod.note_pipeline("redis", "整批正文", query_segments=["段一" * 40, "段二" * 40])
+
+    event = _events(audit_events, "note_recall")[-1]
+    assert event["query_count"] == 2  # 两段各一条查询（每段 80 字，未触发窗口切分）
+    assert event["query_chars"] == 160
+    assert event["kb_notes"] == 9 and event["recalled_count"] == 0
 
 
 def test_sweep_drain_marks_stale_on_timeout(monkeypatch, audit_events):

@@ -35,6 +35,7 @@
 - [report/rag-hybrid-scenario-eval-v1.3.md](report/rag-hybrid-scenario-eval-v1.3.md) —— v1.3：词法一致性软重排（轻量 rerank）
 - [report/note-dedup-report.md](report/note-dedup-report.md) —— 笔记去重：确定性确认层被合成压力测试揭穿 → LLM 判定 + 用户确认兜底
 - [report/note-sweep-async-report.md](report/note-sweep-async-report.md) —— 记忆沉淀并行化：同步阻塞 → 后台并行 + 确定性反馈 / 确认
+- [report/note-recall-report.md](report/note-recall-report.md) —— 差量提取的召回窗口：取头 1500 字 / top-3 分块 / 无下限 → 按助手讲解分段 + 按笔记归并 + 相似度下限（含一个被否决的方案）
 - [report/rag-p0-p1-record.md](report/rag-p0-p1-record.md) —— RAG 优化 P0–P1 实施记录（长会话被压缩前的决策依据）
 
 ## 基准数据
