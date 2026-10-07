@@ -317,6 +317,7 @@ def test_sweep_fire_and_drain_sync_path(monkeypatch, audit_events):
     drain = _events(audit_events, "sweep_drain")[-1]
     assert fire["items"] == 1 and fire["mode"] == "sync"
     assert fire["chars"] == 3000  # 与触发判定共用 _buffer_chars：日志里的批次大小要能和"为什么触发"对上
+    assert fire["turns"] == 1 and fire["trigger"] == "chars"  # 3000 字 / 1 回合 → 字符规则
     assert drain["result"] == "persisted" and drain["count"] == 2 and drain["mode"] == "sync"
 
 
@@ -328,6 +329,34 @@ def test_sweep_fire_async_records_chars(monkeypatch, audit_events):
 
     fire = _events(audit_events, "sweep_fire")[-1]
     assert fire["mode"] == "async" and fire["items"] == 2 and fire["chars"] == 3200
+    assert fire["turns"] == 1 and fire["trigger"] == "chars"
+
+
+def test_sweep_fire_records_which_rule_fired(monkeypatch, audit_events):
+    """触发规则要能分开：实测 17 次真实触发里 11 次由字符规则决定、6 回合规则几乎不生效，
+    没有 trigger 字段这事根本看不出来。"""
+    assert graph_mod._fire_reason([{"role": "user", "content": "x" * 6}]) is None
+    assert graph_mod._fire_reason([{"role": "user", "content": "x" * 2500}]) == "chars"
+    many_turns = [{"role": "user", "content": "嗯"} for _ in range(6)]
+    assert graph_mod._fire_reason(many_turns) == "turns"
+    assert graph_mod._fire_reason([*many_turns, {"role": "user", "content": "y" * 2500}]) == "both"
+
+
+def test_sweep_drain_records_merged_back_size(monkeypatch, audit_events):
+    """失败/超时排水会把在飞快照并回缓冲——必须记并回多少字（条数看不出量级）。
+
+    实测三次并回分别是 4348 / 6656 / 3489 字，都是"下一批被撑大"的一半来源。
+    """
+    graph_mod._sweep_results.pop("learn-merge", None)
+    state = {"mode": "coaching", "tech": "Redis",
+             "memory_sweep_inflight": {"tech": "Redis",
+                                       "buffer": [{"role": "user", "content": "x" * 4348}],
+                                       "fired_at": "2000-01-01T00:00:00"}}
+    out = graph_mod.coach_memory_write(state)
+
+    drain = _events(audit_events, "sweep_drain")[-1]
+    assert drain["result"] == "stale" and drain["merged_back_chars"] == 4348
+    assert len(out["memory_sweep_buffer"]) == 1  # 内容确实并回去了
 
 
 def test_note_recall_event_records_sizes_without_content(monkeypatch, audit_events):

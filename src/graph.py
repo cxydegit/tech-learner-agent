@@ -762,10 +762,32 @@ def _buffer_chars(buffer: list[dict]) -> int:
     return sum(len(m.get("content") or "") for m in buffer)
 
 
+def _user_turns(buffer: list[dict]) -> int:
+    """缓冲里的用户回合数（= 一个回合一条 user 消息）。与判定共用，避免日志和闸门各数一遍。"""
+    return sum(1 for m in buffer if m.get("role") == "user")
+
+
+def _fire_reason(buffer: list[dict]) -> str | None:
+    """触发判定的**唯一出处**：返回是哪条规则达标（"turns" / "chars" / "both"），未达标 None。
+
+    日志与闸门共用它，理由和 `_buffer_chars` 一样：两处各判一次，日志里说的"为什么触发"
+    迟早和闸门实际认的对不上。实测 17 次真实触发里 11 次由字符规则决定、6 回合规则只有
+    1 次同回合达标——没有区分字段的话，这种"某条规则形同虚设"的事根本看不出来。
+    """
+    hit_turns = _user_turns(buffer) >= config.ROUTE_MEMORY_SWEEP_TURNS
+    hit_chars = _buffer_chars(buffer) >= config.ROUTE_MEMORY_SWEEP_CHARS
+    if hit_turns and hit_chars:
+        return "both"
+    if hit_turns:
+        return "turns"
+    if hit_chars:
+        return "chars"
+    return None
+
+
 def _threshold_met(buffer: list[dict]) -> bool:
     """沉淀触发阈值：自上次沉淀以来累计用户回合数 / 字符数（任一达标即触发）。"""
-    turns = sum(1 for m in buffer if m.get("role") == "user")
-    return turns >= config.ROUTE_MEMORY_SWEEP_TURNS or _buffer_chars(buffer) >= config.ROUTE_MEMORY_SWEEP_CHARS
+    return _fire_reason(buffer) is not None
 
 
 def _emit_sweep_feedback(message: str) -> None:
@@ -845,9 +867,12 @@ def coach_memory_write(state: LearnState) -> dict:
             return {}  # 后台线程仍在跑：不阻塞、不重复 fire，保留 inflight 等下一回合
         if result is None or result.get("action") == "error":
             # 线程失败 / 超时 / 进程重启：不重跑不阻塞——快照并回 buffer，未来正常 fire 重扫
+            # merged_back_chars 必须记：并回是"下一批被撑大、内容被重扫一遍"的成因，只看条数
+            # 看不出量级（实测三次并回分别是 4348 / 6656 / 3489 字，都是下一批变大的一半来源）
             audit("sweep_drain", result="stale" if result is None else "error",
                   elapsed_s=_sweep_elapsed_s(inflight),
-                  items=len(inflight.get("buffer") or []))
+                  items=len(inflight.get("buffer") or []),
+                  merged_back_chars=_buffer_chars(inflight.get("buffer") or []))
             return {"memory_sweep_buffer": (inflight.get("buffer") or []) + (state.get("memory_sweep_buffer") or []),
                     "memory_sweep_inflight": None}
         updates: dict = {"memory_sweep_inflight": None}
@@ -875,10 +900,12 @@ def coach_memory_write(state: LearnState) -> dict:
                                       "fired_at": datetime.now().isoformat(timespec="seconds")},  # noqa: DTZ005 —— 本地 naive 语义
             "memory_sweep_buffer": [],
         }
-        audit("sweep_fire", items=len(snapshot), chars=_buffer_chars(snapshot), mode="async")
+        audit("sweep_fire", items=len(snapshot), chars=_buffer_chars(snapshot),
+              turns=_user_turns(snapshot), trigger=_fire_reason(snapshot), mode="async")
         _start_sweep_thread(tech, snapshot, tid)
         return updates
-    audit("sweep_fire", items=len(buffer), chars=_buffer_chars(buffer), mode="sync")
+    audit("sweep_fire", items=len(buffer), chars=_buffer_chars(buffer),
+          turns=_user_turns(buffer), trigger=_fire_reason(buffer), mode="sync")
     sweep_started = time.monotonic()
     sweep = run_memory_sweep(tech, buffer, progress=_get_progress())
     audit("sweep_drain", result=str(sweep.get("action") or "unknown"), mode="sync",
