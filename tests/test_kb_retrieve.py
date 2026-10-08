@@ -147,10 +147,10 @@ def test_search_exception_degrades_empty(monkeypatch):
     assert route_mod.run_kb_retrieve("X", "问题") == []
 
 
-# ============ _coaching_prompt 注入 kb_context（提示词改动待用户审核） ============
+# ============ kb_context 注入：system → 末尾注入消息（前缀缓存：system 保持会话级稳定） ============
 
-def test_coaching_prompt_injects_kb_block():
-    """命中知识库时，coaching 提示词渲染「知识库相关片段」块（标注来源 + 优先依据作答）。"""
+def test_runtime_context_injects_kb_block():
+    """命中知识库时，kb 片段渲染进末尾注入消息（标注来源 + 优先依据作答）；system 不再含它。"""
     state = {
         "mode": "coaching", "roadmap": None, "coach_summary": "",
         "kb_context": [
@@ -158,18 +158,24 @@ def test_coaching_prompt_injects_kb_block():
             {"path": "knowledge/spring/scope.md", "snippet": "单例与原型作用域。"},
         ],
     }
+    inj = route_mod.coach_runtime_context(state)
+    assert inj is not None and inj["role"] == "system"
+    assert "系统注入的运行时状态" in inj["content"]
+    assert "知识库相关片段" in inj["content"]
+    assert "knowledge/spring/bean.md" in inj["content"]
+    assert "Bean 生命周期" in inj["content"]
+    assert "优先依据上述片段作答" in inj["content"]
+    assert "标注来源" in inj["content"]
+    # system 提示词不再含片段块（前缀缓存的前提：system 会话级稳定）
     prompt = route_mod._coaching_prompt(state, "Spring")
-    assert "知识库相关片段" in prompt
-    assert "knowledge/spring/bean.md" in prompt
-    assert "Bean 生命周期" in prompt
-    assert "优先依据上述片段作答" in prompt
-    assert "标注来源" in prompt
+    assert "知识库相关片段" not in prompt
 
 
-def test_coaching_prompt_without_kb():
-    """无命中（kb_context 为空/None）时提示词不含片段块，行为不变。"""
+def test_runtime_context_without_kb_or_pending():
+    """无命中且无卡点 → 不产生注入消息（请求 messages 原样），system 行为不变。"""
     for kb in (None, []):
         state = {"mode": "coaching", "roadmap": None, "coach_summary": "", "kb_context": kb}
+        assert route_mod.coach_runtime_context(state) is None
         prompt = route_mod._coaching_prompt(state, "Spring")
         assert "知识库相关片段" not in prompt
         assert "执行陪练" in prompt
@@ -259,7 +265,8 @@ def _scripted_kb_chat(system_prompt, messages, tools, **_kw):
             "stages": [{"name": "环境搭建", "goal": "跑通 hello", "est_hours": 4,
                         "milestones": [{"desc": "安装完成"}, {"desc": "跑通 hello"}]}]}}]}
     if "执行陪练" in system_prompt:
-        if "知识库相关片段" in system_prompt:
+        # 方案 B 后 kb 片段在末尾注入消息里，不在 system（见 coach_runtime_context）
+        if any("知识库相关片段" in (m.get("content") or "") for m in messages):
             kb_seen["injected"] = True
             return {"content": "根据你的笔记，Spring Bean 生命周期是实例化→注入→初始化（来源：knowledge/spring/bean.md）。",
                     "tool_calls": []}
@@ -304,6 +311,9 @@ def test_e2e_question_hits_kb_and_injects(monkeypatch, tmp_path):
     final, _ = _run(graph, gconfig, {"command": "route", "tech": "X"}, replies)
 
     assert final["mode"] == "coaching"
-    assert kb_seen["injected"] is True  # coaching 提示词渲染了知识库片段块
+    assert kb_seen["injected"] is True  # coaching 请求渲染了知识库片段注入消息
     assert final["kb_context"] == [{"path": "knowledge/spring/bean.md",
                                     "snippet": "Bean 生命周期：实例化→注入→初始化。"}]
+    # 注入消息用完即弃：绝不落盘 coach_messages（落盘 = 过期指令累积 + 上下文膨胀）
+    assert not any("知识库相关片段" in (m.get("content") or "")
+                   for m in final["coach_messages"])

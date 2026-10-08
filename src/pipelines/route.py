@@ -98,13 +98,21 @@ def _planning_prompt(state, tech: str) -> str:
 
 
 def _coaching_prompt(state, tech: str) -> str:
+    """coaching 系统提示词：只放会话级稳定内容（角色 / 规则 / 画像 / 路线 / 三舱）。
+
+    每轮变化的内容（kb 片段 / 里程碑卡点）不在这里：system 里每轮必变的 token 会让
+    前缀缓存从 system 就断掉，其后整段对话历史全部重新计费。它们改由
+    coach_runtime_context 拼成请求末尾的注入消息。
+    拼接顺序按「越稳定越靠前」：静态角色与规则在前，画像 / 路线 / 三舱按变更频率递增
+    排列——勾选里程碑或触发压缩的那几轮，最长的规则前缀仍能命中缓存。
+    """
+    profile = state.get("learner_profile") or {}
+    profile_block = f"用户画像：{survey.profile_summary(profile)}\n" if profile else ""
     roadmap = state.get("roadmap")
     prog = ""
     if roadmap:
-        prog = "\n\n当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap)
-    # 画像直注（画像与摘要解耦，避免 coaching 模式丢失画像上下文）+ 三舱注入
-    profile = state.get("learner_profile") or {}
-    profile_block = f"用户画像：{survey.profile_summary(profile)}\n" if profile else ""
+        prog = "当前路线：\n" + roadmap_domain.roadmap_to_markdown(roadmap) + "\n"
+    # 三舱注入（画像与摘要解耦，避免 coaching 模式丢失画像上下文）
     facts = state.get("coach_facts") or []
     facts_block = ""
     if facts:
@@ -115,28 +123,11 @@ def _coaching_prompt(state, tech: str) -> str:
         open_block = ("未决事项（待跟进，解决后移除）：\n"
                       + "\n".join(f"- [{it['id']}] {it['text']}" for it in open_items) + "\n")
     conv = (state.get("coach_summary") or "").strip()
-    conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
-    # 确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
-    kb = state.get("kb_context") or []
-    kb_block = ""
-    if kb:
-        parts = [f"（来源：{it.get('path', '')}）\n{it.get('snippet', '')}" for it in kb]
-        kb_block = ("\n\n===== 知识库相关片段（按来源标注） =====\n"
-                    + "\n\n".join(parts)
-                    + "\n===== 片段结束 =====\n"
-                    "优先依据上述片段作答，引用时标注来源；片段未覆盖的部分可用你自己的知识补充，"
-                    "但必须明确区分「来自你笔记的内容」与「基于经验的讲解」。")
-    # 里程碑推进卡点：刚勾选了一个里程碑、尚未获得用户推进确认 → 强制停下总结 + 询问。
-    # 结构保证（代码设置、用户回复后清除）：Agent 勾选后不会自行开始下一里程碑。
-    pending = state.get("coach_milestone_pending")
-    pending_block = ""
-    if pending:
-        pending_block = (f"\n你刚勾选了里程碑「{pending}」，尚未获得用户推进确认。\n"
-                         "请向用户总结该里程碑成果，并询问是否进入下一里程碑/阶段；\n"
-                         "在用户明确同意前，不要开始下一里程碑的内容。")
+    conv_block = f"此前对话摘要：{conv}\n" if conv else ""
+    blocks = "".join((profile_block, prog, facts_block, open_block, conv_block)).strip()
+    suffix = f"\n\n{blocks}" if blocks else ""
     return (
-        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。{prog}\n"
-        f"{profile_block}{facts_block}{open_block}{conv_block}{kb_block}{pending_block}\n\n"
+        f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ "
         "ask（问已学笔记）/ get_roadmap / update_roadmap（勾选里程碑）/ "
         "revise_roadmap（按用户要求调整路线，保留已完成进度）。"
@@ -156,7 +147,44 @@ def _coaching_prompt(state, tech: str) -> str:
         "\n- 一轮只能勾选一个里程碑；勾选后停下来向用户总结成果，并询问是否进入下一里程碑/阶段；未经用户明确同意不要开始下一里程碑内容。"
         "\n- 例外：用户上一轮已明确指令「直接进入下一步/下一阶段/不用再问」时，勾选后直接推进，不再询问。"
         "这条例外只免除勾选之后的确认询问，不免除勾选之前的验收：证据不足仍会被驳回。"
+        + suffix
     )
+
+
+# 注入消息开头的固定标识：graph 拼请求、测试定位注入消息都靠它（不要改动措辞）。
+RUNTIME_CONTEXT_MARK = "（系统注入的运行时状态，非用户发言）"
+
+
+def coach_runtime_context(state) -> dict | None:
+    """拼「本轮临时上下文」注入消息（kb 片段 + 里程碑卡点），两者皆无时返回 None。
+
+    这些内容每轮必变（kb）或偶发出现（卡点），放 system 会让前缀缓存每轮从 system
+    就断掉；改为请求末尾的一条 system 注入消息，由 graph.coach_llm 拼进本次请求、
+    **用完即弃，绝不落盘 coach_messages**——旧轮注入是过期指令，落盘还会随轮次
+    无限膨胀。中部/末尾 system 消息在本代码库是既有模式（sweep/note 结果、空输出
+    重试提示都这样注入），DashScope 兼容接口接受；末尾位置同时让卡点指令离生成
+    位置最近，比埋在 system 中部更显眼。
+    """
+    parts: list[str] = []
+    # 确定性读路由——命中知识库时把相关片段注入作答上下文（来源由代码标注）
+    kb = state.get("kb_context") or []
+    if kb:
+        blocks = [f"（来源：{it.get('path', '')}）\n{it.get('snippet', '')}" for it in kb]
+        parts.append("===== 知识库相关片段（按来源标注） =====\n"
+                     + "\n\n".join(blocks)
+                     + "\n===== 片段结束 =====\n"
+                     "优先依据上述片段作答，引用时标注来源；片段未覆盖的部分可用你自己的知识补充，"
+                     "但必须明确区分「来自你笔记的内容」与「基于经验的讲解」。")
+    # 里程碑推进卡点：刚勾选了一个里程碑、尚未获得用户推进确认 → 强制停下总结 + 询问。
+    # 结构保证（代码设置、用户回复后清除）：Agent 勾选后不会自行开始下一里程碑。
+    pending = state.get("coach_milestone_pending")
+    if pending:
+        parts.append(f"你刚勾选了里程碑「{pending}」，尚未获得用户推进确认。\n"
+                     "请向用户总结该里程碑成果，并询问是否进入下一里程碑/阶段；\n"
+                     "在用户明确同意前，不要开始下一里程碑的内容。")
+    if not parts:
+        return None
+    return {"role": "system", "content": RUNTIME_CONTEXT_MARK + "\n\n" + "\n\n".join(parts)}
 
 
 def coach_system_prompt(state) -> str:

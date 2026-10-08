@@ -277,6 +277,15 @@ def test_planning_generates_roadmap_and_confirms(monkeypatch, tmp_path):
 
 # ---------- coaching 工具端到端 + 上下文压缩 ----------
 
+def _last_turn_message(messages):
+    """取真实的最后一条对话消息：跳过末尾的运行时注入消息（方案 B 后它拼在 messages 最后）。"""
+    for m in reversed(messages or []):
+        if m.get("role") == "system" and (m.get("content") or "").startswith("（系统注入的运行时状态"):
+            continue
+        return m
+    return None
+
+
 def _scripted_coaching_chat(system_prompt, messages, tools, **_kw):
     """问卷 + planning（生成/确认路线）+ coaching（collect → 勾选里程碑 → 结束）。"""
     if "水平探测助手" in system_prompt:
@@ -299,7 +308,7 @@ def _scripted_coaching_chat(system_prompt, messages, tools, **_kw):
                         {"name": "核心概念", "goal": "掌握核心", "est_hours": 8,
                          "milestones": [{"desc": "理解 A"}]}]}}]}
     if "执行陪练" in system_prompt:
-        last = messages[-1] if messages else None
+        last = _last_turn_message(messages)
         if last and last.get("role") == "tool":
             content = last.get("content") or ""
             if "materials_path" in content:
@@ -348,16 +357,18 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
 
 # ---------- 里程碑推进把关（勾选后停下询问，用户确认后才推进） ----------
 
-def test_coaching_prompt_injects_milestone_pending_block():
-    """coaching 提示词：有 coach_milestone_pending → 注入「尚未获得用户推进确认」强制块。"""
+def test_runtime_context_injects_milestone_pending_block():
+    """里程碑卡点：有 coach_milestone_pending → 末尾注入消息带「尚未获得用户推进确认」强制块。"""
     state = {"mode": "coaching", "roadmap": None, "coach_milestone_pending": "s1-m1"}
-    prompt = route_mod._coaching_prompt(state, "Spring")
-    assert "尚未获得用户推进确认" in prompt
-    assert "s1-m1" in prompt
-    assert "在用户明确同意前，不要开始下一里程碑的内容" in prompt
-    # 无 pending 时不注入
-    prompt2 = route_mod._coaching_prompt({"mode": "coaching", "roadmap": None}, "Spring")
-    assert "尚未获得用户推进确认" not in prompt2
+    inj = route_mod.coach_runtime_context(state)
+    assert inj is not None and inj["role"] == "system"
+    assert "系统注入的运行时状态" in inj["content"]
+    assert "尚未获得用户推进确认" in inj["content"]
+    assert "s1-m1" in inj["content"]
+    assert "在用户明确同意前，不要开始下一里程碑的内容" in inj["content"]
+    # system 不再含卡点（前缀缓存的前提）；无 pending 时无注入消息
+    assert "尚未获得用户推进确认" not in route_mod._coaching_prompt(state, "Spring")
+    assert route_mod.coach_runtime_context({"mode": "coaching", "roadmap": None}) is None
 
 
 def test_coach_human_clears_milestone_pending(monkeypatch):
@@ -372,11 +383,13 @@ def test_coach_human_clears_milestone_pending(monkeypatch):
 
 
 def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
-    """端到端：勾选里程碑后提示词注入「待确认」块（强制停下询问）；用户回复后闸门清除。"""
-    seen_prompts = []
+    """端到端：勾选里程碑后请求注入「待确认」块（强制停下询问）；用户回复后闸门清除。"""
+    seen_requests = []
 
     def scripted(system_prompt, messages, tools, **_kw):
-        seen_prompts.append(system_prompt)
+        # 方案 B 后卡点在末尾注入消息里：分别记录 system 与消息内容，断言才有区分度
+        seen_requests.append((system_prompt,
+                              "\n".join(m.get("content") or "" for m in messages)))
         return _scripted_coaching_chat(system_prompt, messages, tools)
 
     monkeypatch.setattr(config, "ROADMAP_DIR", tmp_path / "roadmaps")
@@ -391,9 +404,14 @@ def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
     gconfig = {"configurable": {"thread_id": "test-coach-gate"}}
     final, _ = _run(graph, gconfig, {"command": "route", "tech": "X"},
                     ["5", "Java Maven", "跑通最小项目", "2小时", "答1", "答2", "可以", "好的", "结束"])
-    # 勾选里程碑后的提示词必须注入待确认块（用户未确认前不自行推进）
-    blocking = [p for p in seen_prompts if "尚未获得用户推进确认" in p]
-    assert blocking, "勾选里程碑后的提示词应注入待确认块"
+    # 勾选里程碑后的请求必须注入待确认块（用户未确认前不自行推进）
+    blocking = [r for r in seen_requests if "尚未获得用户推进确认" in r[1]]
+    assert blocking, "勾选里程碑后的请求应注入待确认块"
+    # 卡点经注入消息进请求，system 保持稳定（不随 pending 变化 → 前缀缓存不断）
+    assert all("尚未获得用户推进确认" not in r[0] for r in seen_requests)
+    # 注入用完即弃：不落盘 coach_messages（落盘 = 过期指令累积 + 上下文膨胀）
+    assert not any("尚未获得用户推进确认" in (m.get("content") or "")
+                   for m in final["coach_messages"])
     # 用户最终回复后闸门清除（一次性）
     assert final.get("coach_milestone_pending") is None
 

@@ -38,6 +38,7 @@ from .pipelines.route import (
     COACH_TOOLS_BY_MODE,
     HEAVY_TOOLS,
     CoachCtx,
+    coach_runtime_context,
     coach_system_prompt,
     consolidate_memory,
     run_coach_tool,
@@ -516,10 +517,15 @@ COACH_DEGRADED_NOTICE = (
 def coach_llm(state: LearnState) -> dict:
     """调用模型（按 mode 注入提示词 + 工具集），追加一条 assistant 消息。"""
     msgs = state.get("coach_messages") or []
+    # 每轮变化的运行时状态（kb 片段 / 里程碑卡点）拼成末尾注入消息参与**本次请求**，用完即弃：
+    # 绝不落进 coach_messages——旧轮注入是过期指令，落盘还会随轮次无限膨胀。
+    # 放 system 的话前缀缓存每轮从 system 就断，其后整段历史全部重算。
+    # 落盘仍走 msgs：下面所有持久化更新（错误路径 / 空输出 / 正常回复）都只追加 assistant 消息。
+    injection = coach_runtime_context(state)
     try:
         result = chat_with_tools(
             coach_system_prompt(state),
-            msgs,
+            [*msgs, injection] if injection else msgs,
             COACH_TOOLS_BY_MODE.get(state.get("mode") or "survey", []),
             call_site="coach.chat",
         )
