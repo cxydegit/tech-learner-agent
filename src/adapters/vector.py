@@ -433,9 +433,12 @@ def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None,
     """混合检索：dense + BM25 → RRF 融合。
 
     每路取 ``top_k*3`` 候选再融合后截断到 top_k（候选充足融合才有意义）。
-    ``candidates`` 可单独指定候选池深度（**诊断用**，默认 None = 沿用上述推导）：
+    ``candidates`` 可单独指定候选池深度（默认 None = 沿用上述推导）：
     池子跟着 ``top_k`` 一起放大会改变融合排序，所以"想看某条命中到底排第几"时必须
     把池子钉在原值上、只放大返回条数——否则拿到的是另一个排序，不是原排序的加长版。
+    两条生产/诊断路径都用它：召回侧传 ``candidates=召回深度``（池子＝返回条数，
+    "取更多"是原排名的加长版，见 pipelines/qa.py::_search_notes）；排名探针则钉住
+    生产池子值、只看名次。
     dense 空回退 keyword、keyword 全零回退 dense（两路内部已各自吞掉 Chroma 异常）。
     返回条目的 ``similarity`` 为归一化 RRF 分（top=1.0），``dense_similarity`` 保留
     原始余弦给相关度阈值等下游。

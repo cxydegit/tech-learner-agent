@@ -46,11 +46,26 @@ QA_PROMPT = """你是一个知识问答助手，回答用户关于 TA 的学习�
 # 召回桥接（vector 层函数内 lazy）
 # ============================================================
 
-def _search_notes(question: str, top_k: int, tech: str | None):
+def note_key(hit: dict) -> str:
+    """命中的「笔记」身份：同一篇笔记的多个分块在取件时只占一个名额。
+
+    召回吃的是分块（一篇笔记常切成多块），对外消费（/ask 分段、coach 注入）吃的是
+    笔记。两处口径 + 评测脚本共用本函数，避免各写一份「怎么算同一篇」而悄悄漂移
+    （历史问题：8 个分块名额实测只覆盖 3~8 篇笔记）。
+    """
+    return (hit.get("path") or "").strip()
+
+
+def _search_notes(question: str, recall: int, tech: str | None):
     """lazy import vector 层（顶层 `import src.cli` 不加载 chromadb）。
 
     默认走混合检索（dense + BM25 → RRF，config.QA_USE_HYBRID），
     hybrid 内部已各自吞掉空索引 / Chroma 异常，这里再套一层兜底回退纯 dense。
+
+    ``recall`` 是**召回分块数**（不是最终看到的笔记篇数）：调用方拿到这批分块后
+    按笔记去重再截断（/ask 的分组上限、coach 的注入篇数上限）。候选池深度与返回
+    条数取同值——池子跟着返回条数放大会改变 RRF 融合排序，取同值可保证「取更多」
+    只是同一次排名的加长版，不会改写任何一条的位次。
 
     检索前先做一次惰性对账（节流，见 config.RAG_RECONCILE_INTERVAL）：
     清理磁盘已删除笔记的残留分块，避免本轮召回并引用已不存在的笔记。
@@ -68,10 +83,10 @@ def _search_notes(question: str, top_k: int, tech: str | None):
         pass
     if config.QA_USE_HYBRID:
         try:
-            return hybrid_search_knowledge(question, top_k, tech)
+            return hybrid_search_knowledge(question, recall, tech, candidates=recall)
         except Exception:  # noqa: BLE001, S110 —— 混合检索异常时回退纯 dense
             pass
-    return semantic_search_knowledge(question, top_k, tech)
+    return semantic_search_knowledge(question, recall, tech)
 
 
 # ============================================================
@@ -84,7 +99,9 @@ def _group_hits(hits: list[dict], max_groups: int, snippets_per_note: int,
 
     同一篇笔记的多条命中归为一组（避免答案把同篇片段当多条来源），每组保留：
     {path, topic, best_similarity, snippets[≤snippets_per_note 条 × snippet_chars 字]}。
-    组按 best_similarity 降序，组数上限 max_groups。hits 已按相似度降序
+    组按 best_similarity 降序，组数上限 max_groups——**上限按篇算**：传进来的命中
+    通常远多于组数上限（召回 24 条分块 → 最多 max_groups 篇），靠分组把同篇的重复
+    分块折叠掉，别让一篇笔记占掉多个名额。hits 已按相似度降序
     （chroma 按距离排序），每组按出现顺序取前几条片段即可。
 
     Args:
@@ -98,7 +115,7 @@ def _group_hits(hits: list[dict], max_groups: int, snippets_per_note: int,
     """
     groups: dict[str, dict] = {}
     for h in hits:
-        path = (h.get("path") or "").strip()
+        path = note_key(h)
         if not path:
             continue
         g = groups.setdefault(path, {
@@ -204,7 +221,7 @@ def _says_not_covered(answer: str) -> bool:
 # qa_pipeline：召回 → 分组 → 单次 LLM 综合回答（无副作用）
 # ============================================================
 
-def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
+def qa_pipeline(question: str, *, tech: str | None = None, top_k: int | None = None,
                 history: list[dict] | None = None,
                 progress: Callable[[str], None] | None = None) -> dict:
     """跨笔记联想检索 Q&A 管道（无副作用、不打印）。
@@ -213,7 +230,8 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
         question: 用户问题
         tech: 可选，限定技术领域；默认 None 跨全部笔记（"闭包"类问题天生跨笔记，
               不受当前会话 topic 限制；参数留给未来 Web 端做范围选择）
-        top_k: 召回条数；默认用 config.QA_TOP_K
+        top_k: 召回分块数（按笔记去重前的候选深度）；默认用 config.QA_RECALL_CHUNKS。
+              最终给 LLM 的材料按笔记分段、段数上限 config.QA_MAX_GROUPS
         history: 最近几轮 {question, answer} 对话记录（qa_history 取末 N 轮）
         progress: 可选回调，接收进度消息；None 则静默
 
@@ -233,7 +251,7 @@ def qa_pipeline(question: str, *, tech: str | None = None, top_k: int = 8,
     if progress:
         progress("🔎 联想检索笔记库...")
     try:
-        hits = _search_notes(question, top_k or config.QA_TOP_K, tech)
+        hits = _search_notes(question, top_k or config.QA_RECALL_CHUNKS, tech)
     except Exception:  # noqa: BLE001
         hits = []
 

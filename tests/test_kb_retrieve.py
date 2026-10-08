@@ -89,13 +89,44 @@ def test_above_threshold_injected(monkeypatch):
 
 
 def test_snippet_cap(monkeypatch):
-    """注入片段数上限：超过 ROUTE_KB_SNIPPETS 只取前 N 条。"""
+    """注入篇数上限：超过 ROUTE_KB_SNIPPETS 只取前 N **篇**。"""
     hits = [{"path": f"p{i}", "similarity": 0.9 - i * 0.1, "document": f"d{i}"} for i in range(5)]
     monkeypatch.setattr(route_mod, "_search_notes", lambda q, k, t: hits)
     monkeypatch.setattr(config, "ROUTE_KB_INJECT_SIM", 0.0)
     monkeypatch.setattr(config, "ROUTE_KB_SNIPPETS", 3)
     out = route_mod.run_kb_retrieve("X", "问题")
     assert len(out) == 3
+
+
+def test_same_note_takes_one_slot(monkeypatch):
+    """同一篇笔记的多个分块只占一个名额：N 是**篇数**，不被同篇分块重复占用。
+
+    旧口径按条取前 3，这条 seed 会返回 3 条全是同一篇的片段（1 篇）；新口径取 3 篇。
+    """
+    hits = [{"path": "knowledge/spring/bean.md", "similarity": 0.90, "document": "块1"},
+            {"path": "knowledge/spring/bean.md", "similarity": 0.88, "document": "块2"},
+            {"path": "knowledge/spring/bean.md", "similarity": 0.86, "document": "块3"},
+            {"path": "knowledge/spring/scope.md", "similarity": 0.80, "document": "作用域"},
+            {"path": "knowledge/spring/aop.md", "similarity": 0.75, "document": "AOP"}]
+    monkeypatch.setattr(route_mod, "_search_notes", lambda q, k, t: hits)
+    monkeypatch.setattr(config, "ROUTE_KB_INJECT_SIM", 0.0)
+    monkeypatch.setattr(config, "ROUTE_KB_SNIPPETS", 3)
+    out = route_mod.run_kb_retrieve("X", "Bean 生命周期")
+    # 3 个名额给 3 篇不同笔记（旧口径会给同一篇的 3 个块）
+    assert [o["path"] for o in out] == ["knowledge/spring/bean.md",
+                                        "knowledge/spring/scope.md",
+                                        "knowledge/spring/aop.md"]
+    assert out[0]["snippet"] == "块1"  # 取该篇最靠前（相似度最高）的那条
+
+
+def test_recall_depth_from_config(monkeypatch):
+    """召回深度按 QA_RECALL_CHUNKS（分块）取，而不是旧的按条数截断值。"""
+    seen = {}
+    monkeypatch.setattr(route_mod, "_search_notes",
+                        lambda q, k, t: (seen.update(k=k) or []))
+    monkeypatch.setattr(config, "QA_RECALL_CHUNKS", 24)
+    route_mod.run_kb_retrieve("X", "Spring 的 Bean 生命周期？")
+    assert seen["k"] == 24
 
 
 def test_snippet_truncated(monkeypatch):

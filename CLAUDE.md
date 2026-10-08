@@ -9,7 +9,7 @@
 | LLM 调用 / 超时 / max_tokens | `docs/incidents/llm-timeout-and-truncation.md` |
 | coach 上下文裁剪 / 压缩 | `docs/incidents/coach-trim-tool.md` |
 | route / exit_intent / 里程碑判定 | `docs/milestone-advance-claim-fix.md` |
-| 检索排序 | `docs/report/rag-hybrid-scenario-eval-v1.3.md` |
+| 检索排序 / 取件口径（召回几条、交付几篇） | `docs/report/rag-hybrid-scenario-eval-v1.5.md` |
 | 笔记去重 / 合并 | `docs/report/note-dedup-report.md` |
 | 编排架构（要不要上 ReAct） | `docs/report/reAct-vs-graph-report.md` |
 | 写 / 改任何提示词 | `docs/PROMPT_DESIGN.md` |

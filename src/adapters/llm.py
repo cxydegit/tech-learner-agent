@@ -98,7 +98,8 @@ def _heartbeat(progress, label: str, interval: float):
 
 def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | None = None,
                   call_site: str = "", truncation_notice: str = "",
-                  progress=None, progress_label: str = "生成报告") -> str:
+                  progress=None, progress_label: str = "生成报告",
+                  temperature: float | None = None) -> str:
     """执行一次（非循环的）LLM 生成，返回响应文本。
 
     适用于"URL → 抓取 → 生成 → 保存"这类确定性管道任务，
@@ -117,6 +118,8 @@ def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | No
             是 JSON，追加标注会破坏解析，它们的解析失败路径已各自处理。
         progress: 可选进度回调；长调用期间会由心跳线程周期发"仍在进行"
         progress_label: 心跳文案里的动作名（如「LLM 生成学习资料」）
+        temperature: 可选，覆盖默认 0.5。**只给「判定类」调用点传**——判定要可复现
+            （同一份输入重复判出同一结果），采样温度越低越稳；生成类调用点保持默认。
 
     Returns:
         LLM 生成的文本（若传入 truncation_notice 且被截断，末尾带该标注）
@@ -124,7 +127,7 @@ def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | No
     kwargs: dict = {
         "model": config.LLM_MODEL,
         "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
-        "temperature": 0.5,
+        "temperature": 0.5 if temperature is None else temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},

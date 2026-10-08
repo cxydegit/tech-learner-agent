@@ -70,6 +70,18 @@ def test_pinned_pool_keeps_prefix_order(monkeypatch):
     assert [h["id"] for h in long_out[:8]] == [h["id"] for h in short_out]
 
 
+def test_production_recall_extends_the_same_ranking(monkeypatch):
+    """生产取件口径：召回 24 条（池子取同值）的前 8 名 == 旧口径（top_k=8，池子由推导得 24）。
+
+    这是 P1-1b 的 before/after 能归因干净的前提：排名一条没动，改的只是取件。
+    """
+    vector, _ = _patch(monkeypatch)
+    new_out = vector.hybrid_search_knowledge("q", top_k=24, candidates=24)
+    old_out = vector.hybrid_search_knowledge("q", top_k=8)
+    assert len(new_out) == 24
+    assert [h["id"] for h in new_out[:8]] == [h["id"] for h in old_out]
+
+
 def test_pinned_pool_reads_true_rank_of_a_hit(monkeypatch):
     """诊断用途：能读到某条命中在生产池子里的真实名次（此处 dense 第 30 名）。"""
     import src.adapters.vector as vector

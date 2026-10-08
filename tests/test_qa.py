@@ -9,6 +9,7 @@ from pathlib import Path
 # 保证 tests/ 下能 import src（pytest 无 src 布局配置时）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.config import config
 from src.pipelines import qa as qa_mod
 
 
@@ -68,6 +69,47 @@ def test_group_hits_cap_and_snippets():
     # 按 best_similarity 降序
     sims = [g["best_similarity"] for g in groups]
     assert sims == sorted(sims, reverse=True)
+
+
+def test_recall_depth_by_chunks_cut_by_notes(monkeypatch):
+    """召回深度按分块（config.QA_RECALL_CHUNKS），最终材料按笔记篇数截断（QA_MAX_GROUPS）。
+
+    分块口径的坑：12 条命中若只覆盖 5 篇，段数上限 5 恰好装满；若 8 条命中只覆盖 3 篇，
+    旧口径下 LLM 就只看到 3 篇——所以召回要取够深，再由分组去重、按篇截断。
+    """
+    captured = {}
+    hits = [{"path": f"knowledge/rag/n{i}.md", "similarity": 0.90 - i * 0.01,
+             "document": f"块{i}"} for i in range(12)]
+
+    def fake_search(q, k, t):
+        captured["k"] = k
+        return hits
+    monkeypatch.setattr(qa_mod, "_search_notes", fake_search)
+    monkeypatch.setattr(qa_mod, "generate_text", lambda s, u, **_kw: "ok")
+    monkeypatch.setattr(config, "QA_RECALL_CHUNKS", 24)
+    monkeypatch.setattr(config, "QA_MAX_GROUPS", 5)
+    res = qa_mod.qa_pipeline("有哪些笔记讲了分块")
+    assert captured["k"] == 24          # 召回按分块：取够深
+    assert len(res["sources"]) == 5     # 取件按笔记：截断到篇数上限
+
+
+def test_group_hits_dedupes_before_cutting(monkeypatch):
+    """同篇的重复分块不占名额：按篇截断发生在去重之后。"""
+    hits = ([{"path": "knowledge/rag/a.md", "similarity": 0.9 - i * 0.01, "document": f"a{i}"}
+             for i in range(6)]
+            + [{"path": f"knowledge/rag/b{i}.md", "similarity": 0.5 - i * 0.01,
+                "document": f"b{i}"} for i in range(3)])
+    groups = qa_mod._group_hits(hits, max_groups=3, snippets_per_note=2, snippet_chars=10)
+    assert [g["path"] for g in groups] == [
+        "knowledge/rag/a.md", "knowledge/rag/b0.md", "knowledge/rag/b1.md"]
+    assert len(groups[0]["snippets"]) == 2  # 同篇仍可取多条片段，但只占一个组名额
+
+
+def test_note_key_ignores_missing_path():
+    """路径空白的命中不构成一篇笔记（不占名额、不成组）。"""
+    assert qa_mod.note_key({"path": None}) == ""
+    assert qa_mod.note_key({}) == ""
+    assert qa_mod.note_key({"path": " knowledge/a.md "}) == "knowledge/a.md"
 
 
 # ---------- 无命中 ----------

@@ -23,7 +23,7 @@ from .note import (
     parse_merge_decision,
     persist_points,
 )
-from .qa import _search_notes, qa_pipeline
+from .qa import _search_notes, note_key, qa_pipeline
 from .read import ReadStageError, read_pipeline
 
 # ============================================================
@@ -779,10 +779,12 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
 
     两级闸门：
     - 廉价闸门（零成本）：明显过程/元问题（继续、现在到哪、路线对吗…）直接跳过，不查库；
-    - 质量闸门（可标定相似度）：复用 qa 混合检索（限定 tech），按 _hit_relevance
-      （hybrid 用保留的 dense 原始余弦、BM25 独有命中不过闸）≥ ROUTE_KB_INJECT_SIM
-      取前 ROUTE_KB_SNIPPETS 条，片段截断到 QA_SNIPPET_CHARS。混合检索的归一化
+    - 质量闸门（可标定相似度）：复用 qa 混合检索（限定 tech，召回 config.QA_RECALL_CHUNKS
+      条分块），按 _hit_relevance（hybrid 用保留的 dense 原始余弦、BM25 独有命中不过闸）
+      ≥ ROUTE_KB_INJECT_SIM 过滤，片段截断到 QA_SNIPPET_CHARS。混合检索的归一化
       similarity 不能当绝对门槛。
+    N 的单位是**笔记篇数**（ROUTE_KB_SNIPPETS）：一篇笔记常切成多块，按块取 N 条会让
+    同一篇的多个分块重复占名额（实测 3 条注入只覆盖 1~3 篇），故每篇只取最靠前的一块。
     检索异常（RAG 未索引 / Chroma 异常）优雅降级为空——模型用自己的知识正常回答。
     """
     question = (question or "").strip()
@@ -791,18 +793,23 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
     if _is_meta_question(question):
         return []
     try:
-        hits = _search_notes(question, config.QA_TOP_K, tech)
+        hits = _search_notes(question, config.QA_RECALL_CHUNKS, tech)
     except Exception:  # noqa: BLE001 —— RAG 未索引 / Chroma 异常时降级为空
         return []
     out: list[dict] = []
+    seen: set[str] = set()
     for h in hits:
         rel = _hit_relevance(h)
         if rel is None or rel < config.ROUTE_KB_INJECT_SIM:
             continue
+        note = note_key(h)
+        if not note or note in seen:  # 同篇的后续分块不再占名额（hits 按相似度降序，首条即最佳）
+            continue
         snippet = (h.get("document") or "").strip()
         if not snippet:
             continue
-        out.append({"path": h.get("path") or "", "snippet": snippet[:config.QA_SNIPPET_CHARS]})
+        seen.add(note)
+        out.append({"path": note, "snippet": snippet[:config.QA_SNIPPET_CHARS]})
         if len(out) >= config.ROUTE_KB_SNIPPETS:
             break
     return out

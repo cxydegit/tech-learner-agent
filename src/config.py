@@ -151,13 +151,13 @@ class Config:
     # 超过仍未出结果（线程死/进程重启）→ 把 inflight 快照并回 buffer，交给未来正常 fire 重扫
     ROUTE_MEMORY_SWEEP_TIMEOUT: float = float(os.getenv("ROUTE_MEMORY_SWEEP_TIMEOUT", "300"))
     # 记忆系统：coach 提问确定性读路由——提问先查库，命中相似度达标才注入上下文。
-    # 检索复用 qa 的混合检索（QA_TOP_K 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
+    # 检索复用 qa 的混合检索（QA_RECALL_CHUNKS 召回 / QA_SNIPPET_CHARS 截断），此处只控制闸门。
     # 注入阈值（可标定余弦，见 route.py::_hit_relevance）：hybrid 的归一化 similarity（top 恒 1.0）
     # 不能当绝对门槛，run_kb_retrieve 用 dense 原始余弦过闸。标定依据（一次性的离线标定实验）：
     # 正样本（coach 应注入）余弦 0.58~0.87，负样本（笔记里没有）top-1 余弦 0.45~0.62；0.65 时注入召回 90%、
     # 误注入 0/6（0.5 时误注入 3/6——22 篇语料里 0.5 过松）。
     ROUTE_KB_INJECT_SIM: float = float(os.getenv("ROUTE_KB_INJECT_SIM", "0.65"))
-    ROUTE_KB_SNIPPETS: int = int(os.getenv("ROUTE_KB_SNIPPETS", "3"))  # 注入片段数上限
+    ROUTE_KB_SNIPPETS: int = int(os.getenv("ROUTE_KB_SNIPPETS", "3"))  # 注入笔记篇数上限（每篇一条最佳片段）
     # 里程碑验收闸门：勾选里程碑时核对「完成证据是否真实出现在对话里」（双层：引用 substring
     # 确定性校验 + LLM 验收语义覆盖）。提示词自觉被证伪（Agent 未完成待办即宣布完成），必须代码强制。
     ROUTE_MILESTONE_VERIFY: bool = os.getenv("ROUTE_MILESTONE_VERIFY", "true").lower() == "true"
@@ -200,8 +200,14 @@ class Config:
     NOTE_CONTENT_CHARS: int = int(os.getenv("NOTE_CONTENT_CHARS", "12000"))
 
     # QA 模块（联想检索）：检索与提示词预算参数
-    QA_TOP_K: int = int(os.getenv("QA_TOP_K", "8"))  # 召回笔记片段条数
-    QA_MAX_GROUPS: int = int(os.getenv("QA_MAX_GROUPS", "5"))  # 最多按来源笔记分组数
+    # 召回深度**按分块**（vector 的限制），取件口径**按笔记**：一篇笔记常切成多块，
+    # 「取 N 条分块」实测 8 条只覆盖 3~8 篇（同一篇的多个分块重复占名额），所以 /ask 与
+    # coach 注入都改成「取满候选池 → 按笔记去重 → 截断到 N 篇」（截断见 QA_MAX_GROUPS /
+    # ROUTE_KB_SNIPPETS）。默认 24 = 旧口径 max(top_k*3, 8) 的候选池深度：旧代码本来就把
+    # 这 24 条算了出来却只用前 8 条，这里只是不再丢弃剩下的——同一池子、同一次融合，
+    # 任何一条命中的排名都不变，改动只影响「取件」。
+    QA_RECALL_CHUNKS: int = int(os.getenv("QA_RECALL_CHUNKS", "24"))  # 检索召回分块数（按笔记去重前）
+    QA_MAX_GROUPS: int = int(os.getenv("QA_MAX_GROUPS", "5"))  # /ask 最多按来源笔记分段数（＝笔记篇数）
     QA_SNIPPETS_PER_NOTE: int = int(os.getenv("QA_SNIPPETS_PER_NOTE", "3"))  # 每组最多片段数
     QA_SNIPPET_CHARS: int = int(os.getenv("QA_SNIPPET_CHARS", "500"))  # 每条片段截断字数
     QA_HISTORY_ROUNDS: int = int(os.getenv("QA_HISTORY_ROUNDS", "3"))  # 多轮上下文取最近 N 轮
