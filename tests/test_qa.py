@@ -71,6 +71,25 @@ def test_group_hits_cap_and_snippets():
     assert sims == sorted(sims, reverse=True)
 
 
+def test_group_hits_unlimited_snippets_per_note():
+    """每篇片段数 ≤0 = 不限：该篇在池里的块全交付，篇数上限仍然生效。
+
+    依据（2026-10-10 实测）：材料体积已被「篇数上限 × 召回池深度」夹住，再按篇限块数
+    是重复设限；而块长由 Markdown 结构决定（中位 145 字），"3 块"实际只给约 435 字，
+    把整节内容切在门外。默认改为不限，避免以后被当作"忘了配"误改回固定值。
+    """
+    hits = ([{"path": "knowledge/a/x.md", "similarity": 0.9 - i * 0.01, "document": f"x{i}"}
+             for i in range(6)]
+            + [{"path": f"knowledge/b/y{i}.md", "similarity": 0.4 - i * 0.01,
+                "document": f"y{i}"} for i in range(3)])
+    groups = qa_mod._group_hits(hits, max_groups=2, snippets_per_note=0, snippet_chars=10)
+    # 篇数上限仍生效：只留 2 篇
+    assert [g["path"] for g in groups] == ["knowledge/a/x.md", "knowledge/b/y0.md"]
+    # 片段数不限：该篇 6 块全留（旧默认 3 会砍掉后 3 块）
+    assert len(groups[0]["snippets"]) == 6
+    assert groups[0]["snippets"] == ["x0", "x1", "x2", "x3", "x4", "x5"]
+
+
 def test_recall_depth_by_chunks_cut_by_notes(monkeypatch):
     """召回深度按分块（config.QA_RECALL_CHUNKS），最终材料按笔记篇数截断（QA_MAX_GROUPS）。
 

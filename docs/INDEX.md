@@ -37,6 +37,7 @@
 - [report/rag-hybrid-scenario-eval-v1.5.md](report/rag-hybrid-scenario-eval-v1.5.md) —— v1.5：取件口径按笔记去重（/ask 与 coach 注入）；排名未动、cross_note 取件召回 79%→83%；发现「瓶颈是取件上限不是召回深度」
 - [report/qa-faithfulness-baseline.md](report/qa-faithfulness-baseline.md) —— 问答忠实度基线（生成层首份）：60 条分层问答集；忠实度 99.8%、编造 1/58、拒答 7/7；材料缺位时模型转向「标注推断」而非编造
 - [report/qa-faithfulness-baseline-v1.1.md](report/qa-faithfulness-baseline-v1.1.md) —— v1.1：经人工复核纠正（真编造 0；生成侧漏答并到「要点设计边缘」）+ 1 条要点补判后覆盖 90%（155/173）
+- [report/qa-context-budget-ab.md](report/qa-context-budget-ab.md) —— 上下文装配预算 A/B（两臂同批 + 共享召回）：交付 5 篇×3 块 → 6 篇×不限块；覆盖 +5 但**逐条归因后只有 4 条是材料带来的**、其余是生成随机性；2×2 分解给出「去块数上限 +11 条 / 加一篇 +2 条」；代价 +365 prompt 词元/题
 - [report/note-dedup-report.md](report/note-dedup-report.md) —— 笔记去重：确定性确认层被合成压力测试揭穿 → LLM 判定 + 用户确认兜底
 - [report/note-sweep-async-report.md](report/note-sweep-async-report.md) —— 记忆沉淀并行化：同步阻塞 → 后台并行 + 确定性反馈 / 确认
 - [report/note-recall-report.md](report/note-recall-report.md) —— 差量提取的召回窗口：取头 1500 字 / top-3 分块 / 无下限 → 按助手讲解分段 + 按笔记归并 + 相似度下限（含一个被否决的方案）
