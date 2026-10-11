@@ -107,7 +107,8 @@ def _group_hits(hits: list[dict], max_groups: int, snippets_per_note: int,
     Args:
         hits: semantic_search_knowledge 返回的命中列表
         max_groups: 最多返回的组数
-        snippets_per_note: 每组最多保留的片段数
+        snippets_per_note: 每组最多保留的片段数；≤0 = 不限（该篇在池里的块全留，
+            体积仍被 max_groups × 召回池深度夹住）
         snippet_chars: 每条片段的截断字数
 
     Returns:
@@ -128,7 +129,7 @@ def _group_hits(hits: list[dict], max_groups: int, snippets_per_note: int,
         if sim > g["best_similarity"]:
             g["best_similarity"] = sim
             g["topic"] = h.get("topic", g["topic"])
-        if len(g["snippets"]) < snippets_per_note:
+        if snippets_per_note <= 0 or len(g["snippets"]) < snippets_per_note:
             g["snippets"].append((h.get("document") or "")[:snippet_chars].strip())
     ordered = [g for g in groups.values() if g["snippets"]]
     ordered.sort(key=lambda g: g["best_similarity"], reverse=True)
