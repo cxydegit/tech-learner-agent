@@ -70,6 +70,32 @@ def test_not_completion_claim():
     assert not is_completion_claim("我脑子里还没过一遍")
 
 
+def test_completion_claim_knowledge_class():
+    """认知类自述（「我知道」这类表态）→ True：用户本人的掌握声明，豁免验收。
+
+    这类措辞原先不在词表里，会掉进验收员；现已收进快路径（省一次 LLM 调用）。
+    """
+    for t in ["这个我知道", "我知道了", "我懂了", "我明白了", "这块我清楚了",
+              "我了解了", "我理解了", "搞清楚了", "知道了"]:
+        assert is_completion_claim(t), t
+
+
+def test_knowledge_class_negation_guard():
+    """认知类的否定 / 疑问式不得豁免：「不知道」「我不明白了」「我知道了没」仍走验收。"""
+    for t in ["我不知道", "我不懂", "我不清楚", "这个我不了解", "我还没明白",
+              "我不明白了", "我知道了没"]:
+        assert not is_completion_claim(t), t
+
+
+def test_knowledge_class_question_not_claim():
+    """提问里的「知道」不是掌握声明——词表只收第一人称/完成态，不收光秃秃的动词。
+
+    这条守的是误豁免方向（判 True 会跳过验收直接勾选），所以宁可漏判。
+    """
+    for t in ["我想知道这个为什么", "你知道为什么吗", "这个谁知道怎么弄"]:
+        assert not is_completion_claim(t), t
+
+
 def test_advance_only_is_not_completion_claim():
     """只说「往下走」不构成完成声明：打不打得勾交给验收员按证据判。"""
     assert is_advance_directive("直接下一步")
