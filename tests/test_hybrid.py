@@ -9,24 +9,53 @@ from pathlib import Path
 # 保证 tests/ 下能 import src（pytest 无 src 布局配置时）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.domain.hybrid import build_bm25, lexical_rerank, rrf_fuse, tokenize
+from src.domain.hybrid import (
+    build_bm25,
+    get_tokenizer,
+    lexical_rerank,
+    rrf_fuse,
+    tokenize,
+    tokenize_bigram,
+    tokenize_char,
+)
 
 # ---------- tokenize ----------
 
-def test_tokenize_english_and_chinese_char():
-    toks = tokenize("Redis 缓存穿透")
+def test_tokenize_char_english_and_chinese_single_chars():
+    toks = tokenize_char("Redis 缓存穿透")
     assert "redis" in toks
     assert {"缓", "存", "穿", "透"} <= set(toks)
 
 
+def test_tokenize_bigram_uses_adjacent_pairs():
+    """中文按相邻两字切；不再保留单字（单字正是虚词噪声的来源）。"""
+    toks = tokenize_bigram("Redis 向量数据库")
+    assert "redis" in toks
+    assert {"向量", "量数", "数据", "据库"} <= set(toks)
+    assert "数" not in toks
+    assert tokenize("向量数据库") == tokenize_bigram("向量数据库")  # 默认口径 = bigram
+
+
+def test_tokenize_bigram_single_char_run_kept():
+    assert tokenize_bigram("猫") == ["猫"]
+    assert tokenize_bigram("Redis 与 猫") == ["redis", "猫"]  # 「与」是停用词
+
+
 def test_tokenize_keeps_dotted_acronym_and_drops_stopwords():
     """点号分隔缩写整体成一个 token（修复拆成 ft/search 后的 idf 稀释）；停用词照常丢弃。"""
-    toks = tokenize("The FT.SEARCH 与 Redis")
-    assert "the" not in toks
-    assert "ft.search" in toks
-    assert "ft" not in toks and "search" not in toks
-    assert "与" not in toks
-    assert "redis" in toks
+    for tok in (tokenize_char, tokenize_bigram):
+        toks = tok("The FT.SEARCH 与 Redis")
+        assert "the" not in toks
+        assert "ft.search" in toks
+        assert "ft" not in toks and "search" not in toks
+        assert "与" not in toks
+        assert "redis" in toks
+
+
+def test_get_tokenizer_falls_back_to_bigram():
+    assert get_tokenizer("char") is tokenize_char
+    assert get_tokenizer("bigram") is tokenize_bigram
+    assert get_tokenizer("unknown") is tokenize_bigram
 
 
 def test_bm25_dotted_acronym_stays_single_token():
@@ -53,6 +82,16 @@ def test_bm25_exact_token_ranks_above():
     scores = build_bm25(docs).score("RedisJSON")
     assert scores[1] > scores[0] and scores[1] > scores[2]
     assert scores[0] == 0.0 and scores[2] == 0.0
+
+
+def test_bm25_tokenizer_changes_compound_specificity():
+    """单字口径会被「只含单字」的文档骗到；bigram 要求相邻两字同时出现。"""
+    docs = ["向量数据库", "向 量"]
+    char_scores = build_bm25(docs, tokenizer=tokenize_char).score("向量数据库")
+    bigram_scores = build_bm25(docs, tokenizer=tokenize_bigram).score("向量数据库")
+    assert char_scores[1] > 0.0          # 单字「向」「量」都命中
+    assert bigram_scores[1] == 0.0       # 没有「向量/量数/...」组合
+    assert bigram_scores[0] > 0.0
 
 
 def test_bm25_ordering_by_relevance():
@@ -140,6 +179,19 @@ def test_lexical_rerank_full_coverage_beats_zero():
     assert out[0]["path"] == "a/transformer"
     assert out[0]["lexical_coverage"] == 1.0
     assert out[1]["lexical_coverage"] == 0.0
+
+
+def test_lexical_rerank_accepts_custom_tokenizer():
+    """rerank 的词项口径可跟随 BM25：bigram 下「相邻两字」比单字覆盖率更严格。"""
+    fused = [
+        _hit_doc(0, "a/split", "向量 数据库"),
+        _hit_doc(1, "a/compound", "向量数据库"),
+        _hit_doc(2, "a/noise", "完全无关"),
+    ]
+    char_out = lexical_rerank(fused, "向量数据库", w=1.0, tokenizer=tokenize_char)
+    bigram_out = lexical_rerank(fused, "向量数据库", w=1.0, tokenizer=tokenize_bigram)
+    assert char_out[0]["lexical_coverage"] == 1.0
+    assert bigram_out[0]["path"] == "a/compound"
 
 
 def test_lexical_rerank_zero_weight_preserves_order():

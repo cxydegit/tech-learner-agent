@@ -29,7 +29,7 @@ import chromadb
 
 from ..config import config
 from ..domain.chunking import _content_digest, chunk_markdown
-from ..domain.hybrid import build_bm25, lexical_rerank, rrf_fuse
+from ..domain.hybrid import build_bm25, get_tokenizer, lexical_rerank, rrf_fuse
 from .audit import audit
 from .embedding import DashScopeEmbeddingFunction
 
@@ -382,11 +382,17 @@ def semantic_search_knowledge(query: str, top_k: int = 1, tech: str | None = Non
 # 词法 BM25 检索 + 混合检索
 # ============================================================
 
+def _bm25_tokenizer():
+    """BM25 与词法重排共用的分词口径（config.QA_BM25_TOKENIZER，默认中文 bigram）。"""
+    return get_tokenizer(config.QA_BM25_TOKENIZER)
+
+
 def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None) -> list[dict]:
     """词法 BM25 检索：补纯 dense 漏「精确词匹配」的弱点（搜 RedisJSON/FT.SEARCH 等专有名词）。
 
     collection 全量取 knowledge chunk（可选限定 tech）→ 内存 BM25 打分 top-k。
     当前知识库规模小，全量内存打分可行；库变大后再考虑持久化 BM25 索引。
+    分词口径由 config.QA_BM25_TOKENIZER 控制（默认中文 bigram；char 可回滚旧单字口径）。
 
     返回结构与 semantic_search_knowledge 一致；``similarity`` 为归一化 BM25 分（top=1.0）。
     """
@@ -401,7 +407,7 @@ def keyword_search_knowledge(query: str, top_k: int = 1, tech: str | None = None
     if not ids or not (query or "").strip():
         return []
 
-    scores = build_bm25(docs).score(query)
+    scores = build_bm25(docs, tokenizer=_bm25_tokenizer()).score(query)
     # 只保留 BM25 分 > 0 的块（与查询至少共享一个词项）。0 分块是纯填充，
     # 若放进 RRF 会按"填充排名"白拿融合分，把无关笔记抬高（教训：RoPE 查询里
     # rag-架构模式 靠语义榜第 1 + 0 分填充的关键词榜"第 12 名"拿到 0.0303 排第一，
@@ -456,7 +462,8 @@ def hybrid_search_knowledge(query: str, top_k: int = 1, tech: str | None = None,
     # 语义第1但通篇无 RoPE 的案例）。概念查询 BM25 命中散落各篇，不重排避免误伤语义排序
     # （实测：命中≤3 篇时重排只改进/持平；≥4 篇时会造成回退）。
     if config.QA_RERANK_LEXICAL and len({h.get("path") for h in sparse}) <= config.QA_RERANK_MIN_HITS:
-        fused = lexical_rerank(fused, query, w=config.QA_RERANK_LEXICAL_W)
+        fused = lexical_rerank(fused, query, w=config.QA_RERANK_LEXICAL_W,
+                               tokenizer=_bm25_tokenizer())
     return fused[:top_k]
 
 
