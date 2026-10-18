@@ -15,12 +15,13 @@ from hashlib import sha1
 
 from ..config import config
 
-# 分块器版本号：改分块逻辑时递增，作为 content_hash 前缀。
+# 分块器 / 索引格式版本号：改分块逻辑或索引前预处理时递增，作为 content_hash 前缀。
 # 版本提升 → 既有 hash 全部失配 → 首次 index 自动全量重切（无需手动清库）。
+# v5 行为：索引前剥离笔记题头（> 日期 / > 标签），题头转元数据、不再单独成块。
 # v4 行为：同节内代码围栏若整块放得下，就并入前后正文（「解释 → 示例 → 作用」留在
 #   同一块）；放不下时仍整体独立成块。表格保持独立。超大原子块的硬上限与逻辑二次
 #   切分（表格按行重复表头 / 代码按空行分组 + 截断保底）沿用 v3。
-CHUNKER_VERSION = 4
+CHUNKER_VERSION = 5
 
 # chunk_markdown 的返回值：text 用于嵌入，section 是标题路径字符串（存入 Chroma 元数据便于调试）
 Chunk = namedtuple("Chunk", ["text", "section"])

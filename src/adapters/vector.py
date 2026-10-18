@@ -30,6 +30,7 @@ import chromadb
 from ..config import config
 from ..domain.chunking import _content_digest, chunk_markdown
 from ..domain.hybrid import build_bm25, get_tokenizer, lexical_rerank, rrf_fuse
+from ..domain.note_header import parse_note_header
 from .audit import audit
 from .embedding import DashScopeEmbeddingFunction
 
@@ -132,10 +133,17 @@ def _index_single_file(collection: Any, path: Path, force: bool) -> tuple[str, s
     # 内容变更或新文件：删旧块 → 重新切块嵌入
     if ids:
         collection.delete(ids=ids)
-    chunks = chunk_markdown(content)
+    # 题头（> 日期 / > 标签）转元数据并从索引正文剥离：否则它会单独成为一个
+    # 零内容分块，白占召回名额（见 domain/note_header.py）。
+    header_date, header_tags, body = parse_note_header(content)
+    chunks = chunk_markdown(body)
     if not chunks:
         return "skipped", None
     meta = _doc_metadata(path, content)
+    if header_date:
+        meta["date"] = header_date
+    if header_tags:
+        meta["tags"] = " ".join(f"#{t}" for t in header_tags)
     doc_ids = [f"{rel}::{i}" for i in range(len(chunks))]
     doc_metas = [
         {**meta, "content_hash": digest, "chunk": i, "section": c.section}
