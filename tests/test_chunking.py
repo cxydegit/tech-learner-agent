@@ -2,6 +2,7 @@
 
 覆盖 chunk_markdown 的核心不变量：
 - 长表格 / 长代码围栏整体原子成块，绝不按字符硬切
+- 同节内代码围栏整块放得下时，与前后正文并入同一块（语义单元不被切开）
 - 每块携带标题路径前缀（section）
 - overlap 永不始于原子块内部
 - CRLF 归一化、连续标题、前引块等边界
@@ -58,6 +59,56 @@ def test_long_fence_stays_whole():
     assert len(fences) == 1, "长代码围栏必须整体成块"
     assert "line199" in fences[0].text
     assert fences[0].text.count("```") == 2  # 起始 + 闭合
+
+
+# 2b. 同节内围栏放得下 → 与前后正文同块（解释 / 示例 / 作用不被切开）
+def test_fence_joins_surrounding_text_when_it_fits():
+    text = (
+        "# 类型提示\n\n## 机制\n\n"
+        "函数定义后的 `-> int:` 表示预期返回整数。\n\n"
+        "```python\ndef f() -> int:\n    return 1\n```\n\n"
+        "**关键特性**：不强制运行时校验，可配 mypy 静态检查。\n"
+    )
+    chunks = chunk_markdown(text)
+    assert len(chunks) == 1, "整节放得下时不应被围栏切成多块"
+    assert "-> int:" in chunks[0].text
+    assert "def f() -> int:" in chunks[0].text
+    assert "mypy" in chunks[0].text
+
+
+# 2c. 围栏放不进当前缓冲区 → 仍整体独立成块，不被切开
+def test_fence_stays_whole_when_it_does_not_fit():
+    prose = "说明文字。" * 100  # 500 字，先占住缓冲区
+    fence = "```python\n" + "\n".join(f"x{i} = {i}" for i in range(40)) + "\n```"
+    chunks = chunk_markdown(f"# 标题\n\n{prose}\n\n{fence}\n")
+    fence_chunks = [c for c in chunks if "x0 = 0" in c.text]
+    assert len(fence_chunks) == 1
+    assert "x39 = 39" in fence_chunks[0].text
+    assert fence_chunks[0].text.count("```") == 2
+
+
+# 2d. 合并后的块仍不超过 chunk_size（含章节前缀）
+def test_fence_join_respects_chunk_size():
+    intro = "前文说明。" * 40    # 200 字
+    fence = "```python\n" + "z = 1\n" * 20 + "```"
+    tail = "后文补充。" * 120    # 600 字，触发 flush
+    chunks = chunk_markdown(f"# 标题\n\n{intro}\n\n{fence}\n\n{tail}\n")
+    assert len(chunks) == 2
+    assert "z = 1" in chunks[0].text
+    assert all(len(c.text) <= config.RAG_CHUNK_SIZE for c in chunks)
+
+
+# 2e. 含围栏的缓冲区 flush 时不取 overlap，下一块不得从围栏内部起头
+def test_overlap_never_starts_inside_fence():
+    intro = "前文。" * 75                              # 225 字
+    fence = "```python\n" + "y = 2\n" * 30 + "```"     # 193 字
+    tail = "后文。" * 134                              # 402 字，触发 flush
+    chunks = chunk_markdown(f"# 标题\n\n{intro}\n\n{fence}\n\n{tail}\n")
+    assert len(chunks) == 2
+    assert "y = 2" in chunks[0].text
+    body_next = chunks[1].text.split("\n\n", 1)[1]     # 去掉 section 前缀
+    assert "y = 2" not in body_next, "overlap 不得从围栏内部续接"
+    assert not body_next.lstrip().startswith("```")
 
 
 # 3. 章节上下文前缀正确（"# 顶层 › ## 小节"）

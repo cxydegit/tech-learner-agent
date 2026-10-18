@@ -17,8 +17,10 @@ from ..config import config
 
 # 分块器版本号：改分块逻辑时递增，作为 content_hash 前缀。
 # 版本提升 → 既有 hash 全部失配 → 首次 index 自动全量重切（无需手动清库）。
-# 当前版本行为：超大原子块硬上限 + 逻辑二次切分（表格按行重复表头 / 代码按空行分组 + 截断保底）。
-CHUNKER_VERSION = 3
+# v4 行为：同节内代码围栏若整块放得下，就并入前后正文（「解释 → 示例 → 作用」留在
+#   同一块）；放不下时仍整体独立成块。表格保持独立。超大原子块的硬上限与逻辑二次
+#   切分（表格按行重复表头 / 代码按空行分组 + 截断保底）沿用 v3。
+CHUNKER_VERSION = 4
 
 # chunk_markdown 的返回值：text 用于嵌入，section 是标题路径字符串（存入 Chroma 元数据便于调试）
 Chunk = namedtuple("Chunk", ["text", "section"])
@@ -253,9 +255,11 @@ def chunk_markdown(text: str, chunk_size: int = 0, overlap: int = 0, hard_cap: i
     """Markdown 感知分块：表格 / 代码围栏原子化，标题作为章节上下文前缀。
 
     相比 chunk_text 的两个核心改进：
-    1. **原子块永不进 buf** → 长表格 / 长代码块整体独立成块，绝不按字符硬切，
-       overlap 也永不始于原子块内部（不变量）；超过 RAG_CHUNK_HARD_CAP 的病态超大块
-       例外：按逻辑结构二次切分（表格按行重复表头 / 代码按空行分组），避免超出 embedding 上限；
+    1. **原子块绝不按字符切分**：表格整体独立成块；代码围栏在同节内若整块放得下，
+       会连同前后正文并入同一块（让「解释 → 示例 → 作用」这类语义单元不被切开），
+       放不下时整体独立成块。overlap 永不始于原子块内部（不变量）；超过
+       RAG_CHUNK_HARD_CAP 的病态超大块例外：按逻辑结构二次切分（表格按行重复表头 /
+       代码按空行分组），避免超出 embedding 上限；
     2. 每块携带标题路径前缀（如 "# RAG 学习资料清单 › ## 三、可运行的示例项目"），
        检索时知道块属于哪一节。
 
@@ -288,14 +292,22 @@ def chunk_markdown(text: str, chunk_size: int = 0, overlap: int = 0, hard_cap: i
         return f"{section}\n\n{body}" if section else body
 
     chunks: list[Chunk] = []
-    buf = ""  # 累积普通块正文（不含前缀；原子块从不进 buf）
+    buf = ""  # 累积普通块正文（不含前缀）
+    buf_has_fence = False  # buf 是否含代码围栏（含则 flush 时不取 overlap，防切出残缺围栏）
+
+    def _flush(section: str, keep_overlap: bool = False) -> None:
+        nonlocal buf, buf_has_fence
+        if not buf:
+            return
+        chunks.append(Chunk(_prefix(section, buf), section))
+        # overlap 只能从纯正文尾部续接；围栏是原子块，从其内部起头会切出未闭合围栏
+        buf = buf[-overlap:] if (keep_overlap and overlap and not buf_has_fence) else ""
+        buf_has_fence = False
 
     for kind, blines in blocks:
         if kind == "heading":
             # 标题不跨节续接：先 flush 当前节正文（不带 overlap），再更新栈
-            if buf:
-                chunks.append(Chunk(_prefix(_section(), buf), _section()))
-                buf = ""
+            _flush(_section())
             m = _HEADING_RE.match(blines[0])
             lvl, txt = len(m.group(1)), m.group(2).strip()
             while stack and stack[-1][0] >= lvl:
@@ -305,15 +317,23 @@ def chunk_markdown(text: str, chunk_size: int = 0, overlap: int = 0, hard_cap: i
 
         section = _section()
         prefix = f"{section}\n\n" if section else ""
+        avail = max(chunk_size - len(prefix), 1)
 
         if kind in ("fence", "table"):
-            # 原子块：先收走普通块，再整体独立成块（绝不合并 / 切分，即使超 chunk_size）。
-            # 但超过 hard_cap 的病态超大块，按逻辑结构二次切分（表格按行重复表头 / 代码按空行分组），
-            # 防超出 embedding 输入上限导致整文件索引失败。
-            if buf:
-                chunks.append(Chunk(_prefix(section, buf), section))
-                buf = ""
             body = "\n".join(blines)
+            # 代码围栏：同节内整块放得下就并入当前缓冲区，让「解释 → 示例 → 作用」
+            # 留在同一块（实测：短笔记被"围栏必独立"切成 5 块，作用说明排到第 33 名）。
+            # 表格不合并：表格行若成为 overlap 起点会切出残缺表格，且表格多为独立查询目标。
+            if (kind == "fence" and len(body) <= hard_cap and len(body) <= avail
+                    and (not buf or len(buf) + len(body) + 2 <= avail)):
+                buf = (buf + "\n\n" + body).strip() if buf else body
+                buf_has_fence = True
+                continue
+
+            # 原子块：先收走普通块，再整体独立成块（绝不切分，即使超 chunk_size）。
+            # 超过 hard_cap 的病态超大块例外：按逻辑结构二次切分（表格按行重复表头 /
+            # 代码按空行分组），防超出 embedding 输入上限导致整文件索引失败。
+            _flush(section)
             if len(body) > hard_cap:
                 for sub in _split_oversize_atomic(kind, blines, hard_cap):
                     chunks.append(Chunk(f"{prefix}{sub}", section))
@@ -325,24 +345,19 @@ def chunk_markdown(text: str, chunk_size: int = 0, overlap: int = 0, hard_cap: i
         body = "\n".join(blines).strip()
         if not body:
             continue
-        avail = max(chunk_size - len(prefix), 1)
         if len(body) > avail:
             # 单个超长段落仍硬切（散文可接受；表格 / 围栏不适用）
-            if buf:
-                chunks.append(Chunk(_prefix(section, buf), section))
-                buf = ""
+            _flush(section)
             step = max(avail - overlap, 1)
             for i in range(0, len(body), step):
                 piece = body[i : i + avail]
                 chunks.append(Chunk(f"{prefix}{piece}", section))
             continue
         if buf and len(buf) + len(body) + 1 > avail:
-            chunks.append(Chunk(_prefix(section, buf), section))
-            buf = buf[-overlap:] if overlap else ""
+            _flush(section, keep_overlap=True)
         buf = (buf + "\n\n" + body).strip() if buf else body
 
-    if buf:
-        chunks.append(Chunk(_prefix(_section(), buf), _section()))
+    _flush(_section())
     return chunks
 
 

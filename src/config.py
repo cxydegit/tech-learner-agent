@@ -226,6 +226,11 @@ class Config:
     # 混合检索（BM25 + RRF）：/ask 召回改走 hybrid_search_knowledge，可关回纯 dense
     QA_USE_HYBRID: bool = os.getenv("QA_USE_HYBRID", "true").lower() == "true"
     QA_RRF_K: int = int(os.getenv("QA_RRF_K", "60"))  # RRF 融合常数（名次倒数分母）
+    # BM25 / 词法重排的中文分词口径：bigram（相邻两字、英文整词）为生产默认；
+    # char = 旧单字口径，保留用于回滚与对照。依据（2026-10 实测，72 条场景集，
+    # 同索引同版本）：/ask 交付召回 90.5%→96.8%，cross_note 81.0%→100%，
+    # 4 条改善 / 0 条回退。失效条件：语料转为英文/代码为主时需重新标定。
+    QA_BM25_TOKENIZER: str = os.getenv("QA_BM25_TOKENIZER", "bigram")
     # 词法一致性软重排：RRF 融合后按「查询词在块中的覆盖率（mini-idf 加权）」加分。
     # 仅当 BM25 正命中 ≤ QA_RERANK_MIN_HITS 篇笔记（罕见词型查询，dense 对专有名词
     # 零词法重合噪声的失败场景）时启用；概念查询 BM25 命中散落，不重排避免误伤语义排序
