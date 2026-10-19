@@ -5,6 +5,7 @@
 画像（learner/profile.json）为单用户个人工具，全局单文件。
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -85,5 +86,6 @@ def save_roadmap(roadmap: dict) -> Path:
     # 应当能看到"这一轮改了路线"，而不是只有工具调用、看不到产物
     audit("artifact_write", kind="roadmap", tech=roadmap.get("tech"),
           bytes=len(md.encode("utf-8")),
+          content_hash=hashlib.sha256(md.encode("utf-8")).hexdigest()[:12],
           stages=len(roadmap.get("stages") or []))
     return jp

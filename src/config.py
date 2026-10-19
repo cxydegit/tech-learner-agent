@@ -107,7 +107,13 @@ class Config:
     # 单文件按**大小**轮转，文件名不带日期——带日期会和按大小轮转打架（轮转出来的
     # `audit-09-24.jsonl.1` 里可能装着 09-25 的行），而且日期只在进程启动时算一次，
     # Web 服务跨零点会继续写昨天那个文件。时间过滤按每行的 `ts` 字段做，能力一样。
-    AUDIT_LOG_DIR: Path = BASE_DIR / "logs"  # 绝对锚点：CWD 相对路径会在换目录跑 CLI 时写飞
+    # 默认 BASE_DIR/logs；显式设 AUDIT_LOG_DIR 时：绝对路径照用，相对路径锚到 BASE_DIR
+    # （否则换目录跑 CLI 会把日志写到 CWD 下）。
+    AUDIT_LOG_DIR: Path = Path(os.getenv("AUDIT_LOG_DIR", str(BASE_DIR / "logs")))
+    if not AUDIT_LOG_DIR.is_absolute():
+        AUDIT_LOG_DIR = BASE_DIR / AUDIT_LOG_DIR
+    # 文件名（不含目录）：产品默认 audit.jsonl；评测脚本用 <run_id>.jsonl 一次一份。
+    AUDIT_LOG_NAME: str = os.getenv("AUDIT_LOG_NAME", "audit.jsonl")
     AUDIT_LOG_MAX_BYTES: int = int(os.getenv("AUDIT_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
     AUDIT_LOG_BACKUPS: int = int(os.getenv("AUDIT_LOG_BACKUPS", "5"))
 

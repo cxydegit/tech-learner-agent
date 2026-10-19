@@ -9,8 +9,10 @@
 """
 
 import re
+import time
 from collections.abc import Callable
 
+from ..adapters.audit import audit
 from ..adapters.llm import generate_text
 from ..config import config
 
@@ -77,16 +79,27 @@ def _search_notes(question: str, recall: int, tech: str | None):
         reconcile_orphans,
         semantic_search_knowledge,
     )
+    started = time.monotonic()
+    hits: list[dict] = []
+    path = "dense"
+    reason = "disabled" if not config.QA_USE_HYBRID else "ok"
     try:
         reconcile_orphans()  # /ask 前清孤儿分块；节流 + 内部吞异常，失败不影响检索
     except Exception:  # noqa: BLE001, S110 —— 对账失败不应阻断提问
         pass
     if config.QA_USE_HYBRID:
         try:
-            return hybrid_search_knowledge(question, recall, tech, candidates=recall)
+            hits = hybrid_search_knowledge(question, recall, tech, candidates=recall)
+            path = "hybrid"
         except Exception:  # noqa: BLE001, S110 —— 混合检索异常时回退纯 dense
-            pass
-    return semantic_search_knowledge(question, recall, tech)
+            path, reason = "dense", "fallback"
+            hits = semantic_search_knowledge(question, recall, tech)
+    else:
+        hits = semantic_search_knowledge(question, recall, tech)
+    audit("retrieve", path=path, reason=reason, recall=recall, tech=tech or "",
+          question_chars=len(question or ""), hits=len(hits),
+          elapsed_s=round(time.monotonic() - started, 1))
+    return hits
 
 
 # ============================================================

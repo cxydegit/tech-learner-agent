@@ -235,6 +235,23 @@ def test_small_kb_still_filtered_by_floor(monkeypatch, audit_events):
     # kb_notes 让"库里本来就没笔记"和"有笔记但被下限滤掉了"能分开
     assert event["kb_notes"] == 3 and event["recalled_count"] == 0
     assert event["sim_min"] == config.NOTE_RECALL_SIM_MIN
+    done = _last(audit_events, "note_pipeline_done")
+    assert done["skip_reason"] == "no_new" and done["extracted_count"] == 0
+
+
+def test_note_pipeline_logs_match_decision(monkeypatch, audit_events):
+    _kb(monkeypatch, [], {})
+    monkeypatch.setattr(note_mod, "generate_text",
+                        lambda *args, **kwargs: '[{"topic":"T","content":"C","tags":["s"]}]')
+    monkeypatch.setattr(note_mod, "find_note_match",
+                        lambda *args, **kwargs: (None, None, ""))
+
+    note_mod.note_pipeline("s", "一批新内容")
+
+    done = _last(audit_events, "note_pipeline_done")
+    assert done["new_count"] == 1 and done["extracted_count"] == 1
+    decision = _last(audit_events, "dedup_decision")
+    assert decision["phase"] == "match" and decision["decision"] == "diff"
 
 
 def test_kb_size_does_not_change_the_floor(monkeypatch):

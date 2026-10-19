@@ -21,7 +21,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from .adapters.audit import audit, audit_context
+from .adapters.audit import audit, audit_context, set_turn
 from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
 from .domain import exit_intent, survey
@@ -216,6 +216,10 @@ class LearnState(TypedDict):
     # 护栏：本回合已执行的「贵工具」（collect/read）次数，超 ROUTE_MAX_HEAVY_TOOLS_PER_TURN
     # 后停下问用户（这两个工具单次就烧搜索/抓取额度 + 分钟级耗时）
     coach_turn_heavy_count: int
+    # 用户回合号（checkpointer 持久化）：初始 route 记 1，此后每次 coach_human 回复 +1。
+    coach_turn_index: int
+    # 本轮用户输入的来源（cli/web；resume 由 coach_human 自报）——只用于审计，不参与业务。
+    turn_source: str
     # 护栏：本回合失败过的贵工具 → {count, stage}。失败后拒绝重跑（重跑 = 搜索+抓取+生成全重演），
     # 搜索段首次失败例外放行；每用户回合在 coach_human 清零
     coach_heavy_failures: dict
@@ -458,6 +462,17 @@ def _sanitize_messages(msgs: list[dict]) -> list[dict]:
     return cleaned
 
 
+def coach_turn_start(state: LearnState) -> dict:
+    """用户发起一轮 coach 对话：回合号 +1，并把它注入本回合所有审计事件。"""
+    turn = int(state.get("coach_turn_index") or 0) + 1
+    set_turn(_coach_thread_id(), turn)
+    chars = len(state.get("tech") or "") + len(state.get("focus") or "")
+    audit("user_turn", turn=turn, chars=chars,
+          source=state.get("turn_source") or "unknown",
+          mode=state.get("mode") or "survey")
+    return {"coach_turn_index": turn}
+
+
 def coach_trim(state: LearnState) -> dict:
     """上下文管理 + 首次初始化。
 
@@ -482,19 +497,24 @@ def coach_trim(state: LearnState) -> dict:
     # 上下文压缩：超阈值 → 三舱记忆增量整理（LLM 只看旧消息产增量，既有积累不过 LLM），
     # 只留最近 N 轮
     if len(msgs) > config.COACH_COMPRESS_AT:
+        before_chars = sum(len(m.get("content") or "") for m in msgs)
         cut = _turn_cut_index(msgs, config.COACH_HISTORY_KEEP)
         if cut is None:
             # 消息数已超阈值却找不到 user 切点：按 _turn_cut_index 的说明，这会卡在
             # 「触发却不裁」的空转里让窗口无界增长。用 WARNING 让它从常规 INFO 里跳出来——
             # 这条风险此前只写在注释里，埋点后才谈得上"实测有没有发生"。
             audit("ctx_compact", level=logging.WARNING, cut="none",
-                  before=len(msgs), after=len(msgs), dropped=0)
+                  before=len(msgs), after=len(msgs), dropped=0,
+                  before_chars=before_chars, after_chars=before_chars,
+                  consolidate_elapsed_s=0, cut_reason="no_user_cut")
             return updates  # 保留窗口覆盖全部消息（没超过 N 轮），不裁
+        compact_start = time.monotonic()
         mem = consolidate_memory(
             {"facts": state.get("coach_facts") or [],
              "open_items": state.get("coach_open_items") or [],
              "summary": state.get("coach_summary") or ""},
             msgs[:cut], state.get("tech") or "")
+        consolidate_elapsed = round(time.monotonic() - compact_start, 1)
         updates["coach_facts"] = mem["facts"]
         updates["coach_open_items"] = mem["open_items"]
         updates["coach_summary"] = mem["summary"]
@@ -502,7 +522,10 @@ def coach_trim(state: LearnState) -> dict:
         # 压缩是"模型为什么突然变傻 / 重复问"的唯一解释源：它决定模型这一刻能看见什么。
         # 记下裁掉多少、切在哪，才谈得上回答"这次变傻是不是刚压缩过"。
         audit("ctx_compact", cut=cut, before=len(msgs), after=len(msgs) - cut,
-              dropped=cut, summary_chars=len(mem["summary"] or ""))
+              dropped=cut, summary_chars=len(mem["summary"] or ""),
+              before_chars=before_chars,
+              after_chars=sum(len(m.get("content") or "") for m in msgs[cut:]),
+              consolidate_elapsed_s=consolidate_elapsed, cut_reason="ok")
     return updates
 
 
@@ -668,9 +691,15 @@ def coach_human(state: LearnState) -> dict:
         "doc_type": (doc.get("type") or "read") if doc else None,
     })
     reply = (reply or "").strip()
+    # 回合号必须在 interrupt() 之后递增：恢复时节点会从头重跑，放在前面会重复计数。
+    turn = int(state.get("coach_turn_index") or 0) + 1
+    set_turn(_coach_thread_id(), turn)
+    audit("user_turn", turn=turn, chars=len(reply), source="resume",
+          mode=state.get("mode") or "")
     now = datetime.now().isoformat(timespec="seconds")  # noqa: DTZ005 —— 本地 naive 语义，与会话列表/前端格式一致
     updates: dict = {
         "coach_messages": [*msgs, {"role": "user", "content": reply}],
+        "coach_turn_index": turn,
         "coach_turn_tool_count": 0,
         "coach_turn_heavy_count": 0,
         "coach_heavy_failures": {},  # 贵工具失败闸每回合清零（同回合内才拦重跑）
@@ -876,6 +905,7 @@ def coach_memory_write(state: LearnState) -> dict:
             # merged_back_chars 必须记：并回是"下一批被撑大、内容被重扫一遍"的成因，只看条数
             # 看不出量级（实测三次并回分别是 4348 / 6656 / 3489 字，都是下一批变大的一半来源）
             audit("sweep_drain", result="stale" if result is None else "error",
+                  mode="async",
                   elapsed_s=_sweep_elapsed_s(inflight),
                   items=len(inflight.get("buffer") or []),
                   merged_back_chars=_buffer_chars(inflight.get("buffer") or []))
@@ -883,6 +913,7 @@ def coach_memory_write(state: LearnState) -> dict:
                     "memory_sweep_inflight": None}
         updates: dict = {"memory_sweep_inflight": None}
         audit("sweep_drain", result=str(result.get("action") or "unknown"),
+              mode="async",
               elapsed_s=_sweep_elapsed_s(inflight),
               items=len(inflight.get("buffer") or []), count=result.get("count"))
         if result.get("action") == "persisted":
@@ -1100,7 +1131,7 @@ def build_graph(checkpointer):
         "read": "read",
         "note": "note_extract",
         "qa": "qa",
-        "route": "coach_trim",
+        "route": "coach_turn_start",
     })
 
     # note 两段式：提取（昂贵 LLM，只跑一次）→ 确认入库（interrupt 点，resume 只重跑它）
@@ -1114,6 +1145,7 @@ def build_graph(checkpointer):
     # coach 循环（模块 2）：llm ↔ (tool | human | guard) ↔ survey，共用 trim 保底上下文有界。
     # 模式切换（survey→planning→coaching）全部在节点内写 mode，条件边只做路由
     # （langgraph 1.2.10 条件边不支持返回 Command）。
+    builder.add_node("coach_turn_start", coach_turn_start)
     builder.add_node("coach_trim", coach_trim)
     builder.add_node("coach_llm", coach_llm)
     builder.add_node("coach_tool", coach_tool)
@@ -1124,6 +1156,7 @@ def build_graph(checkpointer):
     builder.add_node("coach_candidate_confirm", coach_candidate_confirm)
     builder.add_node("coach_kb_retrieve", coach_kb_retrieve)
 
+    builder.add_edge("coach_turn_start", "coach_trim")
     builder.add_edge("coach_trim", "coach_llm")
     builder.add_conditional_edges("coach_llm", _route_coach, {
         "coach_tool": "coach_tool",

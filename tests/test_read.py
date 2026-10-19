@@ -54,8 +54,8 @@ def test_read_fetch_failure_propagates(monkeypatch):
         pass
 
 
-def test_read_report_wires_heartbeat_progress(monkeypatch):
-    """解读报告生成同样要挂心跳（与 collect 对齐）。"""
+def test_read_report_wires_heartbeat_progress(monkeypatch, audit_events):
+    """解读报告生成同样要挂心跳（与 collect 对齐），且进度回调继续转发给 UI。"""
     captured = {}
 
     def fake_generate(system, user, **kw):
@@ -72,5 +72,11 @@ def test_read_report_wires_heartbeat_progress(monkeypatch):
     seen: list[str] = []
     read_mod.read_pipeline("https://example.com/doc", progress=seen.append)
 
-    assert captured["progress"] == seen.append
+    assert callable(captured["progress"])
+    captured["progress"]("⏳ 仍在进行...")
+    assert "⏳ 仍在进行..." in seen
+    assert any(
+        event.get("event") == "pipeline_step" and event.get("pipeline") == "read"
+        for event in audit_events
+    )
     assert captured["progress_label"] == "LLM 生成解读报告"

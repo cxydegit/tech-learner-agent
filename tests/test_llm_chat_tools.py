@@ -400,6 +400,8 @@ def test_generate_text_logs_finish_reason_and_usage(monkeypatch, log_capture):
     assert line["status"] == "ok" and line["fallback"] is False
     assert line["finish_reason"] == "length"
     assert line["prompt_tokens"] == 3912 and line["completion_tokens"] == 4096
+    assert line["max_tokens"] == config.LLM_MAX_TOKENS
+    assert line["cached_tokens"] is None
     assert line["elapsed_s"] >= 0
 
 

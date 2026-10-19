@@ -38,6 +38,17 @@ NO_THREAD = "local"
 
 # 非图线程的显式会话标识（见 audit_context）。默认 None 才轮到 langgraph 的 config 兜底。
 _CONTEXT_THREAD_ID: ContextVar[str | None] = ContextVar("audit_thread_id", default=None)
+# 流量来源与评测 run 标识：显式传参 > audit_context > 环境变量 > 默认。
+_CONTEXT_ORIGIN: ContextVar[str | None] = ContextVar("audit_origin", default=None)
+_CONTEXT_RUN_ID: ContextVar[str | None] = ContextVar("audit_run_id", default=None)
+
+# 用户回合号按 thread_id 记录：图节点在回合开始时 set_turn()，之后同线程的每一条
+# 事件（LLM / 工具 / 后台沉淀）都能带上 turn。用普通 dict 而不是 ContextVar：
+# langgraph 节点可能跑在线程池里，且后台沉淀线程不继承 contextvars。
+_TURN_BY_THREAD: dict[str, int] = {}
+
+# `origin` 白名单：产品 / 评测 / 测试 / 未知。不在白名单的值降级为 unknown，不猜测。
+ORIGINS = {"product", "eval", "test", "unknown"}
 
 LOGGER = logging.getLogger(LOGGER_NAME)
 LOGGER.setLevel(logging.INFO)
@@ -93,7 +104,7 @@ def configure_audit_log() -> None:
         _file_handler = None
         try:
             handler = _LazyRotatingFileHandler(
-                str(Path(config.AUDIT_LOG_DIR) / "audit.jsonl"),
+                str(Path(config.AUDIT_LOG_DIR) / config.AUDIT_LOG_NAME),
                 maxBytes=config.AUDIT_LOG_MAX_BYTES,
                 backupCount=config.AUDIT_LOG_BACKUPS,
                 encoding="utf-8",
@@ -126,18 +137,29 @@ def _graph_context() -> tuple[str | None, int | None]:
 
 
 @contextmanager
-def audit_context(thread_id: str | None):
-    """在**非图线程**里显式声明本次事件的归属会话。
+def audit_context(
+    thread_id: str | None,
+    *,
+    origin: str | None = None,
+    run_id: str | None = None,
+):
+    """在**非图线程**里显式声明本次事件的归属会话/流量来源。
 
     调用点：`graph._start_sweep_thread` 起的后台沉淀线程——它手里本来就有 thread_id，
     显式声明比依赖线程继承可靠（普通线程根本不继承 contextvars），否则这条链上的
     LLM 调用与副作用事件会全部退化成无归属。
+
+    `origin` / `run_id` 用于区分产品、评测、测试；评测脚本也可用环境变量设置。
     """
-    token = _CONTEXT_THREAD_ID.set(thread_id or None)
+    token_thread = _CONTEXT_THREAD_ID.set(thread_id or None)
+    token_origin = _CONTEXT_ORIGIN.set(origin)
+    token_run = _CONTEXT_RUN_ID.set(run_id)
     try:
         yield
     finally:
-        _CONTEXT_THREAD_ID.reset(token)
+        _CONTEXT_THREAD_ID.reset(token_thread)
+        _CONTEXT_ORIGIN.reset(token_origin)
+        _CONTEXT_RUN_ID.reset(token_run)
 
 
 def _current_thread_id() -> str:
@@ -147,25 +169,67 @@ def _current_thread_id() -> str:
     return _graph_context()[0] or NO_THREAD
 
 
-def audit(event: str, /, *, level: int = logging.INFO, **fields) -> None:
+def set_turn(thread_id: str | None, turn: int | None) -> None:
+    """记录某个会话当前用户回合号；`audit()` 会把它注入每一条事件。
+
+    `turn=None` 清除该会话的映射（会话结束/测试清理用）。
+    """
+    if not thread_id:
+        return
+    if turn is None:
+        _TURN_BY_THREAD.pop(thread_id, None)
+    else:
+        _TURN_BY_THREAD[thread_id] = int(turn)
+
+
+def audit(
+    event: str,
+    /,
+    *,
+    level: int = logging.INFO,
+    origin: str | None = None,
+    run_id: str | None = None,
+    turn: int | None = None,
+    **fields,
+) -> None:
     """写一条审计事件（**唯一写出口**）。
 
     Args:
         event: 事件名（蛇形，如 `llm_call` / `tool_call`）
         level: 日志级别，默认 INFO（数据质量类事件用 WARNING 让它从常规里跳出来）
+        origin: 流量来源（product/eval/test/unknown）。不传时按
+            audit_context > AUDIT_ORIGIN 环境变量 > product 取值。
+        run_id: 评测/长任务标识。不传时按 audit_context > AUDIT_RUN_ID 环境变量 > null。
+        turn: 用户回合号。不传时取 `set_turn()` 记录的当前会话回合；都没有则 null。
         **fields: 事件字段。**按白名单显式传，不要 `json.dumps(args)` 整包落盘**——
             新工具可能带长正文，整包 dump 会在某次加字段时静默把学习内容写进日志。
 
     公共字段由本函数注入且**优先级高于同名字段**（调用方传了 `ts=` 也不会覆盖），
     保证"每条事件都带得上会话标识"这条不变式不被局部代码破坏。
     """
+    resolved_origin = (
+        origin or _CONTEXT_ORIGIN.get() or os.getenv("AUDIT_ORIGIN") or "product"
+    )
+    resolved_origin = resolved_origin.strip().lower()
+    if resolved_origin not in ORIGINS:
+        resolved_origin = "unknown"
+    resolved_run_id = (
+        run_id if run_id is not None
+        else (_CONTEXT_RUN_ID.get() or os.getenv("AUDIT_RUN_ID") or None)
+    )
+    resolved_run_id = resolved_run_id or None
+    thread_id = _current_thread_id()
+    resolved_turn = turn if turn is not None else _TURN_BY_THREAD.get(thread_id)
     payload = {
         **fields,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "level": logging.getLevelName(level),
-        "thread_id": _current_thread_id(),
+        "thread_id": thread_id,
         "step": _graph_context()[1],
         "event": event,
+        "origin": resolved_origin,
+        "run_id": resolved_run_id,
+        "turn": resolved_turn,
     }
     LOGGER.log(level, json.dumps(payload, ensure_ascii=False, default=str))
 
@@ -210,6 +274,23 @@ def _project_version() -> str:
         return "unknown"
 
 
+def _git_sha() -> str:
+    """当前代码版本（短 SHA）；不在 git 仓库/超时/无 git 时返回空串，不影响启动。"""
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(config.BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:  # noqa: BLE001 —— 版本只用于归因，取不到不该拦启动
+        return ""
+
+
 def boot(entry: str) -> None:
     """进程启动时记一条配置快照。entry：`cli` / `web`。"""
     settings = {key: getattr(config, key, None) for key in _BOOT_SETTINGS}
@@ -222,6 +303,7 @@ def boot(entry: str) -> None:
         cfg_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12],
         python=platform.python_version(),
         version=_project_version(),
+        git_sha=_git_sha(),
         config=settings,
     )
 

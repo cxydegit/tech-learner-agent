@@ -7,6 +7,7 @@ note_pipeline 只做「召回已有笔记 → 差量提取（只写增量，可�
 """
 
 import re
+import time
 from collections.abc import Callable
 
 from ..adapters.audit import audit
@@ -204,10 +205,12 @@ def _audit_recall(tech: str, *, batch_chars: int, queries: list[str], kb_notes: 
           query_count=len(queries),
           query_chars=query_chars,
           query_truncated=batch_chars > query_chars,
+          query_omitted_chars=max(0, batch_chars - query_chars),
           kb_notes=kb_notes,
           sim_min=config.NOTE_RECALL_SIM_MIN,
           content_chars=min(batch_chars, config.NOTE_CONTENT_CHARS),
           content_truncated=batch_chars > config.NOTE_CONTENT_CHARS,
+          content_omitted_chars=max(0, batch_chars - config.NOTE_CONTENT_CHARS),
           recalled_count=len(recalled),
           recalled=[{"path": n.get("path") or "", "sim": _sim_of(n)} for n in recalled])
 
@@ -240,9 +243,11 @@ def note_pipeline(tech: str, conversation_log: str,
           "new_count": int, "merged_count": int,
         }
     """
+    pipeline_start = time.monotonic()
     # 1. 语义召回：该 tech 下与学习内容最相关的已有笔记（差量上下文）
     if progress:
         progress("🔎 召回已有笔记...")
+    recall_start = time.monotonic()
     existing_all = get_existing_notes(tech)  # 全量（逐条匹配用），同时给召回日志一个"库里有几篇"的底
     queries = _recall_queries(conversation_log, query_segments)
     # 下限一律生效，不看库大小："小库就全给"曾实现过又撤掉——低相似度的笔记就是噪声，
@@ -252,19 +257,28 @@ def note_pipeline(tech: str, conversation_log: str,
                                      sim_min=config.NOTE_RECALL_SIM_MIN)
     _audit_recall(tech, batch_chars=len(conversation_log), queries=queries,
                   kb_notes=len(existing_all), recalled=existing)
+    recall_s = round(time.monotonic() - recall_start, 1)
 
     # 2. 差量提取：只输出新增知识点（可输出 []）
     if progress:
         progress("🧠 LLM 差量提取知识点...")
+    extract_start = time.monotonic()
     raw = generate_text(EXTRACT_SYSTEM_PROMPT, _build_extraction_user(tech, conversation_log, existing),
                         call_site="note.extract")
     entries = parse_entries(raw)
+    extract_s = round(time.monotonic() - extract_start, 1)
 
     if not entries:
         # 4. 无新内容路径：不沉淀；有 materials 则轻量 LLM 推荐未覆盖方向，否则只如实告知
         topics = [n["topic"] for n in existing_all]
         suggestion = suggest_directions(tech, materials_path, topics) if materials_path else None
         empty_reason = "学习内容与已有知识笔记重复，或没有可提取的新知识点"
+        audit("note_pipeline_done",
+              tech=tech, elapsed_s=round(time.monotonic() - pipeline_start, 1),
+              recall_s=recall_s, extract_s=extract_s, match_s=0,
+              batch_chars=len(conversation_log), query_count=len(queries),
+              recalled_count=len(existing), extracted_count=0,
+              new_count=0, merge_candidates=0, skip_reason="no_new")
         return {
             "new_points": [], "merge_candidates": [], "empty_reason": empty_reason,
             "suggestion": suggestion, "summary": empty_reason, "raw": raw,
@@ -274,6 +288,7 @@ def note_pipeline(tech: str, conversation_log: str,
     # 3. 逐条匹配已有笔记 → 新点 / 合并候选
     new_points: list[dict] = []
     merge_candidates: list[dict] = []
+    match_start = time.monotonic()
     for e in entries:
         topic = (e.get("topic") or "").strip()
         body = (e.get("content") or "").strip()
@@ -284,6 +299,10 @@ def note_pipeline(tech: str, conversation_log: str,
         # 候选召回 → 标题 fast-path → LLM 判定（find_note_match），返回第一个判定
         # same 的候选及理由；reason 供确认时展示。
         match, similarity, reason = find_note_match(tech, topic, existing_all, content=body, tags=tags)
+        audit("dedup_decision", phase="match",
+              decision="same" if match else "diff",
+              similarity=similarity, reason_chars=len(reason or ""),
+              topic_chars=len(topic), tech=tech)
         if match:
             merge_candidates.append({
                 "old_path": match["path"],
@@ -298,11 +317,19 @@ def note_pipeline(tech: str, conversation_log: str,
         else:
             new_points.append({"topic": topic, "tags": tags, "content": body})
 
+    match_s = round(time.monotonic() - match_start, 1)
     summary = (
         f"差量提取出 {len(new_points)} 个新知识点，{len(merge_candidates)} 条与已有笔记相似待确认"
         if (new_points or merge_candidates)
         else "未提取到可入库的新知识点"
     )
+    audit("note_pipeline_done",
+          tech=tech, elapsed_s=round(time.monotonic() - pipeline_start, 1),
+          recall_s=recall_s, extract_s=extract_s, match_s=match_s,
+          batch_chars=len(conversation_log), query_count=len(queries),
+          recalled_count=len(existing), extracted_count=len(entries),
+          new_count=len(new_points), merge_candidates=len(merge_candidates),
+          skip_reason="" if (new_points or merge_candidates) else "all_filtered")
     return {
         "new_points": new_points,
         "merge_candidates": merge_candidates,
@@ -386,6 +413,7 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
         {"results": [persist 结果...], "new_count": int, "merged_count": int,
          "conflict_reports": [{path, topic, report}, ...]}（无矛盾为空列表）
     """
+    persist_start = time.monotonic()
     new_count = merged_count = 0
     results: list[dict] = []
     conflict_reports: list[dict] = []
@@ -397,6 +425,18 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
               index_ok=r.get("index_ok"))
         results.append(r)
         new_count += 1
+    persist_s = round(time.monotonic() - persist_start, 1)
+
+    # 用户明确跳过的候选也要留痕：只记 accepted 会让"去重判了 same 但用户不认"
+    # 这一整类信号消失。
+    for idx, candidate in enumerate(merge_candidates):
+        if idx not in merge_indices:
+            audit("dedup_decision", phase="persist", decision="rejected",
+                  similarity=candidate.get("similarity"),
+                  reason_chars=len(candidate.get("reason") or ""),
+                  topic_chars=len(candidate.get("topic") or ""), tech=tech)
+
+    merge_start = time.monotonic()
     for idx in sorted(merge_indices):
         c = merge_candidates[idx]
         merged = merge_notes(c["old_content"], c["content"], c["topic"])
@@ -405,11 +445,21 @@ def persist_points(tech: str, new_points: list[dict], merge_candidates: list[dic
         r = persist_note(tech, c["old_topic"], merged["content"], c["tags"], replace_path=c["old_path"])
         audit("note_persist", tech=tech, path=r.get("path"), kind=r.get("action"),
               index_ok=r.get("index_ok"), conflict=bool(merged["report"]))
+        audit("dedup_decision", phase="persist", decision="accepted",
+              similarity=c.get("similarity"), reason_chars=len(c.get("reason") or ""),
+              topic_chars=len(c.get("topic") or ""), tech=tech)
         results.append(r)
         merged_count += 1
         if merged["report"]:
             conflict_reports.append({"path": c["old_path"], "topic": c["topic"],
                                      "report": merged["report"]})
+    merge_s = round(time.monotonic() - merge_start, 1)
+    audit("note_persist_done", tech=tech,
+          elapsed_s=round(time.monotonic() - persist_start, 1),
+          persist_s=persist_s, merge_s=merge_s,
+          new_count=new_count, merged_count=merged_count,
+          conflict_count=len(conflict_reports),
+          skipped_candidates=len(merge_candidates) - len(merge_indices))
     return {"results": results, "new_count": new_count, "merged_count": merged_count,
             "conflict_reports": conflict_reports}
 

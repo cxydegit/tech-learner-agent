@@ -14,6 +14,7 @@ from ..adapters.store import index_file_lazy, save_file_tool
 from ..config import config
 from ..domain.dedup import sanitize_filename
 from ..domain.extraction import parse_classify
+from .collect import _step_recorder
 
 # ============================================================
 # 提示词
@@ -159,6 +160,9 @@ def read_pipeline(url: str, progress: Callable[[str], None] | None = None) -> di
         - notes 形如 [{"url", "title", "report"}]，供 LangGraph 状态累积
         - index_ok 表示报告是否已写入 RAG 索引（失败不阻断保存，缺口由对账补齐）
     """
+    # 分段计时复用 collect 的 recorder：read 此前只有总耗时，长文档解读的静默段不可分。
+    progress = _step_recorder("read", progress)
+
     # 1. 抓取文档内容
     # 必须显式给超时并关掉 SDK 重试：read 是单页、直接阻塞在工具路径上，没有 fetch_many 那样的
     # 墙钟兜底；不给的话 Firecrawl 客户端 timeout=None（不设 HTTP 超时）+ SDK 默认重试 3 次，

@@ -6,6 +6,7 @@ save_file_tool / read_file_tool / list_files_tool。
 ⚠️ vector 导入必须保持函数内 lazy（`import src.cli` 不得拉起 chromadb）。
 """
 
+import hashlib
 import re
 import time
 from datetime import datetime
@@ -395,7 +396,8 @@ def save_file_tool(path: str, content: str) -> dict:
         kind = "reports"
     else:
         kind = "other"
-    audit("artifact_write", kind=kind, path=path, bytes=len(content.encode("utf-8")))
+    audit("artifact_write", kind=kind, path=path, bytes=len(content.encode("utf-8")),
+          content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest()[:12])
     return {
         "path": str(full_path),
         "size": len(content),

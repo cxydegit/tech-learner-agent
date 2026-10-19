@@ -44,14 +44,27 @@ def replace_time_line(report: str, label: str, now: str) -> str:
 # ============================================================
 
 
+def _cached_tokens(usage) -> int | None:
+    """取 prompt 缓存命中 token 数；不同网关字段名不同，取不到返回 None。"""
+    if usage is None:
+        return None
+    details = getattr(usage, "prompt_tokens_details", None)
+    value = getattr(details, "cached_tokens", None) if details is not None else None
+    if value is None:
+        value = getattr(usage, "prompt_cache_hit_tokens", None)
+    return int(value) if isinstance(value, int) else None
+
+
 def _log_call(call_site: str, attempt: int, elapsed: float, *, status: str,
               kind: str = "ok", http: int | None = None,
               finish_reason: str | None = None, usage=None,
+              max_tokens: int | None = None,
               fallback: bool = False, error: str = "") -> None:
     """记一次 LLM 请求（含失败与降级）。
 
     attempt=1..N 是工具调用通道的第几次尝试；attempt=0 且 fallback=True 表示降级那次请求。
     finish_reason 是「截断」的直接实锤（length=撞 max_tokens），elapsed_s 是「慢」的直接实锤。
+    max_tokens 记本次上限，读侧才能区分"预算上限"与"意外截断"；cached_tokens 记缓存命中。
     """
     audit("llm_call",
           site=call_site or "unknown",
@@ -63,6 +76,8 @@ def _log_call(call_site: str, attempt: int, elapsed: float, *, status: str,
           finish_reason=finish_reason,
           prompt_tokens=getattr(usage, "prompt_tokens", None),
           completion_tokens=getattr(usage, "completion_tokens", None),
+          max_tokens=max_tokens,
+          cached_tokens=_cached_tokens(usage),
           fallback=fallback,
           error=error[:200])
 
@@ -124,9 +139,10 @@ def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | No
     Returns:
         LLM 生成的文本（若传入 truncation_notice 且被截断，末尾带该标注）
     """
+    max_tokens_eff = max_tokens or config.LLM_MAX_TOKENS
     kwargs: dict = {
         "model": config.LLM_MODEL,
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+        "max_tokens": max_tokens_eff,
         "temperature": 0.5 if temperature is None else temperature,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -141,11 +157,13 @@ def generate_text(system_prompt: str, user_content: str, *, max_tokens: int | No
     except Exception as e:  # noqa: BLE001 —— 记完就抛，由调用方决定降级（不在这里吞）
         _log_call(call_site, 1, time.monotonic() - start, status="error",
                   kind=_classify(e), http=getattr(e, "status_code", None),
+                  max_tokens=max_tokens_eff,
                   error=f"{type(e).__name__}: {e}")
         raise
     finish = response.choices[0].finish_reason
     _log_call(call_site, 1, time.monotonic() - start, status="ok",
-              finish_reason=finish, usage=getattr(response, "usage", None))
+              finish_reason=finish, usage=getattr(response, "usage", None),
+              max_tokens=max_tokens_eff)
     text = response.choices[0].message.content
     if finish == "length":
         # 截断是数据质量事件，用 WARNING 让它从常规 INFO 里跳出来
@@ -319,10 +337,11 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
         - 超时（LLM_REQUEST_TIMEOUT）：立即抛 ToolCallError，不重试也不降级
         - 代码 bug（响应解析等非 SDK 异常）：原样抛出，不包装、不重试
     """
+    max_tokens_eff = max_tokens or config.LLM_MAX_TOKENS
     kwargs: dict = {
         "model": config.LLM_MODEL,
         "temperature": 0.5,
-        "max_tokens": max_tokens or config.LLM_MAX_TOKENS,
+        "max_tokens": max_tokens_eff,
         "messages": [{"role": "system", "content": system_prompt}, *messages],
     }
     client = _get_client()
@@ -339,13 +358,15 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
             parsed = _parse_chat_response(response.choices[0].message, call_site=call_site)
             _log_call(call_site, attempt + 1, time.monotonic() - start, status="ok",
                       finish_reason=response.choices[0].finish_reason,
-                      usage=getattr(response, "usage", None))
+                      usage=getattr(response, "usage", None),
+                      max_tokens=max_tokens_eff)
             parsed["fallback"] = False
             return parsed
         except Exception as e:  # noqa: BLE001 —— 按错误性质分流，见 _classify
             kind = _classify(e)
             _log_call(call_site, attempt + 1, time.monotonic() - start, status="error",
                       kind=kind, http=getattr(e, "status_code", None),
+                      max_tokens=max_tokens_eff,
                       error=f"{type(e).__name__}: {e}")
             if kind == _TIMEOUT:
                 # 超时直接失败：不重试、也不降级（降级仍是同一条流水线上的又一次完整生成）
@@ -371,12 +392,14 @@ def chat_with_tools(system_prompt: str, messages: list[dict], tools: list[dict],
             parsed = _parse_chat_response(response.choices[0].message, call_site=call_site)
             _log_call(call_site, 0, time.monotonic() - start, status="ok", fallback=True,
                       finish_reason=response.choices[0].finish_reason,
-                      usage=getattr(response, "usage", None))
+                      usage=getattr(response, "usage", None),
+                      max_tokens=max_tokens_eff)
             parsed["fallback"] = True
             return parsed
         except Exception as e:  # noqa: BLE001 —— 降级也失败，只能上报
             _log_call(call_site, 0, time.monotonic() - start, status="error", fallback=True,
                       kind=_classify(e), http=getattr(e, "status_code", None),
+                      max_tokens=max_tokens_eff,
                       error=f"{type(e).__name__}: {e}")
             last_err = e
     if last_err is None:  # 首次请求前预算就耗尽：没有真实错误可报，是配置问题

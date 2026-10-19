@@ -384,6 +384,7 @@ docs/        工程记录（事故复盘 / 评测报告 / 优化日志，见 doc
 | `EMBEDDING_BASE_URL` / `EMBEDDING_API_KEY` | 回落 `OPENAI_*`    | 独立 embedding 端点（chat / embedding 异源，可选）    |
 | `EMBEDDING_BATCH_SIZE`                 | `10`                  | embedding 单请求批量上限（10=百炼限额，换服务可调大）        |
 | `WEB_HOST` / `WEB_PORT`                | `127.0.0.1` / `8000` | Web 服务地址                            |
+| `AUDIT_LOG_DIR` / `AUDIT_LOG_NAME`     | `logs` / `audit.jsonl` | 审计日志目录与文件名（评测脚本用 `<run_id>.jsonl` 一次一份） |
 | `AUDIT_LOG_MAX_BYTES` / `AUDIT_LOG_BACKUPS` | `5242880` / `5` | 审计日志（`logs/audit.jsonl`）单文件上限与轮转保留数          |
 
 ***

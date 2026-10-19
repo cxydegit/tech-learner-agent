@@ -371,6 +371,45 @@ def test_runtime_context_injects_milestone_pending_block():
     assert route_mod.coach_runtime_context({"mode": "coaching", "roadmap": None}) is None
 
 
+def test_coach_turn_start_increments_and_emits(audit_events):
+    out = graph_mod.coach_turn_start({
+        "coach_turn_index": 2, "turn_source": "test", "tech": "Spring",
+    })
+    assert out["coach_turn_index"] == 3
+    event = [e for e in audit_events if e.get("event") == "user_turn"][-1]
+    assert event["turn"] == 3
+    assert event["chars"] == len("Spring")
+    assert event["source"] == "test"
+
+
+def test_coach_human_increments_turn(monkeypatch, audit_events):
+    monkeypatch.setattr(graph_mod, "interrupt", lambda x: "继续")
+    out = graph_mod.coach_human({
+        "mode": "coaching",
+        "coach_messages": [{"role": "assistant", "content": "总结"}],
+        "coach_turn_index": 2,
+    })
+    assert out["coach_turn_index"] == 3
+    event = [e for e in audit_events if e.get("event") == "user_turn"][-1]
+    assert event["turn"] == 3
+    assert event["chars"] == len("继续")
+    assert event["source"] == "resume"
+
+
+def test_graph_turn_index_monotonic(monkeypatch, audit_events):
+    monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_survey_chat)
+    graph = build_graph(InMemorySaver())
+    gconfig = {"configurable": {"thread_id": "test-turn-index"}}
+    replies = ["5", "Java Maven", "跑通最小项目", "2小时", "B", "C", "结束"]
+    final, _ = _run(graph, gconfig, {"command": "route", "tech": "Spring Boot"}, replies)
+    events = [e for e in audit_events if e.get("event") == "user_turn"]
+    turns = [e["turn"] for e in events]
+    assert turns == list(range(1, len(replies) + 2))
+    assert all("mode" in e for e in events)
+    assert any(e.get("mode") == "survey" for e in events)
+    assert final["coach_turn_index"] == len(replies) + 1
+
+
 def test_coach_human_clears_milestone_pending(monkeypatch):
     """用户回复后清空待确认标记（一次性闸门）+ 验收拒绝计数清零（节流只限本回合）。"""
     monkeypatch.setattr(graph_mod, "interrupt", lambda x: "可以")

@@ -88,6 +88,17 @@ def test_above_threshold_injected(monkeypatch):
     ]
 
 
+def test_kb_inject_event(monkeypatch, audit_events):
+    """注入判定要留痕：命中/低于阈值/元问题/错误各有 reason。"""
+    monkeypatch.setattr(route_mod, "_search_notes", lambda q, k, t: _seed_hits())
+    monkeypatch.setattr(config, "ROUTE_KB_INJECT_SIM", 0.5)
+    route_mod.run_kb_retrieve("X", "Bean 生命周期")
+    event = [e for e in audit_events if e.get("event") == "kb_inject"][-1]
+    assert event["reason"] == "hit"
+    assert event["injected_count"] == 2
+    assert event["top_sim"] == 0.90
+
+
 def test_snippet_cap(monkeypatch):
     """注入篇数上限：超过 ROUTE_KB_SNIPPETS 只取前 N **篇**。"""
     hits = [{"path": f"p{i}", "similarity": 0.9 - i * 0.1, "document": f"d{i}"} for i in range(5)]

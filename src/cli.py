@@ -437,6 +437,10 @@ def _drive(graph, gconfig, payload, render: str = "plain") -> dict:
 
     from .graph import web_progress
 
+    # 新命令（dict）带来源；resume 用 Command，来源由 coach_human 自报。
+    if isinstance(payload, dict):
+        payload = {**payload, "turn_source": "cli"}
+
     thread_id = (gconfig.get("configurable") or {}).get("thread_id")
     while True:
         # recursion_limit 是运行 config 的一部分（防 coach 循环失控打转）

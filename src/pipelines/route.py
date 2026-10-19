@@ -8,6 +8,7 @@ schema、工具执行（大内容写文件、出入参短，工具可经 ctx.upd
 """
 
 import re
+import time
 
 from ..adapters import learner
 from ..adapters.audit import audit
@@ -816,14 +817,29 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
     检索异常（RAG 未索引 / Chroma 异常）优雅降级为空——模型用自己的知识正常回答。
     """
     question = (question or "").strip()
+    started = time.monotonic()
+
+    def _record(reason: str, hits_count: int = 0, top_sim: float | None = None,
+                injected: int = 0) -> None:
+        audit("kb_inject", tech=tech or "", question_chars=len(question),
+              hits=hits_count, top_sim=top_sim, injected_count=injected,
+              reason=reason, elapsed_s=round(time.monotonic() - started, 1))
+
     if not tech or not question:
+        _record("no_tech_or_question")
         return []
     if _is_meta_question(question):
+        _record("meta_question")
         return []
     try:
         hits = _search_notes(question, config.QA_RECALL_CHUNKS, tech)
     except Exception:  # noqa: BLE001 —— RAG 未索引 / Chroma 异常时降级为空
+        _record("retrieve_error")
         return []
+    top_sim = max(
+        (rel for rel in (_hit_relevance(h) for h in hits) if rel is not None),
+        default=None,
+    )
     out: list[dict] = []
     seen: set[str] = set()
     for h in hits:
@@ -840,6 +856,8 @@ def run_kb_retrieve(tech: str, question: str) -> list[dict]:
         out.append({"path": note, "snippet": snippet[:config.QA_SNIPPET_CHARS]})
         if len(out) >= config.ROUTE_KB_SNIPPETS:
             break
+    reason = "no_hits" if not hits else ("hit" if out else "below_threshold")
+    _record(reason, len(hits), top_sim, len(out))
     return out
 
 
