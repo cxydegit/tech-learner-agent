@@ -7,10 +7,18 @@
 
 import { escapeHtml } from "./markdown.js";
 
+/* 卡片线性图标（SVG 字面量，颜色由 CSS 的 --accent-c 控制） */
+const ICONS = {
+  folderPlus: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="12" y1="11" x2="12" y2="17"/><line x1="9" y1="14" x2="15" y2="14"/></svg>`,
+  doc: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
+  chatLines: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><line x1="8" y1="9" x2="16" y2="9"/><line x1="8" y1="13" x2="12" y2="13"/></svg>`,
+  target: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5"/></svg>`,
+};
+
 export const CARDS = [
   {
-    cmd: "collect", icon: "📚", label: "学习新技术", desc: "搜集资料清单",
-    accent: "#4A7A78", soft: "#E6EFED",
+    cmd: "collect", icon: ICONS.folderPlus, label: "收集深度资料", desc: "单次生成 · 输入主题，快速生成资料清单",
+    accent: "#6FA8DC", soft: "rgba(111,168,220,.05)", border: "#6FA8DC",
     fields: [
       { name: "tech", label: "技术名", ph: "如 FastAPI", req: true },
       { name: "focus", label: "关注点", ph: "如 异步编程（可选）", req: false },
@@ -18,24 +26,24 @@ export const CARDS = [
     btn: "开始收集",
   },
   {
-    cmd: "read", icon: "📖", label: "解读文档", desc: "读懂一篇文档",
-    accent: "#8A6B4F", soft: "#F2EAE1",
+    cmd: "read", icon: ICONS.doc, label: "解读文档", desc: "读懂一篇文档 · 上传或粘贴文档，解析核心",
+    accent: "#5FB3A3", soft: "rgba(95,179,163,.05)", border: "#5FB3A3",
     fields: [
       { name: "url", label: "链接", ph: "https://…", req: true },
     ],
     btn: "开始解读",
   },
   {
-    cmd: "ask", icon: "💬", label: "问我的笔记", desc: "联想检索回答",
-    accent: "#4A628A", soft: "#E7ECF4",
+    cmd: "ask", icon: ICONS.chatLines, label: "问我的笔记", desc: "联想检索回答 · 基于已有笔记，关联回答",
+    accent: "#9B8CD9", soft: "rgba(155,140,217,.05)", border: "#9B8CD9",
     fields: [
       { name: "question", label: "问题", ph: "如 笔记里提到过异步和协程吗？", req: true },
     ],
     btn: "提问",
   },
   {
-    cmd: "route", icon: "🧭", label: "定制路线", desc: "问卷 + 路线 + 陪练",
-    accent: "#8A5A6B", soft: "#F3E9EC",
+    cmd: "route", icon: ICONS.target, label: "定制路线", desc: "问卷 + 路线 + 陪练 · 多轮定制路径",
+    accent: "#D98CB0", soft: "rgba(217,140,176,.05)", border: "#D98CB0",
     fields: [
       { name: "tech", label: "技术名", ph: "如 Spring Boot", req: true },
     ],

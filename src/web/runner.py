@@ -119,6 +119,9 @@ def _worker(thread_id: str, payload: Any) -> None:
 
 def _start(thread_id: str, payload: Any) -> str | None:
     """启动后台图执行；已有活跃任务返回错误消息，否则返回 None（成功启动）。"""
+    # 新命令（dict）带来源；resume 用 Command，来源由 coach_human 自报。
+    if isinstance(payload, dict):
+        payload = {**payload, "turn_source": "web"}
     job = _job(thread_id)
     with job.lock:
         if job.active:

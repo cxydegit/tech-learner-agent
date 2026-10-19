@@ -167,6 +167,13 @@ def get_session(thread_id: str) -> dict | None:
     if tup is None:
         return None
     values = _get_state_values(tup)
+    # 定制路线的机器态 + 人读 Markdown：前端「路线」按钮直接用 markdown 渲染，
+    # 与 roadmaps/<tech>-roadmap.md 同源（渲染函数在 domain 层，惰性导入保持本模块轻量）
+    roadmap = values.get("roadmap") or None
+    roadmap_markdown = ""
+    if roadmap:
+        from ..domain.roadmap import roadmap_to_markdown
+        roadmap_markdown = roadmap_to_markdown(roadmap)
     result = {
         "thread_id": thread_id,
         "conversation": values.get("conversation") or [],
@@ -179,6 +186,8 @@ def get_session(thread_id: str) -> dict | None:
             "noted_count": values.get("noted_count") or 0,
             "materials_path": values.get("materials_path") or "",
             "qa_history": values.get("qa_history") or [],
+            "roadmap": roadmap,
+            "roadmap_markdown": roadmap_markdown,
         },
     }
     pending = _pending_interrupt(tup)

@@ -13,12 +13,19 @@ import {
 import { CARDS, cardByCmd, buildFormHTML, collectPayload } from "../cards.js";
 import { mdToHtml, escapeHtml } from "../markdown.js";
 import { navigate } from "../router.js";
-import { closeReader, openDoc } from "./reader.js";
+import { closeReader, openDoc, openMarkdown } from "./reader.js";
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
 const CHIP_LABEL = { collect: "查看资料清单", read: "阅读全文", qa: "查看来源笔记" };
+
+/* 消息流内联小图标（SVG 字面量，颜色随文字/按钮） */
+const ICON_FILE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`;
+const ICON_BOOK = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>`;
+const ICON_EDIT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`;
+/* 卡片右侧 chevron：固定 20×20 观感色（描边 #D1D5DB / 线宽 1.5），不随卡片功能色变化 */
+const ICON_CHEVRON = `<svg viewBox="0 0 24 24" fill="none" stroke="#D1D5DB" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>`;
 
 let expandedCmd = null;      // 当前展开的卡片
 let lastCollect = { tech: "", focus: "" }; // 记忆回填上次 collect 的技术名
@@ -79,13 +86,12 @@ export function renderChat() {
   const body = $("#chatBody");
   const title = $("#chatTitle");
   const meta = $("#chatMeta");
+  syncRoadmapBtn();
   const s = activeSession();
   if (!s) {
-    title.textContent = "学习之旅";
+    title.textContent = "新会话";
     meta.textContent = "";
-    body.innerHTML =
-      `<div class="chat-empty"><div class="big">📚</div>` +
-      `还没有会话——点「＋ 新建会话」开始</div>`;
+    renderWelcome();
     return;
   }
   title.textContent = s.title || "新会话";
@@ -95,9 +101,7 @@ export function renderChat() {
   const conversation = (active && active.conversation) || [];
 
   if (!conversation.length) {
-    body.innerHTML =
-      `<div class="chat-empty"><div class="big">📚</div>` +
-      `新会话已就绪——选一张卡片开始学习</div>`;
+    renderWelcome();
     return;
   }
 
@@ -115,10 +119,10 @@ export function renderChat() {
       html += `<div class="md-body">${mdToHtml(m.content)}</div>`;
       if (m.doc) {
         html += `<button class="doc-chip" data-doc="${escapeHtml(m.doc)}">` +
-          `📄 ${CHIP_LABEL[m.type] || CHIP_LABEL[m.doc_type] || "阅读全文"} ↗</button>`;
+          `${ICON_FILE} ${CHIP_LABEL[m.type] || CHIP_LABEL[m.doc_type] || "阅读全文"} ↗</button>`;
       }
       if (m.sources && m.sources.length) {
-        html += `<div class="source-cards"><div class="sc-label">📚 来源笔记</div><div class="sc-list">`;
+        html += `<div class="source-cards"><div class="sc-label">${ICON_BOOK} 来源笔记</div><div class="sc-list">`;
         for (const s of m.sources) {
           const name = s.path
             ? (s.path.split("/").pop() || "").replace(/\.md$/, "")
@@ -140,7 +144,7 @@ export function renderChat() {
   if (readDone && !noteRunning && !notePending[activeId]) {
     html += `<div class="note-reminder"><div class="nr-row">` +
       `<span class="nr-text">本次解读完成，是否沉淀为知识笔记？</span>` +
-      `<button class="nr-btn" data-note type="button">📝 一键沉淀</button></div></div>`;
+      `<button class="nr-btn" data-note type="button">${ICON_EDIT} 一键沉淀</button></div></div>`;
   }
   html += `</div>`;
   body.innerHTML = html;
@@ -151,7 +155,27 @@ export function renderChat() {
     btn.addEventListener("click", () => openDoc(btn.getAttribute("data-doc"))));
   $$(".source-cards .sc-item").forEach((btn) =>
     btn.addEventListener("click", () => openDoc(btn.getAttribute("data-src"), { badge: "笔记" })));
+  // 消息流重渲染后同步输入区：会话详情异步到达，此处一并刷新底部卡片的显隐
+  renderInputZone();
   scrollChatBottom();
+}
+
+/* 顶栏「路线」按钮：仅当前会话已生成 roadmap 时出现 */
+function syncRoadmapBtn() {
+  const btn = $("#btnRoadmap");
+  if (!btn) return;
+  const { active } = getState();
+  const roadmap = active && active.state ? active.state.roadmap : null;
+  btn.classList.toggle("hidden", !roadmap);
+}
+
+/* 右侧阅读器展示当前路线：Markdown 由后端按 roadmap 机器态渲染，与 roadmaps/*-roadmap.md 同源 */
+function showRoadmap() {
+  const { active } = getState();
+  const st = (active && active.state) || {};
+  if (!st.roadmap) return;
+  const title = `${st.tech || st.roadmap.tech || "学习"} 学习路线`;
+  openMarkdown(title, st.roadmap_markdown, "路线");
 }
 
 function fmtTime(ts) {
@@ -257,19 +281,47 @@ export async function removeSession(id) {
    输入区：场景卡片 + 表单
    ============================================================ */
 
-export function renderInputZone() {
-  const zone = $("#inputZone");
-  if (!zone) return;
+/* 一次性功能：一问一答，AI 输出结束后可再次选择；route 为多轮陪练不在此列 */
+const ONCE_CMDS = ["collect", "read", "ask"];
+
+/* 会话命令模式（从 conversation 的 assistant 消息 type 推断，见 graph.py _conversation）：
+   出现 route/coach 消息 = 多轮陪练会话；出现 collect/read/qa = 一次性功能会话；无消息 = 空 */
+function conversationMode(conversation) {
+  for (const m of conversation || []) {
+    if (m.role !== "assistant") continue;
+    if (m.type === "route" || m.type === "coach") return "route";
+    if (m.type === "collect" || m.type === "read" || m.type === "qa") return "once";
+  }
+  return null;
+}
+
+/* 空会话欢迎页：大标题 + 副标题 + 场景卡片，居中占主区（设计稿空状态） */
+function renderWelcome() {
+  const body = $("#chatBody");
+  body.innerHTML =
+    `<div class="welcome">` +
+    `<h1 class="welcome-title">今天想学什么？</h1>` +
+    `<p class="welcome-sub">选一个方式，开始学习新主题或回顾已有笔记</p>` +
+    `<div class="welcome-cards"></div></div>`;
+  renderCardsInto(body.querySelector(".welcome-cards"));
+}
+
+/* 渲染场景卡片（+ 展开的表单）到指定容器并绑定事件。
+   欢迎页与底部输入区共用同一套模板与事件逻辑，仅容器/卡片集不同。 */
+function renderCardsInto(host, opts = {}) {
+  if (!host) return;
   const { activeId } = getState();
+  const cards = opts.only ? CARDS.filter((c) => opts.only.includes(c.cmd)) : CARDS;
   let html = `<div class="zone-a"><div class="cards-a">`;
-  for (const c of CARDS) {
+  for (const c of cards) {
     const active = expandedCmd === c.cmd ? " active-card" : "";
     const dis = c.disabled ? " disabled" : "";
     html += `<div class="card${active}${dis}" data-cmd="${c.cmd}" ` +
-      `style="--accent-c:${c.accent};--soft-c:${c.soft}">` +
+      `style="--accent-c:${c.accent};--soft-c:${c.soft};--border-c:${c.border}">` +
       `<span class="card-icon">${c.icon}</span>` +
-      `<span class="card-label">${c.label}</span>` +
-      `<span class="card-desc">${c.desc}</span></div>`;
+      `<span class="card-text"><span class="card-label">${c.label}</span>` +
+      `<span class="card-desc">${c.desc}</span></span>` +
+      `<span class="card-arrow">${ICON_CHEVRON}</span></div>`;
   }
   html += `</div>`;
   if (expandedCmd) {
@@ -277,9 +329,9 @@ export function renderInputZone() {
     if (card && !card.disabled) html += buildFormHTML(card, lastCollect);
   }
   html += `</div>`;
-  zone.innerHTML = html;
+  host.innerHTML = html;
 
-  $$("#inputZone .card").forEach((el) => {
+  host.querySelectorAll(".card").forEach((el) => {
     el.addEventListener("click", () => {
       const cmd = el.getAttribute("data-cmd");
       const card = cardByCmd(cmd);
@@ -289,7 +341,7 @@ export function renderInputZone() {
     });
   });
 
-  $$("#inputZone .form-panel").forEach((panel) => {
+  host.querySelectorAll(".form-panel").forEach((panel) => {
     const cmd = panel.getAttribute("data-cmd");
     panel.querySelector(".btn-primary").addEventListener("click", () => submitCard(cmd, panel));
     panel.querySelector(".fh-close").addEventListener("click", () => {
@@ -304,8 +356,33 @@ export function renderInputZone() {
     });
   });
 
-  const first = zone.querySelector(".form-panel input");
+  const first = host.querySelector(".form-panel input");
   if (first) first.focus();
+}
+
+/* 单点收口，三分支：
+   - 空会话：卡片走欢迎页容器，底部输入区隐藏；
+   - 会话内 + 一次性功能（collect/read/ask）+ 无任务在跑/无待确认：底部浮现三枚迷你卡供再次选择；
+   - 其余（route 陪练会话 / 任务运行中 / 待确认沉淀 / 待答 coach）：底部不出现卡片。
+   事件回调与提交流程的调用点无需感知差异。 */
+export function renderInputZone() {
+  const zone = $("#inputZone");
+  if (!zone) return;
+  const wrap = document.querySelector(".input-wrap");
+  const { active, activeId } = getState();
+  const conversation = (active && active.conversation) || [];
+  const empty = !activeSession() || !conversation.length;
+  if (wrap) wrap.classList.toggle("hidden", empty);
+  if (empty) {
+    zone.innerHTML = "";
+    renderCardsInto(document.querySelector(".welcome-cards"));
+    return;
+  }
+  if (isBusy(activeId) || conversationMode(conversation) !== "once") {
+    zone.innerHTML = "";
+    return;
+  }
+  renderCardsInto(zone, { only: ONCE_CMDS });
 }
 
 /* ============================================================
@@ -476,7 +553,7 @@ function runStatusEl() {
 
 function showRunStatus() {
   const el = runStatusEl();
-  el.innerHTML = `<div class="run-title">⏳ 执行中…</div><div class="run-progress"></div>`;
+  el.innerHTML = `<div class="run-title">执行中…</div><div class="run-progress"></div>`;
   el.hidden = false;
   scrollChatBottom();
 }
@@ -500,7 +577,7 @@ function showInterrupt(payload) {
   const el = runStatusEl();
   el.innerHTML =
     `<div class="interrupt-panel">` +
-    `<div class="interrupt-title">🧭 需要你决定如何处理相似笔记</div>` +
+    `<div class="interrupt-title">需要你决定如何处理相似笔记</div>` +
     `<pre class="interrupt-payload">${escapeHtml(payload || "")}</pre>` +
     `<div class="interrupt-actions">` +
     `<button class="btn-primary" data-answer="all" type="button">全部合并</button>` +
@@ -542,8 +619,8 @@ function appendAiMessage(content, doc, docType) {
   div.className = "msg-ai";
   let chip = "";
   if (doc) {
-    chip = `<button class="doc-chip" data-doc="${escapeHtml(doc)}">` +
-      `📄 ${CHIP_LABEL[docType] || "阅读全文"} ↗</button>`;
+  chip = `<button class="doc-chip" data-doc="${escapeHtml(doc)}">` +
+        `${ICON_FILE} ${CHIP_LABEL[docType] || "阅读全文"} ↗</button>`;
   }
   div.innerHTML = `<div class="bubble"><div class="msg-meta"><span class="msg-role">AI 学习助手</span>` +
     `<span>${escapeHtml(fmtTime(new Date().toISOString()))}</span></div>` +
@@ -563,13 +640,13 @@ function showCoachReplyInput() {
   const inputHtml =
     `<div class="interrupt-panel coach-panel">` +
     `<div class="interrupt-custom coach-reply">` +
-    `<input id="coachReply" type="text" placeholder="回复陪练…（输入 结束 可退出）" />` +
+    `<textarea id="coachReply" rows="1" placeholder="回复陪练…（Enter 发送，Shift+Enter 换行）"></textarea>` +
     `<button class="btn-primary" data-coach-send type="button">发送</button>` +
     `</div></div>`;
   const progress = el.querySelector(".run-progress");
   if (progress) {
     const title = el.querySelector(".run-title");
-    if (title) title.textContent = "⌨️ 等你回复";
+    if (title) title.textContent = "等你回复";
     const panel = document.createElement("div");
     panel.innerHTML = inputHtml;
     el.appendChild(panel.firstChild);
@@ -579,6 +656,14 @@ function showCoachReplyInput() {
   el.hidden = false;
   scrollChatBottom();
   const input = el.querySelector("#coachReply");
+  // 随内容自动增高：先归零量出真实高度，超过 180px 转为内部滚动
+  const autoGrow = () => {
+    input.style.height = "auto";
+    const full = input.scrollHeight;
+    input.style.height = Math.min(full, 180) + "px";
+    input.style.overflowY = full > 180 ? "auto" : "hidden";
+    input.scrollIntoView({ block: "nearest" }); // 变高后保证输入框仍在可视区
+  };
   const send = () => {
     const v = (input.value || "").trim();
     if (!v) return;
@@ -586,7 +671,15 @@ function showCoachReplyInput() {
     resume(v);
   };
   el.querySelector("[data-coach-send]").addEventListener("click", send);
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  input.addEventListener("input", autoGrow);
+  input.addEventListener("keydown", (e) => {
+    // Enter 发送、Shift+Enter 换行；输入法组合态的回车只用于选词
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      send();
+    }
+  });
+  autoGrow();
   input.focus();
 }
 
@@ -667,6 +760,7 @@ export function initChat() {
     if (state.view === "chat" && !state.active) renderChat();
   });
   $("#btnNewSession").addEventListener("click", newSession);
+  $("#btnRoadmap").addEventListener("click", showRoadmap);
   renderAll();
 }
 

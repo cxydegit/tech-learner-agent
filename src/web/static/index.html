@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>学习陪练 · Tech Learner Agent</title>
-<link rel="stylesheet" href="css/style.css" />
+<link rel="stylesheet" href="css/style.css?v=18" />
 </head>
 <body>
 <div class="app">
@@ -12,18 +12,19 @@
   <!-- 左侧：会话列表 -->
   <aside class="sidebar">
     <div class="sidebar-head">
-      <div class="logo"><span class="logo-mark">◇</span>学习之旅</div>
+      <div class="logo">学习之旅</div>
       <button class="btn-new" id="btnNewSession" type="button">＋ 新建会话</button>
     </div>
+    <div class="lib-label session-label">最近</div>
     <nav class="session-list" id="sessionList" aria-label="历史会话"></nav>
     <nav class="lib-nav" id="libNav" aria-label="资料库">
       <div class="lib-label">资料库</div>
-      <a class="lib-item" href="#/docs/materials">📁 学习资料</a>
-      <a class="lib-item" href="#/docs/reports">📄 解读报告</a>
-      <a class="lib-item" href="#/docs/knowledge">📝 知识笔记</a>
+      <a class="lib-item" href="#/docs/materials"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>学习资料</a>
+      <a class="lib-item" href="#/docs/reports"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>解读报告</a>
+      <a class="lib-item" href="#/docs/knowledge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>知识笔记</a>
     </nav>
     <div class="sidebar-foot">
-      <div class="foot-note">学习陪练<br/>本地学习会话 · 数据持久化</div>
+      <div class="foot-note">本地学习会话 · 数据持久化</div>
     </div>
   </aside>
 
@@ -31,10 +32,13 @@
   <main class="main">
     <header class="chat-head">
       <div class="chat-head-title">
-        <span class="chat-title" id="chatTitle">FastAPI 异步编程</span>
+        <span class="chat-title" id="chatTitle">新会话</span>
         <span class="chat-meta" id="chatMeta"></span>
       </div>
-      <button class="btn-ghost" id="btnToggleReader" type="button">📂 阅读器</button>
+      <div class="chat-head-actions">
+        <button class="btn-ghost hidden" id="btnRoadmap" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 17V9a4 4 0 0 1 4-4h4"/><path d="M18 7v8a4 4 0 0 1-4 4h-4"/></svg><span>路线</span></button>
+        <button class="btn-ghost" id="btnToggleReader" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg><span>阅读器</span></button>
+      </div>
     </header>
     <section class="chat-body" id="chatBody" aria-live="polite"></section>
     <div class="input-wrap">
@@ -55,6 +59,6 @@
 
 </div>
 
-<script type="module" src="js/main.js"></script>
+<script type="module" src="js/main.js?v=18"></script>
 </body>
 </html>

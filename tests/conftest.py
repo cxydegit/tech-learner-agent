@@ -20,6 +20,9 @@ from src.config import config
 def _audit_log_to_tmp(tmp_path, monkeypatch):
     """把审计日志重定向到本用例的 tmp_path，跑完还原。"""
     monkeypatch.setattr(config, "AUDIT_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(config, "AUDIT_LOG_NAME", "audit.jsonl")
+    monkeypatch.setenv("AUDIT_ORIGIN", "test")
+    monkeypatch.delenv("AUDIT_RUN_ID", raising=False)
     audit_mod.configure_audit_log()
     yield
     audit_mod.configure_audit_log()
