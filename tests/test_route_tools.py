@@ -258,7 +258,7 @@ def _roadmap():
 def test_update_roadmap_completes_and_advances(monkeypatch):
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(),
                     "conversation": [{"role": "assistant", "type": "coach",
                                       "content": "先安装依赖，再跑通 hello world"},
@@ -268,8 +268,10 @@ def test_update_roadmap_completes_and_advances(monkeypatch):
     assert out["status"] == "ok"
     # s1 还有 s1-m2 未完成 → 阶段不推进
     assert ctx.updates["roadmap"]["current_stage"] == "s1"
+    # 同阶段内允许连续勾选（新规则），勾完 s1 后自动推进到 s2
     out2 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True}, ctx)
-    assert out2["status"] == "rejected"  # 闸 1：s1-m1 刚勾、还在等用户确认 → 批量勾选拒绝
+    assert out2["status"] == "ok"
+    assert ctx.updates["roadmap"]["current_stage"] == "s2"
 
 
 def test_update_roadmap_unknown_milestone(monkeypatch):
@@ -289,7 +291,7 @@ def test_update_roadmap_sets_milestone_pending(monkeypatch):
     """勾选里程碑且用户上一条回复不是推进指令 → 设待确认卡点 + note 要求总结询问。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(),
                     "conversation": [{"role": "assistant", "type": "coach",
                                       "content": "先安装依赖，再跑通 hello world"}],
@@ -305,7 +307,7 @@ def test_update_roadmap_skips_pending_on_advance_directive(monkeypatch):
     """用户上一条已明确「直接推进」→ 免确认，不设卡点。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(),
                     "conversation": [{"role": "assistant", "type": "coach",
                                       "content": "先安装依赖，再跑通 hello world"}],
@@ -389,7 +391,7 @@ def test_update_roadmap_verification_rejects_uncovered(monkeypatch):
     """对话记录无实质完成内容 → LLM 验收拒绝，缺失项回喂（不落盘、不设 pending）。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": False, "missing": ["安装依赖未完成"],
+                        lambda d, t, m="": {"verified": False, "missing": ["安装依赖未完成"],
                                       "reason": "只提到跑通，没提安装"})
     ctx = _gate_ctx()
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
@@ -402,7 +404,7 @@ def test_update_roadmap_verification_pass(monkeypatch):
     """验收通过 → 落盘 + 设 pending（用户无推进指令时）。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": "内容覆盖"})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": "内容覆盖"})
     ctx = _gate_ctx()
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out["status"] == "ok"
@@ -414,7 +416,7 @@ def test_update_roadmap_verifier_degrades_open(monkeypatch):
     """验收器自身故障（verified=None）→ 降级放行，不卡死流程。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": None, "missing": [], "reason": "异常"})
+                        lambda d, t, m="": {"verified": None, "missing": [], "reason": "异常"})
     ctx = _gate_ctx()
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out["status"] == "ok"
@@ -424,7 +426,7 @@ def test_update_roadmap_claim_exempts_verification(monkeypatch):
     """用户明确声明完成（对话外完成）→ 跳过验收直接勾选。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: (_ for _ in ()).throw(AssertionError("豁免时不应调 LLM 验收")))
+                        lambda d, t, m="": (_ for _ in ()).throw(AssertionError("豁免时不应调 LLM 验收")))
     ctx = _gate_ctx(user_msg="我在本地都搞定了，直接勾吧")
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out["status"] == "ok"
@@ -435,7 +437,7 @@ def test_update_roadmap_self_report_exempts_verification(monkeypatch):
     """认知型待办的自述证据（「我脑子里过了一遍」）→ 跳过验收直接勾选。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: (_ for _ in ()).throw(AssertionError("豁免时不应调 LLM 验收")))
+                        lambda d, t, m="": (_ for _ in ()).throw(AssertionError("豁免时不应调 LLM 验收")))
     ctx = _gate_ctx(user_msg="我脑子里过了一遍，就不一一回答你了")
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out["status"] == "ok"
@@ -446,7 +448,7 @@ def test_update_roadmap_advance_only_returns_not_checked(monkeypatch):
     """用户只给推进指令、没声明掌握 → 不勾选，返回「未勾选 + 可随时命令勾选」话术。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": False, "missing": ["安装依赖未完成"],
+                        lambda d, t, m="": {"verified": False, "missing": ["安装依赖未完成"],
                                       "reason": "只有推进指令，无掌握证据"})
     ctx = _gate_ctx(user_msg="直接下一步")
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
@@ -460,24 +462,125 @@ def test_update_roadmap_disabled_by_config(monkeypatch):
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(config, "ROUTE_MILESTONE_VERIFY", False)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: (_ for _ in ()).throw(AssertionError("关闭时不应调 LLM 验收")))
+                        lambda d, t, m="": (_ for _ in ()).throw(AssertionError("关闭时不应调 LLM 验收")))
     ctx = _gate_ctx()
     out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out["status"] == "ok"
 
 
-def test_update_roadmap_batch_guard(monkeypatch):
-    """同回合第二个勾选被拒绝（截图事故：一轮勾满所有里程碑架空确认闸门）。"""
+def test_update_roadmap_same_stage_unlimited_cross_stage_rejected(monkeypatch):
+    """同阶段可连勾多个；阶段完成后同轮再勾下一阶段 → 跨阶段拒绝。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     ctx = _gate_ctx()
     out1 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
     assert out1["status"] == "ok"
     out2 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True}, ctx)
-    assert out2["status"] == "rejected"
-    assert "一轮只能勾一个" in out2["error"]
-    assert ctx.updates["roadmap"]["stages"][0]["milestones"][1]["done"] is False  # 第二个未落盘
+    assert out2["status"] == "ok"  # 同阶段放行
+    assert ctx.updates["roadmap"]["current_stage"] == "s2"  # s1 完成自动推进
+    out3 = run_coach_tool("update_roadmap", {"milestone_id": "s2-m1", "done": True}, ctx)
+    assert out3["status"] == "rejected"  # 跨阶段
+    assert "跨阶段" in out3["error"]
+    assert ctx.updates["roadmap"]["stages"][1]["milestones"][0]["done"] is False  # 未落盘
+
+
+def test_update_roadmap_cross_stage_without_completing(monkeypatch):
+    """未勾完 s1 也不能同轮勾 s2：跨阶段一律拒绝。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
+    ctx = _gate_ctx()
+    assert run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True},
+                          ctx)["status"] == "ok"
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s2-m1", "done": True}, ctx)
+    assert out["status"] == "rejected"
+    assert "跨阶段" in out["error"]
+
+
+def test_update_roadmap_exemption_only_once_per_turn(monkeypatch):
+    """一句完成声明只豁免一个里程碑；同轮第二个必须过验收。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    calls = []
+    def fake_verify(desc, transcript, m=""):
+        calls.append(desc)
+        return {"verified": True, "missing": [], "reason": "内容覆盖"}
+    monkeypatch.setattr(route_mod, "verify_milestone", fake_verify)
+    ctx = _gate_ctx(user_msg="我在本地都搞定了")  # 完成声明，非推进指令
+    assert run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True},
+                          ctx)["status"] == "ok"
+    assert calls == []  # 第一次走豁免
+    assert ctx.updates["coach_milestone_exempt_used"] is True
+    assert run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True},
+                          ctx)["status"] == "ok"
+    assert calls == ["跑通 hello"]  # 第二次必须验收
+
+
+def test_update_roadmap_failed_check_does_not_block_same_stage(monkeypatch):
+    """s1-m1 验收失败不影响同阶段 s1-m2；阶段不因 m2 成功而推进。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    def fake_verify(desc, transcript, m=""):
+        if desc == "安装完成":
+            return {"verified": False, "missing": ["安装未完成"], "reason": "缺"}
+        return {"verified": True, "missing": [], "reason": "有内容"}
+    monkeypatch.setattr(route_mod, "verify_milestone", fake_verify)
+    ctx = _gate_ctx()
+    out1 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out1["status"] == "rejected"
+    out2 = run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True}, ctx)
+    assert out2["status"] == "ok"
+    ms = ctx.updates["roadmap"]["stages"][0]["milestones"]
+    assert ms[0]["done"] is False and ms[1]["done"] is True
+    assert ctx.updates["roadmap"]["current_stage"] == "s1"
+
+
+def test_update_roadmap_turn_stage_resets_next_turn(monkeypatch):
+    """用户回复后阶段标记清零：下一轮可以勾选下一阶段。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
+    ctx1 = _gate_ctx()
+    assert run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True},
+                          ctx1)["status"] == "ok"
+    assert run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True},
+                          ctx1)["status"] == "ok"
+    # 模拟 coach_human：合并本回合 updates 后清零三个回合标记
+    state2 = {**ctx1.state, **ctx1.updates,
+              "coach_milestone_pending": None,
+              "coach_milestone_turn_stage": None,
+              "coach_milestone_exempt_used": False,
+              "coach_milestone_turn_count": 0}
+    ctx2 = CoachCtx(state2)
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s2-m1", "done": True}, ctx2)
+    assert out["status"] == "ok"
+    assert ctx2.updates["coach_milestone_turn_stage"] == "s2"
+
+
+def test_update_roadmap_verifier_suggests_matching_milestone(monkeypatch):
+    """验收员指出内容实际匹配的里程碑 → 回执带 suggested_id，note 引导改勾。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t, m="": {"verified": False, "missing": ["缺"],
+                                            "reason": "内容属于阶段二",
+                                            "suggested_id": "s2-m1"})
+    ctx = _gate_ctx()
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out["status"] == "rejected"
+    assert out["suggested_id"] == "s2-m1"
+    assert "s2-m1" in out["note"]
+
+
+def test_update_roadmap_ignores_invalid_suggestion(monkeypatch):
+    """验收员给出不存在的 id → 丢弃，不影响拒绝结果。"""
+    monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t, m="": {"verified": False, "missing": ["缺"],
+                                            "reason": "不匹配",
+                                            "suggested_id": "s9-m9"})
+    ctx = _gate_ctx()
+    out = run_coach_tool("update_roadmap", {"milestone_id": "s1-m1", "done": True}, ctx)
+    assert out["status"] == "rejected"
+    assert out["suggested_id"] is None
 
 
 # ---------- 验收 helper：送审文本 ----------
@@ -496,7 +599,7 @@ def test_update_roadmap_blocks_after_two_rejections(monkeypatch):
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     calls = []
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: calls.append(d) or {"verified": False,
+                        lambda d, t, m="": calls.append(d) or {"verified": False,
                                                          "missing": ["缺"], "reason": "未完成"})
     ctx = _gate_ctx()
     for i in range(2):

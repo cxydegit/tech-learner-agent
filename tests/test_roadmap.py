@@ -115,6 +115,32 @@ def test_complete_all_marks_completed():
     assert r["status"] == "completed"
 
 
+def test_complete_future_stage_moves_pointer_forward():
+    """勾选更靠后阶段的里程碑 → 指针跟随前移，不要求前面阶段全部完成。"""
+    r = _build()
+    r = rm.complete_milestone(r, "s2-m1")  # s1 未完成
+    assert r["current_stage"] == "s2"
+    assert r["status"] == "active"  # s1 有遗留，不算 completed
+
+
+def test_backfill_does_not_move_pointer_back():
+    """回头补勾旧阶段 → 指针保持当前阶段，不回退。"""
+    r = _build()
+    r = rm.complete_milestone(r, "s2-m1")  # 指针 → s2
+    r = rm.complete_milestone(r, "s1-m1")  # 补勾 s1
+    assert r["current_stage"] == "s2"
+
+
+def test_completed_requires_all_stages():
+    """完成状态只认所有阶段都完成：最后阶段完成但前面有遗留时仍是 active。"""
+    r = _build()
+    r = rm.complete_milestone(r, "s2-m1")  # 最后阶段完成，s1 未完成
+    assert r["status"] == "active"
+    r = rm.complete_milestone(r, "s1-m1")
+    r = rm.complete_milestone(r, "s1-m2")
+    assert r["status"] == "completed"
+
+
 def test_complete_milestone_unknown_raises():
     with pytest.raises(KeyError):
         rm.complete_milestone(_build(), "s9-m9")
@@ -206,6 +232,14 @@ def test_merge_progress_advances_to_first_unfinished():
     # s1 的两个里程碑描述匹配保留 done → s1 仍全完成 → current_stage 校正到 s2
     assert merged["stages"][0]["milestones"][0]["done"] is True
     assert merged["stages"][0]["milestones"][1]["done"] is True
+    assert merged["current_stage"] == "s2"
+    assert merged["status"] == "active"
+
+
+def test_merge_progress_preserves_drift():
+    """修订路线不把指针重置回第一阶段：旧路线在 s2 时合并后仍是 s2。"""
+    old = rm.complete_milestone(_build(), "s2-m1")  # 指针 s2，s1 未完成
+    merged = rm.merge_progress(old, _build())
     assert merged["current_stage"] == "s2"
     assert merged["status"] == "active"
 

@@ -188,10 +188,11 @@ def stage_done(roadmap: dict, stage: dict) -> bool:
 
 
 def complete_milestone(roadmap: dict, milestone_id: str, done: bool = True) -> dict:
-    """勾选/取消勾选里程碑，自动推进当前阶段。
+    """勾选/取消勾选里程碑，自动维护当前阶段指针。
 
+    - 勾选更靠后阶段的里程碑时，current_stage 跟随前移（不要求前面阶段全部完成）；
     - 当前阶段全部里程碑完成后自动推进到下一阶段；
-    - 最后阶段全部完成后 status=completed。
+    - 所有阶段全部完成后 status=completed。
     找不到里程碑抛 KeyError（非法 id 由调用方捕获转成工具错误反馈给模型）。
 
     Args:
@@ -209,21 +210,25 @@ def complete_milestone(roadmap: dict, milestone_id: str, done: bool = True) -> d
     updated = _deepcopy(roadmap)
     updated["stages"][si]["milestones"][mi]["done"] = done
 
-    # 当前阶段全部完成 → 推进；最后阶段完成 → 整条路线完成
-    cur = updated.get("current_stage")
     stages = updated["stages"]
-    if stages[si].get("id") == cur and stage_done(updated, stages[si]):
-        if si + 1 < len(stages):
-            updated["current_stage"] = stages[si + 1]["id"]
-        else:
-            updated["status"] = "completed"
-    # 取消勾选时若路线已标 completed（勾满后又被取消），回退状态并指回第一个未完成阶段——
-    # 否则状态与进度不一致（真实事故：显示「✅ 已完成」但 s2 里程碑未勾，误导 coaching）
-    if not done and updated.get("status") == "completed":
-        updated["status"] = "active"
-        first_unfinished = next((s["id"] for s in stages if not stage_done(updated, s)), None)
-        if first_unfinished:
-            updated["current_stage"] = first_unfinished
+    cur_idx = next((i for i, s in enumerate(stages)
+                    if s.get("id") == updated.get("current_stage")), 0)
+
+    # 指针跟随：勾选更靠后阶段的里程碑 → 当前阶段直接前移。
+    # 只前进不回退：用户回头补勾旧阶段时，不该把「当前在学」的指针拽回去。
+    if done and si > cur_idx:
+        cur_idx = si
+
+    # 当前阶段已全部完成 → 继续前进（可连续越过已完成的阶段）。
+    while cur_idx + 1 < len(stages) and stage_done(updated, stages[cur_idx]):
+        cur_idx += 1
+    updated["current_stage"] = stages[cur_idx]["id"]
+
+    # 完成状态只认「所有阶段都完成」：允许跨阶段漂移后，不能只看最后一段，
+    # 否则前面阶段有遗留时仍会显示「✅ 已完成」。
+    updated["status"] = ("completed"
+                         if all(stage_done(updated, s) for s in stages)
+                         else "active")
     updated["updated_at"] = _now()
     return updated
 
@@ -233,7 +238,8 @@ def merge_progress(old: dict, new: dict) -> dict:
 
     里程碑无唯一键（normalize_stages 只产 id/desc/done），故**按 desc（描述）完全匹配**：
     新路线中描述相同的里程碑继承旧勾选状态——阶段增删、改名、调时长都不影响已完成进度。
-    合并后 current_stage 校正为第一个有未完成里程碑的阶段（全部完成 → status=completed）。
+    合并后保留旧路线的当前阶段位置（优先按阶段名匹配，改名/删除时退回原下标），
+    避免修订把「用户已学到后面阶段」的漂移重置回第一阶段。
 
     Args:
         old: 旧路线（只读）
@@ -253,14 +259,23 @@ def merge_progress(old: dict, new: dict) -> dict:
         for m in stage.get("milestones") or []:
             if m.get("desc") in old_done:
                 m["done"] = True
-    # 校正当前阶段到第一个未完成阶段（build 已置 s1；全完成则保持首阶段但 status=completed）
-    first_unfinished = next((s["id"] for s in (result.get("stages") or [])
-                             if not stage_done(result, s)), None)
-    if first_unfinished:
-        result["current_stage"] = first_unfinished
-        result["status"] = "active"
-    else:
-        result["status"] = "completed"
+    stages = result.get("stages") or []
+    # 保留旧路线的当前位置（优先按阶段名匹配，改名/删除时退回原下标），
+    # 避免修订把「用户已学到后面阶段」的漂移重置回第一阶段。
+    old_stages = old.get("stages") or []
+    old_cur = old.get("current_stage")
+    old_idx = next((i for i, s in enumerate(old_stages) if s.get("id") == old_cur), 0)
+    old_name = _stage_name(old, old_cur)
+    cur_idx = next((i for i, s in enumerate(stages) if s.get("name") == old_name), None)
+    if cur_idx is None:
+        cur_idx = min(old_idx, len(stages) - 1) if stages else 0
+    while cur_idx + 1 < len(stages) and stage_done(result, stages[cur_idx]):
+        cur_idx += 1
+    if stages:
+        result["current_stage"] = stages[cur_idx]["id"]
+    result["status"] = ("completed"
+                        if stages and all(stage_done(result, s) for s in stages)
+                        else "active")
     result["updated_at"] = _now()
     return result
 

@@ -191,18 +191,25 @@ def _roadmap():
     stages, _ = rm.normalize_stages([
         {"name": "环境搭建", "goal": "g", "est_hours": 4,
          "milestones": [{"desc": "安装完成"}, {"desc": "跑通 hello"}]},
+        {"name": "核心概念", "goal": "g", "est_hours": 4,
+         "milestones": [{"desc": "理解 A"}]},
     ])
-    return rm.build_roadmap("t", "goal", 4, stages)
+    return rm.build_roadmap("t", "goal", 8, stages)
 
 
-def test_milestone_batch_gate_is_recorded(monkeypatch, audit_events):
+def test_milestone_cross_stage_gate_is_recorded(monkeypatch, audit_events):
+    """同回合已钉住 s1，再勾 s2 的里程碑 → 跨阶段闸拒绝（在调用验收之前）。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
-    ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(), "coach_milestone_pending": "s1-m1"})
-    out = route_mod.run_coach_tool("update_roadmap", {"milestone_id": "s1-m2", "done": True}, ctx)
+    monkeypatch.setattr(route_mod, "verify_milestone",
+                        lambda d, t, m="": (_ for _ in ()).throw(AssertionError("跨阶段不应调验收")))
+    ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(),
+                    "coach_milestone_turn_stage": "s1"})
+    out = route_mod.run_coach_tool("update_roadmap", {"milestone_id": "s2-m1", "done": True}, ctx)
 
-    assert out["status"] == "rejected"  # 闸 1：一轮只能勾一个
+    assert out["status"] == "rejected"
     event = _events(audit_events, "tool_gate")[-1]
-    assert event["kind"] == "milestone_batch" and event["pending"] == "s1-m1"
+    assert event["kind"] == "milestone_cross_stage"
+    assert event["turn_stage"] == "s1" and event["stage"] == "s2"
     assert event["status"] == "rejected"
 
 
@@ -210,7 +217,7 @@ def test_milestone_verify_records_verdict(monkeypatch, audit_events):
     """验收结论本身要留痕：只记被拒那次会让"验收几乎从没触发"这类问题查不出来。"""
     monkeypatch.setattr(route_mod.learner, "save_roadmap", lambda r: r)
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda desc, transcript: {"verified": True, "missing": [], "reason": "覆盖到位"})
+                        lambda desc, transcript, m="": {"verified": True, "missing": [], "reason": "覆盖到位"})
     ctx = CoachCtx({"tech": "t", "roadmap": _roadmap(),
                     "coach_messages": [{"role": "user", "content": "继续"}],
                     "conversation": [{"role": "user", "type": "chat", "content": "都弄好了"}]})

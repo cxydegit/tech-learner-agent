@@ -332,7 +332,7 @@ def test_coaching_uses_collect_and_update_roadmap(monkeypatch, tmp_path):
                         lambda tech, focus=None, progress=None: {
                             "urls": ["u1"], "report": "## 官方文档\n...", "materials_path": "materials/x.md"})
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     monkeypatch.setattr(graph_mod, "chat_with_tools", _scripted_coaching_chat)
     graph = build_graph(InMemorySaver())
     gconfig = {"configurable": {"thread_id": "test-coach-1"}}
@@ -365,10 +365,19 @@ def test_runtime_context_injects_milestone_pending_block():
     assert "系统注入的运行时状态" in inj["content"]
     assert "尚未获得用户推进确认" in inj["content"]
     assert "s1-m1" in inj["content"]
-    assert "在用户明确同意前，不要开始下一里程碑的内容" in inj["content"]
+    assert "在用户明确同意前，不要开始下一阶段的内容" in inj["content"]
     # system 不再含卡点（前缀缓存的前提）；无 pending 时无注入消息
     assert "尚未获得用户推进确认" not in route_mod._coaching_prompt(state, "Spring")
     assert route_mod.coach_runtime_context({"mode": "coaching", "roadmap": None}) is None
+
+
+def test_runtime_context_pending_block_reports_batch_count():
+    """同回合连续勾选多个 → 卡点文案带本回合勾选数，而不是只提最后一个。"""
+    state = {"mode": "coaching", "roadmap": None,
+             "coach_milestone_pending": "s1-m3", "coach_milestone_turn_count": 3}
+    inj = route_mod.coach_runtime_context(state)
+    assert "本回合已勾选 3 个里程碑" in inj["content"]
+    assert "s1-m3" in inj["content"]
 
 
 def test_coach_turn_start_increments_and_emits(audit_events):
@@ -437,7 +446,7 @@ def test_coaching_milestone_pending_gate(monkeypatch, tmp_path):
                         lambda tech, focus=None, progress=None: {
                             "urls": ["u1"], "report": "## 官方文档\n...", "materials_path": "materials/x.md"})
     monkeypatch.setattr(route_mod, "verify_milestone",
-                        lambda d, t: {"verified": True, "missing": [], "reason": ""})
+                        lambda d, t, m="": {"verified": True, "missing": [], "reason": ""})
     monkeypatch.setattr(graph_mod, "chat_with_tools", scripted)
     graph = build_graph(InMemorySaver())
     gconfig = {"configurable": {"thread_id": "test-coach-gate"}}

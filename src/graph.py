@@ -230,6 +230,13 @@ class LearnState(TypedDict):
     # 里程碑推进卡点：刚勾选、待用户确认的里程碑 id（update_roadmap 勾选后设置，用户回复后
     # 由 coach_human 清空）。非空时 coaching 提示词强制 Agent 停下总结 + 询问，不自行推进。
     coach_milestone_pending: str | None
+    # 里程碑跨阶段护栏：本回合第一次勾选钉住的阶段 id（同阶段内不限次数，跨阶段拒绝；
+    # coach_human 每用户回合清零）
+    coach_milestone_turn_stage: str | None
+    # 闸 2 豁免额度：本回合是否已用掉唯一一次「用户完成声明免验收」机会（每回合清零）
+    coach_milestone_exempt_used: bool
+    # 本回合成功勾选的里程碑数（pending 文案 / 审计用；每回合清零）
+    coach_milestone_turn_count: int
     # 里程碑验收拒绝节流：本回合 update_roadmap 已被验收拒绝的次数（≥2 后不再受理，
     # 防重试循环烧光工具预算；coach_human 每用户回合清零）
     coach_verify_rejects: int
@@ -705,6 +712,9 @@ def coach_human(state: LearnState) -> dict:
         "coach_heavy_failures": {},  # 贵工具失败闸每回合清零（同回合内才拦重跑）
         "last_tool_signatures": [],
         "coach_verify_rejects": 0,  # 里程碑验收拒绝计数每回合清零（节流只限本回合）
+        "coach_milestone_turn_stage": None,   # 跨阶段护栏：每回合重新钉住阶段
+        "coach_milestone_exempt_used": False,  # 闸 2 豁免额度：每回合一次
+        "coach_milestone_turn_count": 0,       # 本回合成功勾选数
         "last_output": "",
     }
     # 里程碑推进卡点：一次性闸门——勾选里程碑后提示词强制停下总结 + 询问，

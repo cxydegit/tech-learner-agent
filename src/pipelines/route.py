@@ -92,6 +92,8 @@ def _planning_prompt(state, tech: str) -> str:
         "- 路线必须贴合用户水平：技术小白从环境搭建和最小 demo 起步、拆小步；开发者可跳过基础直达要点。\n"
         "- 里程碑必须是可检验的动作（如「本地跑通 hello world」「能用 XX 完成一个接口」），不要空洞目标；"
         "尽量写成对话内可检验的形式（在对话中能给出讲解/回答/结论/代码），便于后续验收勾选。\n"
+        "- 里程碑描述只写「要掌握的知识点 / 要完成的动作」，不要写成「请用户复述 / 说出 / 讲一遍 XX」这类"
+        "以用户口头输出为完成条件的措辞；讲解与核对由助手负责，描述里不规定用户必须输出什么。\n"
         "- 阶段按依赖排序，每阶段给出预估小时数。\n"
         "- materials 可引用已收集的资料或留空（留空由后续 collect 补充）。\n"
         "- 不要编造资料链接；没有的信息写「待收集」。"
@@ -138,14 +140,18 @@ def _coaching_prompt(state, tech: str) -> str:
         "先确认改动点再调用 revise_roadmap，改完把新路线完整呈现给用户。"
         "\n里程碑推进规则："
         "\n- 勾选里程碑前，逐项核对该里程碑的所有待办是否真实完成；有任何未完成就先完成它，不要勾选、不要推进。"
+        "\n- 勾选哪个里程碑：按「刚讲完、用户刚确认的内容」匹配里程碑描述，不要默认勾 current_stage 里第一个未完成项。"
+        "路线指针会跟随你勾选的里程碑所属阶段前移；前面阶段未完成的项属于遗留，除非用户明确要求回头补，"
+        "否则不要在讲新阶段时去勾旧项。"
         "\n- 勾选（done=true）由系统自动核对对话记录验收：待办内容必须实质出现在对话里才算完成，"
         "仅宣布完成、布置了没人做的任务会被拒绝。不要为凑证据重复输出已讲过的内容；被拒后按提示先补内容再勾选。"
         "\n- 用户在回答里程碑确认时，按他说的走：说了「直接勾/勾了吧」→ 调 update_roadmap（系统跳过验收直接勾）；"
         "表达了自己已掌握/已完成（「我会了」「搞定了」「我脑子里过了一遍」「不一一回答你了」）→ 调 update_roadmap 勾选；"
         "只说了「直接下一步/直接进入下一阶段」而没说自己已掌握 → 不要调 update_roadmap，直接按指令往下讲，"
         "并如实说明「该里程碑我未勾选，后续你可以随时命令我勾选」。"
-        "\n- 不要向用户索要「补一句话」式的关键词，也不要向用户解释验收机制。"
-        "\n- 一轮只能勾选一个里程碑；勾选后停下来向用户总结成果，并询问是否进入下一里程碑/阶段；未经用户明确同意不要开始下一里程碑内容。"
+        "\n- 不要向用户索要「补一句话」式的关键词，也不要要求用户复述、回答或自证掌握来配合勾选，"
+        "更不要向用户解释验收机制。认知型待办由你讲透即可，讲解是否达标由系统核对，不转嫁给用户。"
+        "\n- 同一阶段内可以连续勾选多个里程碑，但不要跨阶段勾选；一个阶段勾完后停下来向用户总结成果，并询问是否进入下一阶段；未经用户明确同意不要开始下一阶段内容。"
         "\n- 例外：用户上一轮已明确指令「直接进入下一步/下一阶段/不用再问」时，勾选后直接推进，不再询问。"
         "这条例外只免除勾选之后的确认询问，不免除勾选之前的验收：证据不足仍会被驳回。"
         + suffix
@@ -180,9 +186,12 @@ def coach_runtime_context(state) -> dict | None:
     # 结构保证（代码设置、用户回复后清除）：Agent 勾选后不会自行开始下一里程碑。
     pending = state.get("coach_milestone_pending")
     if pending:
-        parts.append(f"你刚勾选了里程碑「{pending}」，尚未获得用户推进确认。\n"
-                     "请向用户总结该里程碑成果，并询问是否进入下一里程碑/阶段；\n"
-                     "在用户明确同意前，不要开始下一里程碑的内容。")
+        count = int(state.get("coach_milestone_turn_count") or 0)
+        checked = (f"本回合已勾选 {count} 个里程碑（最后一个是「{pending}」）" if count > 1
+                   else f"你刚勾选了里程碑「{pending}」")
+        parts.append(f"{checked}，尚未获得用户推进确认。\n"
+                     "请向用户总结本阶段成果，并询问是否进入下一阶段；\n"
+                     "在用户明确同意前，不要开始下一阶段的内容。")
     if not parts:
         return None
     return {"role": "system", "content": RUNTIME_CONTEXT_MARK + "\n\n" + "\n\n".join(parts)}
@@ -320,9 +329,10 @@ UPDATE_ROADMAP_SCHEMA = {
     "type": "function",
     "function": {
         "name": "update_roadmap",
-        "description": "勾选/取消勾选一个里程碑（完成一个可检验的动作后调用），自动推进当前阶段。"
+        "description": "勾选/取消勾选一个里程碑。按里程碑描述匹配你刚讲完、用户刚确认的那块内容"
+                       "（如刚讲完 JSX 本质就勾 s2-m2），不要按 current_stage 的顺序猜下一个。"
                        "勾选（done=true）由系统自动核对对话记录验收：内容没有实质出现在对话里"
-                       "会被拒绝，无需也不能自行提交证据。",
+                       "会被拒绝，无需也不能自行提交证据。current_stage 会跟随你勾选的里程碑所属阶段前移。",
         "parameters": {"type": "object", "properties": {
             "milestone_id": {"type": "string", "description": "里程碑 id（如 s1-m1）"},
             "done": {"type": "boolean", "description": "true 勾选 / false 取消"},
@@ -882,16 +892,26 @@ VERIFY_MILESTONE_PROMPT = """你是学习路线的里程碑验收员。根据对
 
 判定规则：
 - 对话中必须实际出现完成该里程碑所需的产出（讲解、回答、结论、代码、操作结果等实质内容）；
+- 认知型里程碑（「能说清 / 理解 / 解释 XX」这类以理解或表述为完成形态的待办）：
+  助手已在对话里给出覆盖该知识点实质内容的完整讲解，即视为所需产出已出现，不要求用户复述、
+  回答或自证掌握；只提名词、只列提纲、只说「已讲完」不算完整讲解；
 - 「宣布完成」要看是谁在宣布：助手自己宣布完成、鼓励、日程性总结不算；布置了任务但没人完成不算；
   任务被转交但对方没回应不算；
 - 例外：用户本人表示该项待办自己已完成 / 已掌握 / 不必细说，算有效证据，判通过。按语义判，
   不按措辞判：只要用户是在告诉你他自己的掌握状态（不是提问，也不是要你讲解），就判通过，
   用的哪几个字不影响结论；
 - 但用户只表达了「往下走」而没说已掌握（意图是推进流程，不是在声明掌握），不算完成证据；
-- 除用户本人的上述表态外，有任何一部分未覆盖就判不通过。
+- 未命中上述用户宣告或认知型讲解判定时，有任何一部分未覆盖就判不通过。
+
+如果本次勾选的里程碑与最近对话内容不匹配，请从下面的里程碑清单里找出最近内容实际对应的那一条，
+在 suggested_id 填它的 id（如 s2-m2）；没有明显匹配、或本次勾选就是匹配的，填 null。
+suggested_id 只是给主模型的提示，不要因为它改变 verified 的判定。
+
+所有里程碑（id: 描述）：
+{milestones}
 
 只输出一个 JSON 对象，不要 ```json 围栏、不要解释：
-{{"verified": true 或 false, "missing": ["未覆盖的部分，每条一句话"], "reason": "一句话结论"}}
+{{"verified": true 或 false, "missing": ["未覆盖的部分，每条一句话"], "reason": "一句话结论", "suggested_id": "s2-m2" 或 null}}
 
 对话记录（截取最近部分）：
 {transcript}"""
@@ -906,24 +926,35 @@ def _transcript_text(conversation, char_limit: int) -> str:
     return text[-char_limit:] if char_limit and len(text) > char_limit else text
 
 
-def verify_milestone(milestone_desc: str, transcript: str) -> dict:
+def verify_milestone(milestone_desc: str, transcript: str, milestones: str = "") -> dict:
     """LLM 验收：对话记录是否足以证明里程碑完成（独立调用，只看事实不看模型自述）。
 
+    Args:
+        milestone_desc: 本次勾选的里程碑描述（验收标准）
+        transcript: 最近对话记录
+        milestones: 全部里程碑的「id: 描述」清单，供验收员在内容与勾选项不匹配时
+            给出 suggested_id（可选；缺省时不提供提示）
+
     Returns:
-        {"verified": bool|None, "missing": [str], "reason": str}；
+        {"verified": bool|None, "missing": [str], "reason": str, "suggested_id": str|None}；
         verified=None 表示验收器自身异常/解析失败 → 调用方降级放行（不卡死流程）。
     """
-    payload = VERIFY_MILESTONE_PROMPT.format(milestone=milestone_desc, transcript=transcript)
+    payload = VERIFY_MILESTONE_PROMPT.format(
+        milestone=milestone_desc, milestones=milestones or "（未提供）", transcript=transcript)
     try:
         raw = generate_text(payload, "请按要求只输出 JSON。", call_site="verify.milestone")
     except Exception:  # noqa: BLE001 —— 验收器故障降级放行
-        return {"verified": None, "missing": [], "reason": "验收器异常，本次跳过验收"}
+        return {"verified": None, "missing": [], "reason": "验收器异常，本次跳过验收",
+                "suggested_id": None}
     obj = parse_json_object(raw)
     if not obj or not isinstance(obj.get("verified"), bool):
-        return {"verified": None, "missing": [], "reason": "验收输出无法解析，本次跳过验收"}
+        return {"verified": None, "missing": [], "reason": "验收输出无法解析，本次跳过验收",
+                "suggested_id": None}
     missing = [str(m)[:100] for m in (obj.get("missing") or []) if str(m).strip()]
+    suggested = obj.get("suggested_id")
+    suggested = str(suggested).strip() if suggested else None
     return {"verified": obj["verified"], "missing": missing,
-            "reason": str(obj.get("reason") or "")[:200]}
+            "reason": str(obj.get("reason") or "")[:200], "suggested_id": suggested}
 
 
 def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
@@ -942,19 +973,35 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
         return {"status": "error", "error": f"未知里程碑 {milestone_id}", "available": ids}
 
     if done:
-        # 闸 1（确定性）：批量勾选护栏——已有待确认里程碑时拒绝再勾（截图事故：Agent 一轮
-        # 把所有里程碑勾满，确认闸门被架空）。同批多个 tool_call 靠 updates 读到前一次的标记。
-        pending_now = ctx.updates.get("coach_milestone_pending",
-                                      ctx.state.get("coach_milestone_pending"))
-        if pending_now:
-            return _gate_event("milestone_batch", {
+        # 闸 1（确定性）：跨阶段护栏——用户回合内只允许勾选同一阶段，同阶段不限次数。
+        # 原「一轮只能勾一个」会卡住「Agent 已连续讲完多个小里程碑、事后一次性补勾」的
+        # 真实场景（日志：同轮补勾 s1-m3/m4 被拒）；内容风险由闸 4 验收覆盖。
+        # 阶段由本回合第一次 done=True 勾选钉住（失败也钉住，避免失败后跳到别的阶段）；
+        # 用户回复后由 coach_human 清零。
+        stage_pos = roadmap_domain.find_milestone(r, milestone_id)
+        stage_id = r["stages"][stage_pos[0]]["id"] if stage_pos else None
+        turn_stage = ctx.updates.get("coach_milestone_turn_stage",
+                                     ctx.state.get("coach_milestone_turn_stage"))
+        if turn_stage is None:
+            ctx.updates["coach_milestone_turn_stage"] = stage_id
+        elif stage_id != turn_stage:
+            return _gate_event("milestone_cross_stage", {
                 "status": "rejected",
-                "error": f"里程碑「{pending_now}」刚勾选、尚在等用户确认推进，"
-                         f"一轮只能勾一个。请先等用户确认后再勾选下一个。",
-            }, milestone=milestone_id, pending=pending_now)
-        # 闸 2（确定性）豁免：用户明确声明完成（对话外完成的动作）或验收开关关闭 → 跳过验收
+                "error": f"本回合已在阶段「{turn_stage}」勾选，不能跨阶段勾选「{milestone_id}」。"
+                         f"请先完成本阶段，用户确认后再勾选下一阶段。",
+            }, milestone=milestone_id, turn_stage=turn_stage, stage=stage_id)
+        # 闸 2（确定性）豁免：用户明确声明完成（对话外完成的动作）→ 跳过验收。
+        # 额度每回合只有一次：同轮可连勾多个里程碑，但用户那句完成声明只可能指其中一个，
+        # 不能让同一句话豁免整个阶段（否则「这个我知道」会绕过全部验收）。
         latest_user = _recent_user_text(ctx.state.get("coach_messages"))
-        verify_enabled = config.ROUTE_MILESTONE_VERIFY and not exit_intent.is_completion_claim(latest_user)
+        exempt_used = bool(ctx.updates.get("coach_milestone_exempt_used",
+                                           ctx.state.get("coach_milestone_exempt_used")))
+        exempt = (config.ROUTE_MILESTONE_VERIFY
+                  and not exempt_used
+                  and exit_intent.is_completion_claim(latest_user))
+        verify_enabled = config.ROUTE_MILESTONE_VERIFY and not exempt
+        if exempt:
+            ctx.updates["coach_milestone_exempt_used"] = True
         if verify_enabled:
             # 闸 3（确定性）拒绝节流：本回合 update_roadmap 已被验收拒绝 ≥2 次 → 不再受理。
             # 真实事故：验收拒绝后模型换措辞无限重试，两回合烧光全部工具预算（连续两次
@@ -975,30 +1022,49 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
                 ctx.progress("🔍 正在核对里程碑完成情况...")
             verdict = verify_milestone(_milestone_desc(updated, milestone_id),
                                        _transcript_text(ctx.state.get("conversation"),
-                                                        config.ROUTE_VERIFY_TRANSCRIPT_CHARS))
+                                                        config.ROUTE_VERIFY_TRANSCRIPT_CHARS),
+                                       _milestone_catalog(updated))
+            # 验收员可能指出「最近内容其实匹配另一个里程碑」：只接受路线里真实存在的 id，
+            # 且不能是本次勾选的 id，避免模型幻觉把 Agent 引到不存在的里程碑。
+            suggested = verdict.get("suggested_id")
+            valid_ids = {m.get("id") for s in (updated.get("stages") or [])
+                         for m in (s.get("milestones") or [])}
+            if suggested and (suggested == milestone_id or suggested not in valid_ids):
+                suggested = None
             # 验收结论本身要留痕：通过对/拒绝都是信号（"模型宣布完成但被独立验收员否掉"
             # 正是里程碑事故的形态），只记被拒那次会让"验收几乎从没触发"这类问题查不出来
             audit("milestone_verify", milestone=milestone_id, verified=verdict["verified"],
                   missing_count=len(verdict.get("missing") or []),
                   reason=str(verdict.get("reason") or "")[:200],
+                  suggested_id=suggested,
                   rejects=rejects, advance_directive=exit_intent.is_advance_directive(latest_user))
             if verdict["verified"] is False:
                 ctx.updates["coach_verify_rejects"] = rejects + 1
                 # 用户只授权「往下走」、没声明掌握：验收判不了完成是预期结果，不是待补的作业。
                 # 确定性给出对外话术，避免模型自己发挥成「你补一句话我就勾」。
                 if exit_intent.is_advance_directive(latest_user):
+                    hint = (f"另外，最近内容更匹配里程碑「{suggested}」；"
+                            f"如果你要记录刚讲完的内容，后续勾它，而不是 {milestone_id}。"
+                            if suggested else "")
                     return {"status": "not_checked", "missing": verdict["missing"],
-                            "reason": verdict["reason"],
+                            "reason": verdict["reason"], "suggested_id": suggested,
                             "note": "用户已授权直接推进，但没有声明自己已掌握该里程碑，验收无法确认完成。"
                                     "不要重试本工具、不要向用户索要措辞、不要解释验收机制；"
                                     "直接按用户的推进指令往下讲，并在回复里如实说明"
-                                    "「该里程碑我未勾选，后续你可以随时命令我勾选」。"}
+                                    "「该里程碑我未勾选，后续你可以随时命令我勾选」。" + hint}
+                if suggested:
+                    note = (f"验收未通过：最近对话内容更匹配里程碑「{suggested}」，"
+                            f"而不是你勾的「{milestone_id}」。"
+                            f"如果你要记录的是刚讲完的内容，请改勾 {suggested}；"
+                            f"如果你确实要勾 {milestone_id}，先把它的要求讲进对话。"
+                            "不要向用户索要「补一句话」式的关键词，也不要向用户解释验收机制。")
+                else:
+                    note = ("验收未通过：以上内容在对话里没有实质完成证据。停止重试本工具；"
+                            "先把缺失内容作为回复完整讲给用户，下一轮再勾选。"
+                            "不要向用户索要「补一句话」式的关键词，也不要向用户解释验收机制。")
                 return {"status": "rejected", "missing": verdict["missing"],
-                        "reason": verdict["reason"],
-                        "action": "teach_then_recheck",
-                        "note": "验收未通过：以上内容在对话里没有实质完成证据。停止重试本工具；"
-                                "先把缺失内容作为回复完整讲给用户，下一轮再勾选。"
-                                "不要向用户索要「补一句话」式的关键词，也不要向用户解释验收机制。"}
+                        "reason": verdict["reason"], "suggested_id": suggested,
+                        "action": "teach_then_recheck", "note": note}
 
     learner.save_roadmap(updated)
     ctx.updates["roadmap"] = updated
@@ -1007,10 +1073,15 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
     # 设置待确认标记 → 提示词强制停下总结 + 询问（用户回复后由 coach_human 清空）。
     # 用户上一轮明确「直接推进/不用再问」→ 免确认直接推进，不设卡点。
     if done:
+        turn_count = int(ctx.updates.get("coach_milestone_turn_count",
+                                         ctx.state.get("coach_milestone_turn_count") or 0)) + 1
+        ctx.updates["coach_milestone_turn_count"] = turn_count
         if not exit_intent.is_advance_directive(_recent_user_text(ctx.state.get("coach_messages"))):
             ctx.updates["coach_milestone_pending"] = milestone_id
-        note = ("该里程碑已勾选（已通过验收）。请向用户总结本里程碑成果并询问是否进入下一里程碑/阶段；"
-                "在用户明确同意前不要开始下一里程碑的内容。")
+        note = (f"该里程碑已勾选（已通过验收）。本回合已勾选 {turn_count} 个里程碑；"
+                "同一阶段内可以继续勾选，但不要跨阶段。"
+                "勾完本阶段后请向用户总结并询问是否进入下一阶段；"
+                "在用户明确同意前不要开始下一阶段内容。")
     else:
         note = "已取消勾选该里程碑。"
     return {"status": "ok", "milestone_id": milestone_id, "done": done,
@@ -1027,6 +1098,15 @@ def _milestone_desc(roadmap: dict, milestone_id: str) -> str:
         return milestone_id
     si, mi = loc
     return (roadmap["stages"][si]["milestones"][mi].get("desc") or milestone_id)
+
+
+def _milestone_catalog(roadmap: dict) -> str:
+    """把全部里程碑拼成「id: 描述」清单（验收员判断内容实际匹配哪一项用）。"""
+    return "\n".join(
+        f"- {m.get('id')}: {m.get('desc')}"
+        for s in (roadmap.get("stages") or [])
+        for m in (s.get("milestones") or [])
+    )
 
 
 def _revise_roadmap(args: dict, ctx: CoachCtx) -> dict:
