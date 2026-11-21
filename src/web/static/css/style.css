@@ -481,13 +481,47 @@ svg[class-icon], .lib-item svg, .btn-ghost svg, .docs-tab svg,
 }
 
 /* ============ note 合并确认（interrupt 两段式） ============ */
-.interrupt-title { font-size: 12.5px; font-weight: 600; color: var(--accent-deep); margin-bottom: 8px; }
+.interrupt-title { font-size: 13.5px; font-weight: 600; color: var(--ink); margin-bottom: 2px; }
+.interrupt-subtitle { font-size: 12.5px; color: var(--ink-3); margin-bottom: 12px; }
 .interrupt-payload {
   white-space: pre-wrap; font-size: 12.5px; color: var(--ink-2);
   background: #F8FAFD; border: 1px solid var(--line-soft);
   border-radius: var(--r-sm); padding: 10px 12px; margin: 0 0 12px; line-height: 1.8;
 }
-.interrupt-actions { display: flex; gap: 10px; }
+
+/* 候选卡片：每条候选一张卡（编号 / 新点标题 / 相似度徽章 / 已有笔记 / 理由 / 新增点） */
+.mc-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.mc-item {
+  background: #F8FAFD; border: 1px solid var(--line-soft);
+  border-radius: var(--r); padding: 12px 14px; text-align: left;
+}
+.mc-head { display: flex; align-items: flex-start; gap: 8px; }
+.mc-idx {
+  flex-shrink: 0; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 6px;
+  background: var(--accent); color: #FDFEFF; font-size: 12px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center;
+  margin-top: 1px;
+}
+.mc-topic { flex: 1; font-size: 13.5px; font-weight: 600; color: var(--ink); line-height: 1.5; word-break: break-word; }
+.mc-sim {
+  flex-shrink: 0; font-size: 11px; padding: 1px 9px; border-radius: 999px;
+  margin-left: auto; margin-top: 1px; white-space: nowrap;
+}
+.mc-sim-high { background: #FDF0F0; color: #C25457; border: 1px solid #F3C8CA; }  /* ≥0.7 高重复风险 */
+.mc-sim-mid  { background: #EEF4FE; color: #3B66E0; border: 1px solid #D6E3FC; }  /* 0.5–0.7 */
+.mc-sim-low  { background: #F2F4F8; color: var(--ink-2); border: 1px solid var(--line-soft); }
+.mc-sim-none { background: #F2F4F8; color: var(--ink-3); border: 1px solid var(--line-soft); }
+.mc-old { font-size: 12.5px; color: var(--ink-2); margin-top: 6px; line-height: 1.6; word-break: break-word; }
+.mc-old b { color: var(--accent-deep); font-weight: 600; }
+.mc-reason { font-size: 12px; color: var(--ink-3); margin-top: 4px; line-height: 1.7; word-break: break-word; }
+.mc-delta { margin-top: 8px; }
+.mc-delta-label { display: block; font-size: 11px; color: var(--ink-3); letter-spacing: 1px; margin-bottom: 4px; }
+.mc-delta-text {
+  margin: 0; font-family: var(--mono); font-size: 12px; color: var(--ink-2);
+  background: var(--card); border: 1px solid var(--line-soft); border-radius: 8px;
+  padding: 8px 10px; white-space: pre-wrap; word-break: break-word; line-height: 1.7;
+}
+.interrupt-actions { display: flex; gap: 10px; margin-top: 4px; }
 .interrupt-actions .btn-primary { margin: 0; }
 .interrupt-custom {
   margin-top: 12px; display: flex; align-items: center; gap: 8px;

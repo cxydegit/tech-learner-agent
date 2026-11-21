@@ -157,7 +157,7 @@ export function renderChat() {
     btn.addEventListener("click", () => openDoc(btn.getAttribute("data-src"), { badge: "笔记" })));
   // 消息流重渲染后同步输入区：会话详情异步到达，此处一并刷新底部卡片的显隐
   renderInputZone();
-  scrollChatBottom();
+  revealLatestAi();
 }
 
 /* 顶栏「路线」按钮：仅当前会话已生成 roadmap 时出现 */
@@ -169,13 +169,29 @@ function syncRoadmapBtn() {
   btn.classList.toggle("hidden", !roadmap);
 }
 
-/* 右侧阅读器展示当前路线：Markdown 由后端按 roadmap 机器态渲染，与 roadmaps/*-roadmap.md 同源 */
-function showRoadmap() {
-  const { active } = getState();
-  const st = (active && active.state) || {};
+/* 右侧阅读器展示当前路线：Markdown 由后端按 roadmap 机器态渲染，与 roadmaps/*-roadmap.md 同源。
+   点击时实时拉一次会话详情——coach 会话每轮以 interrupt 暂停（不走 final），
+   勾里程碑/改路线后本地 active 可能还是上一轮的快照。 */
+async function showRoadmap() {
+  const { activeId } = getState();
+  if (!activeId) return;
+  let st = (getState().active && getState().active.state) || {};
+  try {
+    const detail = await getSession(activeId);
+    if (getState().activeId !== activeId) return; // 请求期间已切会话，丢弃结果
+    setState({ active: detail });
+    st = detail.state || {};
+  } catch (_) { /* 拉取失败回退已有快照 */ }
   if (!st.roadmap) return;
   const title = `${st.tech || st.roadmap.tech || "学习"} 学习路线`;
-  openMarkdown(title, st.roadmap_markdown, "路线");
+  openMarkdown(title, roadmapCheckboxToIcon(st.roadmap_markdown), "路线");
+}
+
+/* markdown 里的任务清单写成 [x]/[ ]，直接渲染是字面方括号；换成与阶段总览一致的 ✅/⬜ */
+function roadmapCheckboxToIcon(md) {
+  return (md || "")
+    .replace(/^\s*-\s*\[x\]\s*/gim, "- ✅ ")
+    .replace(/^\s*-\s*\[\s\]\s*/gim, "- ⬜ ");
 }
 
 function fmtTime(ts) {
@@ -189,6 +205,20 @@ function fmtTime(ts) {
 function scrollChatBottom() {
   const body = $("#chatBody");
   body.scrollTop = body.scrollHeight;
+}
+
+/* 追加/重渲染后的滚动策略：最后一条 AI 消息超过视口约 70% 时停在它的开头，
+   让长内容从第一行开始读（不再一出来就滑到最底）；短消息仍滚到底，保证输入框可见。 */
+function revealLatestAi() {
+  const body = $("#chatBody");
+  const list = body.querySelectorAll(".chat-stream .msg-ai");
+  const last = list.length ? list[list.length - 1] : null;
+  if (last && last.offsetHeight > body.clientHeight * 0.7) {
+    const delta = last.getBoundingClientRect().top - body.getBoundingClientRect().top - 16;
+    body.scrollTop += delta;
+    return;
+  }
+  scrollChatBottom();
 }
 
 /* ============================================================
@@ -492,6 +522,13 @@ function onInterrupt(e) {
     appendAiMessage((e.payload && e.payload.message) || "", // 陪练问题即时上屏
       e.payload && e.payload.doc, e.payload && e.payload.doc_type);
     showCoachReplyInput();
+    // coach 每轮以 interrupt 暂停（不走 final），这里补一次详情刷新：
+    // 本轮可能刚生成路线或勾了里程碑，「路线」按钮的显隐与内容都要跟着更新
+    getSession(activeId).then((detail) => {
+      if (getState().activeId !== activeId) return; // 已切会话，丢弃
+      setState({ active: detail });
+      syncRoadmapBtn();
+    }).catch(() => {});
     return;
   }
   // note 合并确认（原流程）
@@ -572,13 +609,76 @@ function clearRunStatus() {
   if (el) el.hidden = true;
 }
 
+/* ---- note 合并确认：把后端 format_merge_candidates 的展示文本解析为结构化候选 ----
+   文本契约（pipelines/note.py）：
+   [N] {新点topic} → 已有「{旧笔记topic}」（相似度 0.62），理由：{reason}
+       新增点：{delta 单行}
+   解析不出候选时回退原始文本展示，不丢信息。 */
+function parseMergeCandidates(payload) {
+  const items = [];
+  let cur = null;
+  for (const line of (payload || "").split("\n")) {
+    const head = line.match(/^\[(\d+)\]\s*(.+)$/);
+    if (head) {
+      if (cur) items.push(cur);
+      cur = { idx: head[1], head: head[2], delta: "" };
+      continue;
+    }
+    const delta = line.match(/^\s*新增点：\s*(.*)$/);
+    if (delta && cur) cur.delta = delta[1];
+  }
+  if (cur) items.push(cur);
+  if (!items.length) return null;
+  for (const it of items) {
+    const m = it.head.match(/^(.*?)\s*→\s*已有「(.*?)」(?:（相似度\s*([\d.]+)）)?(?:，理由：(.*)|$)/);
+    if (m) {
+      it.topic = m[1];
+      it.oldTopic = m[2];
+      it.sim = m[3] ? parseFloat(m[3]) : null;
+      it.reason = m[4] || "";
+    } else {
+      it.topic = it.head; // 单条解析失败也不丢内容：整行当标题展示
+    }
+  }
+  return items;
+}
+
+function simBadgeClass(sim) {
+  if (sim == null) return "mc-sim-none";
+  if (sim >= 0.7) return "mc-sim-high";
+  if (sim >= 0.5) return "mc-sim-mid";
+  return "mc-sim-low";
+}
+
+function renderMergeItem(it) {
+  const sim = it.sim != null
+    ? `<span class="mc-sim ${simBadgeClass(it.sim)}">相似度 ${it.sim.toFixed(2)}</span>` : "";
+  const old = it.oldTopic
+    ? `<div class="mc-old">合并到已有笔记「<b>${escapeHtml(it.oldTopic)}</b>」</div>` : "";
+  const reason = it.reason
+    ? `<div class="mc-reason">理由：${escapeHtml(it.reason)}</div>` : "";
+  const delta = it.delta
+    ? `<div class="mc-delta"><span class="mc-delta-label">新增点</span>` +
+      `<pre class="mc-delta-text">${escapeHtml(it.delta)}</pre></div>` : "";
+  return `<div class="mc-item">` +
+    `<div class="mc-head"><span class="mc-idx">${escapeHtml(it.idx)}</span>` +
+    `<span class="mc-topic">${escapeHtml(it.topic)}</span>${sim}</div>` +
+    old + reason + delta + `</div>`;
+}
+
 /* note 合并确认：展示候选 + 决策按钮 → resume */
 function showInterrupt(payload) {
   const el = runStatusEl();
+  const items = parseMergeCandidates(payload);
+  const body = items
+    ? `<div class="mc-list">${items.map(renderMergeItem).join("")}</div>`
+    : `<pre class="interrupt-payload">${escapeHtml(payload || "")}</pre>`;
+  const subtitle = items
+    ? `<div class="interrupt-subtitle">发现 ${items.length} 条新知识点与已有笔记相似，勾选处理方式</div>` : "";
   el.innerHTML =
     `<div class="interrupt-panel">` +
     `<div class="interrupt-title">需要你决定如何处理相似笔记</div>` +
-    `<pre class="interrupt-payload">${escapeHtml(payload || "")}</pre>` +
+    subtitle + body +
     `<div class="interrupt-actions">` +
     `<button class="btn-primary" data-answer="all" type="button">全部合并</button>` +
     `<button class="btn-ghost" data-answer="skip" type="button">全部跳过</button>` +
@@ -630,7 +730,7 @@ function appendAiMessage(content, doc, docType) {
     div.querySelector(".doc-chip").addEventListener("click", () =>
       openDoc(div.querySelector(".doc-chip").getAttribute("data-doc")));
   }
-  scrollChatBottom();
+  revealLatestAi();
 }
 
 /* coach 问答输入框：问题已作为气泡上屏，这里只放回复输入（发送时把用户回复先上屏再 resume）。
@@ -654,7 +754,7 @@ function showCoachReplyInput() {
     el.innerHTML = inputHtml;
   }
   el.hidden = false;
-  scrollChatBottom();
+  revealLatestAi();
   const input = el.querySelector("#coachReply");
   // 随内容自动增高：先归零量出真实高度，超过 180px 转为内部滚动
   const autoGrow = () => {
