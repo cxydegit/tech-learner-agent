@@ -9,12 +9,15 @@ schema、工具执行（大内容写文件、出入参短，工具可经 ctx.upd
 
 import re
 import time
+from datetime import timedelta
 
 from ..adapters import learner
+from ..adapters import memory as memory_store
 from ..adapters.audit import audit
 from ..adapters.llm import generate_text
 from ..config import config
 from ..domain import exit_intent, survey
+from ..domain import memory as memory_domain
 from ..domain import roadmap as roadmap_domain
 from ..domain.extraction import parse_json_object
 from .collect import CollectStageError, collect_pipeline
@@ -45,6 +48,53 @@ _FIELD_HINTS = {
 }
 
 
+# 规则行把证据语义和「历史 vs 当前」说死：未考据不等于已掌握，历史路线点不算当前进度。
+_LTM_RULES = {
+    "survey": (
+        "长期记忆简报（跨会话）：以下是学习者已有证据和跨技术背景，用于校准自评、"
+        "选择类比和出针对性诊断题。未考据的点只说明曾接触过，不等于已掌握；"
+        "不要据此跳过必要提问，也不要让用户重复回答已有记录的信息。"),
+    "planning": (
+        "长期记忆简报（跨会话）：只把标为「已验收」「已声明」的点视为可跳过；"
+        "标为「未考据」「验收降级」的点仍需验证，不能据此跳过。"
+        "历史路线点不等于当前路线进度。"),
+    "coaching": (
+        "跨会话长期记忆（只补画像/当前路线没有的异常与稳定偏好；"
+        "与本次画像/当前路线冲突时以本次为准）："),
+}
+
+
+def long_term_memory_text(state, mode: str | None = None) -> str:
+    """返回本次追加进提示词的长期记忆简报原文（无内容返回空串，提示词不留空块）。
+
+    提示词构建与 `coach_llm` 的边界调试落盘共用本函数，避免日志里记录的是
+    「渲染块」而实际提示词拼的是另一份文本。放提示词尾部：简报不常变时，
+    整段前缀仍能命中 prompt cache。
+    """
+    resolved = mode or state.get("mode") or "survey"
+    text = str((state.get("memory_briefing") or {}).get("text") or "")
+    if not text:
+        return ""
+    return "\n\n" + _LTM_RULES.get(resolved, _LTM_RULES["survey"]) + "\n" + text
+
+
+def recall_hint() -> str:
+    """按需记忆工具的提示词规则（仅 flag 开启时使用）。"""
+    if not config.LTM_RECALL_ENABLED:
+        return ""
+    return (
+        f"当前日期 {time.strftime('%Y-%m-%d')}。用户问过去学过什么/撤销过什么/"
+        "跨技术经历时，用 recall_memory 查询；未查询前不要断言没有记录。"
+        "用户未点名其他技术时，tech 用当前会话技术。"
+        "没确认掌握=unknown；当前学过=active；以前/旧值=superseded；"
+        "取消/放弃=revoked；所有历史才用 history。"
+        "status=any 只在用户明确问所有历史时用；当前/每天/现在用 active。"
+        "例：以前的目标→kind=goal,status=history；以前自评→kind=fact,"
+        "status=superseded,key=self_level；以前的相关背景→kind=fact,"
+        "status=superseded,key=related；每天多少时间→kind=fact,status=active,"
+        "key=time_budget；框架对比→query=对比。")
+
+
 def _survey_prompt(state, tech: str) -> str:
     answers = state.get("survey_answers") or {}
     field = state.get("survey_field")
@@ -72,6 +122,12 @@ def _survey_prompt(state, tech: str) -> str:
         lines.append(f"2. 固定字段已收齐，进入动态出题：出 1 道与「{tech}」相关的单选选择题（4 个选项、只有一个正确答案），检验前置知识；还需 {diag_remaining} 道。")
         lines.append("3. 只输出题目本身：题干 + 4 个选项（A/B/C/D），末尾单独一行「【答案】X」标注正确答案（X 为 A/B/C/D 之一，该行仅供系统读取、不会展示给用户），并在题干末尾引导用户「请直接回复选项字母（如 B）」；根据画像调整难度与语气，不要编号、解释或寒暄。")
     lines.append("4. 若收到一条【问卷校验】内部提示，说明用户上一条回答格式不对，请按提示重新问同一个字段。")
+    lines.append("5. 用户主动说出长期有效的偏好/约束/目标时，用 remember 记录；问卷字段由系统记录，不要用 remember 重复记录；一次性要求不要记录。")
+    if config.LTM_RECALL_ENABLED:
+        lines.append(f"6. {recall_hint()}")
+    ltm = long_term_memory_text(state, "survey")
+    if ltm:
+        lines.append(ltm)
     return "\n".join(lines)
 
 
@@ -80,6 +136,8 @@ def _planning_prompt(state, tech: str) -> str:
     summary = survey.profile_summary(profile) if profile else "（问卷信息缺失）"
     conv = (state.get("coach_summary") or "").strip()
     conv_block = f"\n此前对话摘要：{conv}\n" if conv else ""
+    ltm = long_term_memory_text(state, "planning")
+    recall_rule = f"\n- {recall_hint()}" if config.LTM_RECALL_ENABLED else ""
     return (
         f"你是「技术学习陪练」的路线规划助手。用户要学习：{tech}。\n"
         f"用户水平画像：{summary}{conv_block}\n"
@@ -96,7 +154,10 @@ def _planning_prompt(state, tech: str) -> str:
         "以用户口头输出为完成条件的措辞；讲解与核对由助手负责，描述里不规定用户必须输出什么。\n"
         "- 阶段按依赖排序，每阶段给出预估小时数。\n"
         "- materials 可引用已收集的资料或留空（留空由后续 collect 补充）。\n"
+        "- 用户提出长期有效的偏好/约束/目标时，用 remember 记录（只记稳定信息，不记一次性要求）；已有 key 尽量复用。\n"
         "- 不要编造资料链接；没有的信息写「待收集」。"
+        + recall_rule
+        + ltm
     )
 
 
@@ -127,8 +188,11 @@ def _coaching_prompt(state, tech: str) -> str:
                       + "\n".join(f"- [{it['id']}] {it['text']}" for it in open_items) + "\n")
     conv = (state.get("coach_summary") or "").strip()
     conv_block = f"此前对话摘要：{conv}\n" if conv else ""
-    blocks = "".join((profile_block, prog, facts_block, open_block, conv_block)).strip()
+    ltm_block = long_term_memory_text(state, "coaching")
+    blocks = "".join((profile_block, prog, ltm_block, facts_block,
+                      open_block, conv_block)).strip()
     suffix = f"\n\n{blocks}" if blocks else ""
+    recall_rule = f"\n- {recall_hint()}" if config.LTM_RECALL_ENABLED else ""
     return (
         f"你是「技术学习陪练」的执行陪练。用户学习：{tech}。\n\n"
         "你可以用工具推进学习：collect（收集资料）/ read（解读文档）/ "
@@ -138,6 +202,9 @@ def _coaching_prompt(state, tech: str) -> str:
         "原则：先给用户清晰的下一步，用户确认后再用工具；工具结果要提炼成对用户有用的信息，"
         "不要原样堆砌。里程碑完成时用 update_roadmap 勾选；用户要求调整路线时，"
         "先确认改动点再调用 revise_roadmap，改完把新路线完整呈现给用户。"
+        "用户明确说出长期有效的偏好/约束/目标时，调用 remember 记录；"
+        "「下次讲 X」用 remember 的 open_item 打开，解决后用 close 关闭；"
+        "只记稳定信息，不记一次性要求；remember 返回 conflict 时如实告知用户旧值已更新。"
         "\n里程碑推进规则："
         "\n- 勾选里程碑前，逐项核对该里程碑的所有待办是否真实完成；有任何未完成就先完成它，不要勾选、不要推进。"
         "\n- 勾选哪个里程碑：按「刚讲完、用户刚确认的内容」匹配里程碑描述，不要默认勾 current_stage 里第一个未完成项。"
@@ -154,6 +221,7 @@ def _coaching_prompt(state, tech: str) -> str:
         "\n- 同一阶段内可以连续勾选多个里程碑，但不要跨阶段勾选；一个阶段勾完后停下来向用户总结成果，并询问是否进入下一阶段；未经用户明确同意不要开始下一阶段内容。"
         "\n- 例外：用户上一轮已明确指令「直接进入下一步/下一阶段/不用再问」时，勾选后直接推进，不再询问。"
         "这条例外只免除勾选之后的确认询问，不免除勾选之前的验收：证据不足仍会被驳回。"
+        + recall_rule
         + suffix
     )
 
@@ -378,14 +446,116 @@ REVISE_ROADMAP_SCHEMA = {
     },
 }
 
+REMEMBER_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": (
+            "记录一条跨会话长期记忆（偏好 / 事实约束 / 目标 / 未决事项）。"
+            "只在用户表达稳定、以后仍然适用的信息时调用；一次性要求（如「这次讲快点」）不要记录。"
+            "用户说「记住…」「以后…」「每次…」时优先调用。"
+            "同一信息请复用长期记忆块里已有的 key；同 key 新内容会覆盖旧值，"
+            "返回里的 conflict 会给出「旧值→新值」，需要如实告知用户。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["profile", "open_item"],
+                         "description": "profile=偏好/事实/目标；open_item=未决事项"},
+                "category": {"type": "string", "enum": ["preference", "fact", "goal"],
+                             "description": "kind=profile 必填"},
+                "scope": {"type": "string", "enum": ["global", "tech"],
+                          "description": "global=所有技术通用；tech=仅当前技术"},
+                "tech": {"type": "string",
+                         "description": "scope=tech 时必填，必须等于当前技术"},
+                "key": {"type": "string", "description": (
+                    "profile 必填。偏好用受控词表："
+                    + "/".join(memory_domain.PREFERENCE_KEYS)
+                    + "；事实用 ASCII slug（如 constraint:java_version）；目标固定 goal")},
+                "text": {"type": "string", "description": "自然语言，≤200 字"},
+                "op": {"type": "string", "enum": ["open", "close"],
+                       "description": "kind=open_item 必填"},
+                "item_id": {"type": "string",
+                            "description": "close 时必填；open 时由系统生成"},
+                "expires_at": {"type": "string",
+                               "description": "可选，ISO 时间；open 时默认按 TTL"},
+            },
+            "required": ["kind"],
+        },
+    },
+}
+
+RECALL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "recall_memory",
+        "description": (
+            "按需查询跨会话长期记忆（结构化过滤：tech/kind/status/evidence/日期/文本子串；"
+            "不做语义检索）。只在用户问「以前学过什么 / 是否学过 / 撤销过什么 / "
+            "某技术历史 / 上次学了什么 / 我对讲解方式有什么偏好」时调用；不要每轮调用。"
+            "结果带 status/evidence/date；不要把历史、归档或未考据当成当前已掌握。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string",
+                          "description": ("可选；文本子串过滤（不做 BM25/语义排序）。"
+                                          "问某个具体知识点是否学过时用最短关键词，"
+                                          "如“框架对比”用“对比”")},
+                "tech": {"type": "string",
+                         "description": ("可选技术名；用户未点名其他技术时，"
+                                         "用当前会话技术；都不填才查所有技术")},
+                "kind": {"type": "string",
+                         "enum": ["capability", "preference", "fact", "goal", "open_item"],
+                         "description": ("可选；capability=里程碑/能力点（“学过哪些内容”通常用它），"
+                                         "fact=自评/时间预算/相关背景，goal=目标，"
+                                         "preference=偏好，open_item=未决/下次讲")},
+                "status": {"type": "string",
+                           "enum": ["active", "archived", "revoked", "superseded",
+                                    "closed", "expired", "historical", "history", "any"],
+                           "description": ("可选；不填=active。active=当前有效/我学过；"
+                                           "revoked=取消/撤销/放弃；superseded=被新值取代/"
+                                           "以前/旧值；closed=已关闭未决项；"
+                                           "history=所有历史状态（仅在用户问“所有历史”时用）")},
+                "evidence": {"type": "string",
+                             "enum": ["verified", "claimed", "degraded", "unknown"],
+                             "description": ("可选；verified=系统验收；claimed=用户口头声明；"
+                                             "degraded=验收降级；unknown=历史迁移/尚未确认"
+                                             "（用户说“没确认/没验证”用 unknown）")},
+                "key": {"type": "string",
+                        "description": ("可选；精确查某个 key。常见：self_level=自评熟悉度"
+                                        "（问“自评几分”），time_budget=每天可投入时间"
+                                        "（问“每天多少时间”），related=相关技术/基础背景"
+                                        "（问“什么基础/背景”），goal=目标")},
+                "date_from": {"type": "string", "description": "可选，YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "可选，YYYY-MM-DD"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10,
+                          "description": "返回条数，默认 5"},
+            },
+            "required": [],
+        },
+    },
+}
+
 COACH_TOOLS_BY_MODE: dict[str, list[dict]] = {
-    "survey": [],
-    "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA, GET_ROADMAP_SCHEMA],
+    "survey": [REMEMBER_SCHEMA, RECALL_SCHEMA],
+    "planning": [GENERATE_ROADMAP_SCHEMA, CONFIRM_ROADMAP_SCHEMA,
+                 GET_ROADMAP_SCHEMA, REMEMBER_SCHEMA, RECALL_SCHEMA],
     # coaching 不再暴露 note/note_commit：学习内容由自动沉淀（后台线程）
     # 确定性落库 + 候选确定性确认，agent 手动 note 会同步阻塞对话（note_pipeline 耗时长）
     "coaching": [COLLECT_SCHEMA, READ_SCHEMA, ASK_SCHEMA,
-                 GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA, REVISE_ROADMAP_SCHEMA],
+                 GET_ROADMAP_SCHEMA, UPDATE_ROADMAP_SCHEMA, REVISE_ROADMAP_SCHEMA,
+                 REMEMBER_SCHEMA, RECALL_SCHEMA],
 }
+
+
+def coach_tools_for_mode(mode: str) -> list[dict]:
+    """当前 mode 的可用工具；记忆或按需访问未启用时不暴露 recall_memory。"""
+    tools = list(COACH_TOOLS_BY_MODE.get(mode) or [])
+    if config.LTM_ENABLED and config.LTM_RECALL_ENABLED:
+        return tools
+    return [tool for tool in tools
+            if (tool.get("function") or {}).get("name") != "recall_memory"]
 
 
 # ============================================================
@@ -402,12 +572,18 @@ _PLAIN_ARG_FIELDS: dict[str, tuple[str, ...]] = {
     "update_roadmap": ("milestone_id", "done"),
     "note": ("tech",),
     "note_commit": ("decision",),
+    "remember": ("kind", "category", "scope", "tech", "key", "op",
+                 "item_id", "expires_at"),
+    "recall_memory": ("tech", "kind", "status", "evidence", "key",
+                      "date_from", "date_to", "limit"),
 }
 # 自由文本字段：只记长度 + 首 N 字（用户原话，全文不进日志）
 _PREVIEW_ARG_FIELDS: dict[str, tuple[str, ...]] = {
     "ask": ("question",),
     "generate_roadmap": ("goal",),
     "revise_roadmap": ("goal", "revision"),
+    "remember": ("text",),
+    "recall_memory": ("query",),
 }
 # 计数/数值字段：列表只记条数，不记内容（stages 里是整份学习计划）
 _SCALAR_ARG_FIELDS: dict[str, tuple[str, ...]] = {
@@ -504,6 +680,8 @@ def _generate_roadmap(args: dict, ctx: CoachCtx) -> dict:
             learner.save_tech_profile(ctx.tech, entry)
         except Exception:  # noqa: BLE001, S110 —— 画像落盘失败不阻断路线生成
             pass
+    # 问卷声明（目标 / 自评 / 相关技术 / 时间预算 / 诊断结果）同步进长期记忆
+    _sync_planning_memory(ctx, roadmap)
     return {
         "status": "ok",
         "roadmap_path": str(jp),
@@ -535,6 +713,269 @@ def _get_roadmap(args: dict, ctx: CoachCtx) -> dict:
                                    for m in s.get("milestones") or []]}
                    for s in r.get("stages") or []],
     }
+
+
+_CATEGORY_LABEL = {"preference": "偏好", "fact": "事实", "goal": "目标"}
+
+
+def _record_memory_event(events: list[dict], *, where: str) -> dict | None:
+    """写长期记忆事件；失败只留审计，不把工具调用打断。"""
+    if not config.LTM_ENABLED:
+        return None
+    try:
+        return memory_store.record_events(events)
+    except Exception as exc:  # noqa: BLE001 —— 记忆写入失败不应阻断对话/工具
+        audit("ltm_error", where=where,
+              error=f"{type(exc).__name__}: {exc}"[:200])
+        return None
+
+
+def _remember_tech(args: dict, ctx: CoachCtx) -> tuple[str, str | None]:
+    """取 open_item / tech 作用域要写入的技术名，并校验必须是当前技术。"""
+    current = str(ctx.tech or "").strip()
+    tech = str(args.get("tech") or "").strip()
+    if not tech:
+        return "", "需要 tech（当前技术名）"
+    if not current:
+        return tech, "当前会话没有技术名，无法记录技术作用域记忆"
+    if memory_domain.tech_key(tech) != memory_domain.tech_key(current):
+        return tech, f"tech 必须是当前技术「{current}」（收到「{tech}」）"
+    return current, None  # 统一用当前会话的技术名展示，避免大小写/别名漂移
+
+
+def _find_profile_entry(view: dict, category: str, scope: str, tech: str,
+                        key: str) -> dict | None:
+    target = memory_domain.profile_id(category, scope, tech, key)
+    if category == "goal":
+        goals = view.get("goals") or {}
+        if scope == "global":
+            rows = goals.get("global") or []
+        else:
+            rows = (goals.get("by_tech") or {}).get(
+                memory_domain.tech_key(tech)) or []
+        return next((row for row in rows if row.get("id") == target), None)
+    bucket = (view.get("preferences") if category == "preference"
+              else view.get("facts")) or []
+    return next((row for row in bucket if row.get("id") == target), None)
+
+
+def _remember_profile(args: dict, ctx: CoachCtx) -> dict:
+    category = str(args.get("category") or "").strip()
+    scope = str(args.get("scope") or "").strip()
+    key = str(args.get("key") or "").strip()
+    text = memory_domain.clean_text(args.get("text"))
+    tech = ""
+    if scope == "tech":
+        tech, err = _remember_tech(args, ctx)
+        if err:
+            return {"status": "error", "error": err}
+    if category == "goal":
+        key = "goal"  # 每个 (scope, tech) 只有一个 active 目标
+    err = memory_domain.validate_profile_item(category, scope, tech, key, text)
+    if err:
+        return {"status": "error", "error": err,
+                "valid": {"category": list(memory_domain.PROFILE_CATEGORIES),
+                          "scope": list(memory_domain.SCOPES),
+                          "preference_keys": list(memory_domain.PREFERENCE_KEYS)}}
+    try:
+        before = memory_store.ensure_view()
+    except Exception as exc:  # noqa: BLE001
+        audit("ltm_error", where="remember_profile_read",
+              error=f"{type(exc).__name__}: {exc}"[:200])
+        return {"status": "error", "error": "长期记忆读取失败，本次未记录"}
+    old = _find_profile_entry(before, category, scope, tech, key)
+    event = memory_domain.make_event(
+        "profile_recorded", session=ctx.thread_id or "", source="user",
+        category=category, scope=scope, tech=tech, key=key, text=text)
+    if _record_memory_event([event], where="remember_profile") is None:
+        return {"status": "error", "error": "长期记忆写入失败，本次未记录"}
+
+    action, conflict = "created", None
+    if old:
+        if memory_domain.texts_equal(old.get("text"), text):
+            action = "confirmed"
+        else:
+            action = "updated"
+            conflict = (f"{_CATEGORY_LABEL.get(category, category)}「{key}」已更新："
+                        f"『{old.get('text')}』→『{text}』")
+            audit("ltm_conflict", category=category, scope=scope,
+                  tech=tech, key=key)
+    return {"status": "ok", "action": action,
+            "id": memory_domain.profile_id(category, scope, tech, key),
+            "category": category, "scope": scope, "tech": tech,
+            "key": key, "text": text, "conflict": conflict}
+
+
+def _remember_open_item(args: dict, ctx: CoachCtx) -> dict:
+    op = str(args.get("op") or "").strip()
+    if op not in ("open", "close"):
+        return {"status": "error",
+                "error": "kind=open_item 时 op 必须是 open / close"}
+    tech, err = _remember_tech(args, ctx)
+    if err:
+        return {"status": "error", "error": err}
+    if op == "close":
+        item_id = str(args.get("item_id") or "").strip()
+        if not item_id:
+            return {"status": "error",
+                    "error": "close 需要 item_id（从注入块或上次 open 的返回值中取）"}
+        if not item_id.startswith(f"open:{memory_domain.tech_key(tech)}:"):
+            return {"status": "error", "error": "item_id 不属于当前技术"}
+        event = memory_domain.make_event(
+            "open_item_recorded", session=ctx.thread_id or "", source="user",
+            op="close", tech=tech, item_id=item_id)
+        if _record_memory_event([event], where="remember_close") is None:
+            return {"status": "error", "error": "长期记忆写入失败，本次未记录"}
+        return {"status": "ok", "action": "closed", "item_id": item_id}
+
+    text = memory_domain.clean_text(args.get("text"))
+    if not text:
+        return {"status": "error", "error": "open 需要 text"}
+    if len(text) > memory_domain.MAX_TEXT_CHARS:
+        return {"status": "error",
+                "error": f"text 不能超过 {memory_domain.MAX_TEXT_CHARS} 字"}
+    expires = str(args.get("expires_at") or "").strip()
+    if expires:
+        dt = memory_domain.parse_time(expires)
+        if dt is None:
+            return {"status": "error", "error": "expires_at 必须是 ISO 时间"}
+        expires = memory_domain.format_time(dt)
+    elif config.LTM_OPEN_ITEM_TTL_DAYS > 0:
+        expires = memory_domain.format_time(
+            memory_domain.local_now()
+            + timedelta(days=config.LTM_OPEN_ITEM_TTL_DAYS))
+    item_id = memory_domain.open_item_id(tech, text)
+    event = memory_domain.make_event(
+        "open_item_recorded", session=ctx.thread_id or "", source="user",
+        op="open", tech=tech, item_id=item_id, text=text,
+        expires_at=expires or None)
+    if _record_memory_event([event], where="remember_open") is None:
+        return {"status": "error", "error": "长期记忆写入失败，本次未记录"}
+    return {"status": "ok", "action": "opened", "item_id": item_id,
+            "text": text, "expires_at": expires or None}
+
+
+def _remember(args: dict, ctx: CoachCtx) -> dict:
+    """长期记忆写入工具：只接受显式、稳定的信息，代码校验后落事件。"""
+    if not config.LTM_ENABLED:
+        return {"status": "error",
+                "error": "长期记忆已关闭（LTM_ENABLED=false），无法记录"}
+    kind = str(args.get("kind") or "").strip()
+    if kind == "profile":
+        return _remember_profile(args, ctx)
+    if kind == "open_item":
+        return _remember_open_item(args, ctx)
+    return {"status": "error", "error": "kind 必须是 profile / open_item"}
+
+
+def _recall_memory(args: dict, ctx: CoachCtx) -> dict:
+    """按需记忆访问：结构化/时间线；不做 BM25/语义排序。"""
+    if not config.LTM_ENABLED:
+        return {"status": "error",
+                "error": "长期记忆已关闭（LTM_ENABLED=false）"}
+    if not config.LTM_RECALL_ENABLED:
+        return {"status": "error",
+                "error": "按需记忆访问未启用（LTM_RECALL_ENABLED=false）"}
+    from ..adapters import memory_search as search_store
+    from ..domain import memory_search as search_domain
+
+    started = time.monotonic()
+    query = str(args.get("query") or "").strip()
+    tech = str(args.get("tech") or "").strip() or None
+    kind = str(args.get("kind") or "").strip() or None
+    status = str(args.get("status") or "active").strip() or "active"
+    evidence = str(args.get("evidence") or "").strip() or None
+    key = str(args.get("key") or "").strip() or None
+    date_from = str(args.get("date_from") or "").strip() or None
+    date_to = str(args.get("date_to") or "").strip() or None
+    try:
+        limit = int(args.get("limit") or config.LTM_RECALL_TOP_K)
+    except (TypeError, ValueError):
+        limit = config.LTM_RECALL_TOP_K
+    limit = max(1, min(limit, 10))
+    try:
+        records = search_store.load_records()
+        hits = search_domain.filter_records(
+            records, query=query or None, tech=tech,
+            kinds=[kind] if kind else None,
+            statuses=[status] if status else None,
+            evidence=[evidence] if evidence else None,
+            keys=[key] if key else None,
+            date_from=date_from, date_to=date_to, limit=limit)
+        text, used = search_domain.render_records(
+            hits, max_chars=config.LTM_RECALL_MAX_CHARS)
+        mode = "substring" if query else "structured"
+    except Exception as exc:  # noqa: BLE001 —— 按需查询失败不能拖垮对话
+        audit("ltm_error", where="recall",
+              error=f"{type(exc).__name__}: {exc}"[:200])
+        return {"status": "error", "error": "记忆查询失败，本次未返回结果"}
+    ids = [str(item.get("id") or "") for item in used]
+    audit("ltm_recall", mode=mode, tech=tech, kind=kind, status=status,
+          evidence=evidence, key=key, date_from=date_from, date_to=date_to,
+          limit=limit, result_count=len(used), result_ids=ids[:20],
+          result_statuses=sorted({str(item.get("status") or "")
+                                  for item in used if item.get("status")}),
+          query_chars=len(query), has_query=bool(query),
+          elapsed_ms=round((time.monotonic() - started) * 1000, 1))
+    return {"status": "ok", "mode": mode,
+            "count": len(used), "text": text}
+
+
+def _sync_planning_memory(ctx: CoachCtx, roadmap: dict) -> None:
+    """问卷完成/路线生成时，把画像声明同步进长期记忆（source=user）。
+
+    重复调用 generate_roadmap（修订）会重复写同样的事件：同 key 同文本只会刷新
+    确认时间；诊断结果按“最近一次覆盖”折叠，不会累加成多倍题量。
+    """
+    if not config.LTM_ENABLED:
+        return
+    tech = str(ctx.tech or roadmap.get("tech") or "").strip()
+    profile = ctx.learner_profile or {}
+    if not tech or not profile:
+        return
+    events: list[dict] = []
+
+    def add_profile(category: str, key: str, value) -> None:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return
+        events.append(memory_domain.make_event(
+            "profile_recorded", session=ctx.thread_id or "", source="user",
+            category=category, scope="tech", tech=tech, key=key, text=text))
+
+    add_profile("goal", "goal", profile.get("goal"))
+    if profile.get("self_level") is not None:
+        add_profile("fact", "self_level", profile.get("self_level"))
+    add_profile("fact", "related", profile.get("related"))
+    if profile.get("time_budget") is not None:
+        add_profile("fact", "time_budget", profile.get("time_budget"))
+
+    graded = [d for d in (profile.get("diagnostics") or [])
+              if isinstance(d, dict) and d.get("grade")]
+    if graded:
+        right = sum(1 for d in graded if d.get("grade") == survey.GRADE_RIGHT)
+        events.append(memory_domain.make_event(
+            "diagnostic_recorded", session=ctx.thread_id or "", source="system",
+            tech=tech, asked=len(graded), right=right))
+    if events:
+        _record_memory_event(events, where="generate_roadmap")
+
+
+def _record_capability_event(roadmap: dict, milestone_id: str, done: bool,
+                             evidence: str | None, ctx: CoachCtx) -> None:
+    """里程碑勾选/取消后写能力事件（证据等级按验收闸门结果）。"""
+    if not config.LTM_ENABLED:
+        return
+    tech = str(roadmap.get("tech") or ctx.tech or "").strip()
+    point = _milestone_desc(roadmap, milestone_id)
+    if not tech or not point:
+        return
+    event = memory_domain.make_event(
+        "capability_recorded", session=ctx.thread_id or "", source="system",
+        tech=tech, point=point, milestone_id=milestone_id,
+        op="add" if done else "revoke",
+        evidence=evidence if done else None)
+    _record_memory_event([event], where="update_roadmap")
 
 
 def _collect(args: dict, ctx: CoachCtx) -> dict:
@@ -972,6 +1413,9 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
                for m in (s.get("milestones") or [])]
         return {"status": "error", "error": f"未知里程碑 {milestone_id}", "available": ids}
 
+    # 证据等级：默认 claimed（用户声明完成 / 验收被关闭）；验收通过 → verified；
+    # 验收器异常/解析失败降级放行 → degraded；取消勾选的事件不带 evidence。
+    evidence: str | None = "claimed"
     if done:
         # 闸 1（确定性）：跨阶段护栏——用户回合内只允许勾选同一阶段，同阶段不限次数。
         # 原「一轮只能勾一个」会卡住「Agent 已连续讲完多个小里程碑、事后一次性补勾」的
@@ -1065,9 +1509,12 @@ def _update_roadmap(args: dict, ctx: CoachCtx) -> dict:
                 return {"status": "rejected", "missing": verdict["missing"],
                         "reason": verdict["reason"], "suggested_id": suggested,
                         "action": "teach_then_recheck", "note": note}
+            # 走到这里只剩 True / None（None=验收器异常降级放行）
+            evidence = "verified" if verdict["verified"] is True else "degraded"
 
     learner.save_roadmap(updated)
     ctx.updates["roadmap"] = updated
+    _record_capability_event(updated, milestone_id, done, evidence, ctx)
     prog = roadmap_domain.stage_progress(updated, updated["current_stage"])
     # 里程碑推进卡点：勾选（done=True）后，若用户上一条回复不是明确推进指令，
     # 设置待确认标记 → 提示词强制停下总结 + 询问（用户回复后由 coach_human 清空）。
@@ -1159,6 +1606,8 @@ _TOOL_IMPL = {
     "note_commit": _note_commit,
     "update_roadmap": _update_roadmap,
     "revise_roadmap": _revise_roadmap,
+    "remember": _remember,
+    "recall_memory": _recall_memory,
 }
 
 # 「贵工具」：单次执行会烧外部额度（Tavily 搜索 / Firecrawl 抓取）+ 分钟级耗时。

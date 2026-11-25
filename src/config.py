@@ -174,6 +174,40 @@ class Config:
     LEARNER_DIR: Path = BASE_DIR / "learner"
     ROADMAP_DIR: Path = BASE_DIR / "roadmaps"
 
+    # 跨会话长期记忆（事件日志 + 物化视图）。LTM_ENABLED=false 时读写全部跳过，
+    # 行为回退到只有三舱/画像的现状。上限只限制**热视图**，超出的进归档冷存储。
+    LTM_ENABLED: bool = os.getenv("LTM_ENABLED", "true").lower() == "true"
+    LTM_MAX_PREFERENCES: int = int(os.getenv("LTM_MAX_PREFERENCES", "30"))
+    LTM_MAX_FACTS: int = int(os.getenv("LTM_MAX_FACTS", "50"))
+    LTM_MAX_MASTERED_PER_TECH: int = int(os.getenv("LTM_MAX_MASTERED_PER_TECH", "40"))
+    LTM_MAX_OPEN_ITEMS: int = int(os.getenv("LTM_MAX_OPEN_ITEMS", "50"))
+    LTM_MAX_GOALS: int = int(os.getenv("LTM_MAX_GOALS", "20"))
+    # 未决项默认过期天数（0=不过期；过期只在读取层过滤，不写回视图）
+    LTM_OPEN_ITEM_TTL_DAYS: int = int(os.getenv("LTM_OPEN_ITEM_TTL_DAYS", "60"))
+    # 调试开关：true 时把每次注入提示词的长期记忆原文追加到 logs/ltm_inject.jsonl
+    # （本地、已 gitignore）。默认关闭；这不是审计日志（审计仍只记 id/长度），
+    # 打开后文件里会有用户记忆原文。
+    LTM_DEBUG_DUMP: bool = os.getenv("LTM_DEBUG_DUMP", "false").lower() == "true"
+
+    # 长期记忆简报（唯一读取路径）预算：按条目淘汰，不切文本。
+    LTM_BRIEF_CURRENT_POINTS: int = int(os.getenv("LTM_BRIEF_CURRENT_POINTS", "8"))
+    LTM_BRIEF_SURVEY_OTHER_POINTS: int = int(os.getenv("LTM_BRIEF_SURVEY_OTHER_POINTS", "3"))
+    LTM_BRIEF_MAX_GLOBAL_ITEMS: int = int(os.getenv("LTM_BRIEF_MAX_GLOBAL_ITEMS", "8"))
+    # survey 只在进入技术时跑，且是唯一默认放其他技术具体点的阶段；
+    # 实测当前 6 技术全量 top3 约 1.6–1.8k 字，留余量到 2400。
+    LTM_BRIEF_SURVEY_MAX_CHARS: int = int(os.getenv("LTM_BRIEF_SURVEY_MAX_CHARS", "2400"))
+    LTM_BRIEF_PLANNING_MAX_CHARS: int = int(os.getenv("LTM_BRIEF_PLANNING_MAX_CHARS", "600"))
+    LTM_BRIEF_COACHING_MAX_CHARS: int = int(os.getenv("LTM_BRIEF_COACHING_MAX_CHARS", "300"))
+
+    # 按需记忆访问。默认开启：这是冷路径，
+    # 只在用户问到历史/撤销/跨技术经历时才由模型触发，不占常驻提示词预算；功能本身
+    # 不需要用户配置才能用。保留环境变量只为整体回滚（置 false 即隐藏工具与提示词规则）。
+    LTM_RECALL_ENABLED: bool = os.getenv("LTM_RECALL_ENABLED", "true").lower() == "true"
+    LTM_RECALL_TOP_K: int = int(os.getenv("LTM_RECALL_TOP_K", "5"))
+    LTM_RECALL_MAX_CHARS: int = int(os.getenv("LTM_RECALL_MAX_CHARS", "800"))
+    LTM_RECALL_TIMELINE_LIMIT: int = int(os.getenv("LTM_RECALL_TIMELINE_LIMIT", "20"))
+    LTM_RECALL_TIMELINE_MAX_CHARS: int = int(os.getenv("LTM_RECALL_TIMELINE_MAX_CHARS", "1200"))
+
     # Note 模块（差量提取）：召回已有笔记作上下文的预算参数
     # 召回上限是**笔记篇数**，不是检索分块条数：一篇笔记常切成多块，按块计数会让"top-3"
     # 实际只覆盖 1–2 篇（实测 51 个名额里 18–20 个被同一篇的多个分块重复占用）。
@@ -296,6 +330,29 @@ class Config:
         if not cls.FIRECRAWL_API_KEY:
             missing.append("FIRECRAWL_API_KEY")
         return missing
+
+    def ltm_brief_limits(self, mode: str) -> dict:
+        """briefing 的 mode 预算；与 CLI/graph 共用，避免两处漂移。"""
+        max_chars = {
+            "survey": self.LTM_BRIEF_SURVEY_MAX_CHARS,
+            "planning": self.LTM_BRIEF_PLANNING_MAX_CHARS,
+            "coaching": self.LTM_BRIEF_COACHING_MAX_CHARS,
+        }.get(mode, self.LTM_BRIEF_PLANNING_MAX_CHARS)
+        return {
+            "current_points": self.LTM_BRIEF_CURRENT_POINTS,
+            "other_points": self.LTM_BRIEF_SURVEY_OTHER_POINTS,
+            "max_global_items": self.LTM_BRIEF_MAX_GLOBAL_ITEMS,
+            "max_chars": max_chars,
+        }
+
+    def ltm_recall_limits(self) -> dict:
+        """按需记忆访问的默认预算；CLI 与工具共用。"""
+        return {
+            "top_k": self.LTM_RECALL_TOP_K,
+            "max_chars": self.LTM_RECALL_MAX_CHARS,
+            "timeline_limit": self.LTM_RECALL_TIMELINE_LIMIT,
+            "timeline_max_chars": self.LTM_RECALL_TIMELINE_MAX_CHARS,
+        }
 
     @classmethod
     def ensure_dirs(cls) -> None:

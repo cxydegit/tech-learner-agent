@@ -21,9 +21,11 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
+from .adapters import memory as memory_store
 from .adapters.audit import audit, audit_context, set_turn
 from .adapters.llm import ToolCallError, chat_with_tools
 from .config import config
+from .domain import briefing as briefing_domain
 from .domain import exit_intent, survey
 from .pipelines.collect import collect_pipeline
 from .pipelines.note import (
@@ -35,12 +37,13 @@ from .pipelines.note import (
 from .pipelines.qa import qa_pipeline
 from .pipelines.read import read_pipeline
 from .pipelines.route import (
-    COACH_TOOLS_BY_MODE,
     HEAVY_TOOLS,
     CoachCtx,
     coach_runtime_context,
     coach_system_prompt,
+    coach_tools_for_mode,
     consolidate_memory,
+    long_term_memory_text,
     run_coach_tool,
     run_kb_retrieve,
     run_memory_sweep,
@@ -249,6 +252,11 @@ class LearnState(TypedDict):
     # 确定性读路由——当前用户回合命中知识库的相关片段 [{path, snippet}]
     # （coach_kb_retrieve 每用户回合覆盖；coaching 提示词注入作答上下文）
     kb_context: list | None
+    # 跨会话长期记忆：coach_trim 每回合从 learner/memory.json 加载完整视图，
+    # 按当前 mode/tech 编译成任务简报后只存简报；完整视图不进 state，
+    # 避免 checkpoint 每回合序列化全量数据。
+    # text/included_ids/dropped/truncated/counts——included_ids 供 prompt 边界审计。
+    memory_briefing: dict
 
 
 # ============================================================
@@ -501,6 +509,39 @@ def coach_trim(state: LearnState) -> dict:
     if mode == "survey" and not state.get("survey_field") and not state.get("survey_answers"):
         updates["survey_field"] = survey.SURVEY_FIELDS[0]  # 从第一问开始
 
+    # 跨会话长期记忆：加载完整视图 → 编译本次 mode 的任务简报。
+    # 记忆故障只降级为空简报，不阻断对话。
+    if not config.LTM_ENABLED:
+        updates["memory_briefing"] = {}
+    else:
+        try:
+            view = memory_store.ensure_view()
+            brief = briefing_domain.build_briefing(
+                view, mode=mode, tech=state.get("tech") or "",
+                profile=state.get("learner_profile") or {},
+                roadmap=state.get("roadmap"),
+                coach_facts=state.get("coach_facts") or [],
+                coach_open_items=state.get("coach_open_items") or [],
+                limits=config.ltm_brief_limits(mode))
+        except Exception as exc:  # noqa: BLE001 —— 记忆故障不能拖垮对话
+            audit("ltm_error", where="brief",
+                  error=f"{type(exc).__name__}: {exc}"[:200])
+            brief = {"text": "", "included_ids": [], "dropped": [],
+                     "truncated": False, "counts": {}, "section_lengths": {}}
+        # 完整 sections 只在 CLI/测试里看；state/checkpoint 只留提示词需要的字段。
+        updates["memory_briefing"] = {
+            key: brief.get(key)
+            for key in ("text", "included_ids", "dropped", "truncated",
+                        "counts", "section_lengths")
+        }
+        audit("ltm_brief", mode=mode, tech=state.get("tech") or "",
+              chars=len(brief.get("text") or ""),
+              included=len(brief.get("included_ids") or []),
+              dropped=len(brief.get("dropped") or []),
+              truncated=bool(brief.get("truncated")),
+              counts=brief.get("counts") or {},
+              sections=brief.get("section_lengths") or {})
+
     # 上下文压缩：超阈值 → 三舱记忆增量整理（LLM 只看旧消息产增量，既有积累不过 LLM），
     # 只留最近 N 轮
     if len(msgs) > config.COACH_COMPRESS_AT:
@@ -552,11 +593,34 @@ def coach_llm(state: LearnState) -> dict:
     # 放 system 的话前缀缓存每轮从 system 就断，其后整段历史全部重算。
     # 落盘仍走 msgs：下面所有持久化更新（错误路径 / 空输出 / 正常回复）都只追加 assistant 消息。
     injection = coach_runtime_context(state)
+    prompt = coach_system_prompt(state)
+    ltm_text = long_term_memory_text(state)
+    brief = state.get("memory_briefing") or {}
+    # 调试落盘必须在最终提示词拼好之后：编译只说明「产出了什么」，
+    # 这里才能记录「实际追加了什么、多长、是否真的在 prompt 里」。
+    memory_store.dump_prompt_injection(
+        mode=state.get("mode") or "survey",
+        tech=state.get("tech") or "",
+        session=_coach_thread_id(),
+        prompt=prompt,
+        ltm_text=ltm_text,
+        blocks={"briefing": brief.get("text") or ""},
+        section_lengths=brief.get("section_lengths") or {},
+        ids=brief.get("included_ids") or [],
+        turn=state.get("coach_turn_index"),
+        dropped=brief.get("dropped") or [],
+        truncated=bool(brief.get("truncated")),
+    )
+    if ltm_text and ltm_text not in prompt:
+        audit("ltm_prompt_mismatch",
+              mode=state.get("mode") or "survey",
+              tech=state.get("tech") or "",
+              ltm_chars=len(ltm_text), prompt_chars=len(prompt))
     try:
         result = chat_with_tools(
-            coach_system_prompt(state),
+            prompt,
             [*msgs, injection] if injection else msgs,
-            COACH_TOOLS_BY_MODE.get(state.get("mode") or "survey", []),
+            coach_tools_for_mode(state.get("mode") or "survey"),
             call_site="coach.chat",
         )
     except ToolCallError as e:

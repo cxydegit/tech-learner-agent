@@ -17,6 +17,23 @@ from src.config import config
 
 
 @pytest.fixture(autouse=True)
+def _ltm_disabled_by_default(monkeypatch):
+    """长期记忆默认关闭：它会在 learner/ 下落盘，其他模块的单测不应写真实目录。
+
+    长期记忆自己的用例显式 `monkeypatch.setattr(config, "LTM_ENABLED", True)`
+    并把 LEARNER_DIR / ROADMAP_DIR 指向 tmp_path。
+    """
+    monkeypatch.setattr(config, "LTM_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _ltm_debug_dump_off_by_default(monkeypatch):
+    """调试原文落盘默认关闭：本地 `.env` 可能开了 LTM_DEBUG_DUMP=true，
+    测试必须显式 opt-in，避免把 fixture 记忆写进日志/拖慢用例。"""
+    monkeypatch.setattr(config, "LTM_DEBUG_DUMP", False)
+
+
+@pytest.fixture(autouse=True)
 def _audit_log_to_tmp(tmp_path, monkeypatch):
     """把审计日志重定向到本用例的 tmp_path，跑完还原。"""
     monkeypatch.setattr(config, "AUDIT_LOG_DIR", tmp_path / "logs")

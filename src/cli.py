@@ -634,5 +634,271 @@ def learn(session_id: str | None = None):
                 console.print(f"[yellow]未知命令: {op}（输入 /help 查看）[/yellow]")
 
 
+@cli.group()
+def memory():
+    """跨会话长期记忆：查看 / 归档 / 逻辑删除 / 从事件日志重建。"""
+
+
+@memory.command("show")
+@click.option("--archive", "show_archive", is_flag=True,
+              help="查看超上限归档（冷存储，不注入提示词）")
+def memory_show(show_archive: bool = False):
+    """展示长期记忆的物化视图（tech / 来源 / 证据等级 / 条目 id）。"""
+    from .adapters.memory import ensure_view, event_texts
+    from .domain import memory as memory_domain
+
+    if show_archive:
+        _show_memory_archive()
+        return
+    if not config.LTM_ENABLED:
+        console.print("[yellow]长期记忆已关闭（LTM_ENABLED=false），读写全部跳过。[/yellow]")
+        return
+    view = ensure_view()
+    console.print(Panel.fit("🧠 跨会话长期记忆（learner/memory.json）", style="bold cyan"))
+    console.print(f"updated_at: {view.get('updated_at') or '-'}  |  "
+                  f"last_event_id: {view.get('last_event_id') or '-'}")
+    if memory_domain.view_is_empty(view):
+        console.print("[yellow]当前没有 active 长期记忆条目。首次运行（事件日志为空）"
+                      "才会从 learner/profile.json 与 roadmaps/ 迁移。[/yellow]")
+        return
+
+    caps = view.get("capabilities") or {}
+    if caps:
+        console.print("\n[bold]技术能力[/bold]")
+        for key, cap in caps.items():
+            console.print(f"  {cap.get('tech') or key} — {cap.get('summary') or ''}",
+                          markup=False)
+            diag = cap.get("diagnostics") or {}
+            if diag.get("asked"):
+                console.print(f"    诊断：{diag['asked']} 题中 {diag['right']} 对"
+                              f"（{diag.get('at') or '-'}）", markup=False)
+            for item in cap.get("mastered") or []:
+                console.print(
+                    f"    - [{item.get('evidence')}] {item.get('point')}"
+                    f"  （{item.get('at')}，{item.get('id')}，"
+                    f"事件 {item.get('source_event_id')}）", markup=False)
+
+    preferences = view.get("preferences") or []
+    facts = view.get("facts") or []
+    goals = view.get("goals") or {}
+    goal_rows = (goals.get("global") or []) + [
+        row for rows in (goals.get("by_tech") or {}).values() for row in rows]
+    superseded = {entry.get("supersedes") for entry in preferences + facts + goal_rows
+                  if entry.get("supersedes")}
+    old_texts = event_texts(superseded)
+
+    def dump(title: str, rows: list[dict]) -> None:
+        if not rows:
+            return
+        console.print(f"\n[bold]{title}[/bold]")
+        for entry in rows:
+            scope = entry.get("scope") or "tech"
+            tech = entry.get("tech") or ""
+            where = f"{scope}/{tech}" if scope == "tech" else scope
+            supersedes = entry.get("supersedes")
+            if supersedes and old_texts.get(supersedes):
+                sup = f"，旧值『{old_texts[supersedes]}』"
+            elif supersedes:
+                sup = f"，取代事件 {supersedes}"
+            else:
+                sup = ""
+            console.print(
+                f"  [{entry.get('key')}] {entry.get('text')}"
+                f"  （{where}，{entry.get('source')}，"
+                f"最后确认 {entry.get('last_confirmed') or '-'}，{entry.get('id')}，"
+                f"事件 {entry.get('source_event_id')}{sup}）",
+                markup=False)
+
+    dump("偏好", preferences)
+    dump("事实与约束", facts)
+    dump("长期目标（全局）", goals.get("global") or [])
+    for tech_key, rows in (goals.get("by_tech") or {}).items():
+        dump(f"技术目标（{tech_key}）", rows)
+
+    open_items = view.get("open_items") or []
+    if open_items:
+        console.print("\n[bold]未决事项[/bold]")
+        for item in open_items:
+            expired = memory_domain.parse_time(item.get("expires_at"))
+            mark = "（已过期）" if expired and expired < memory_domain.local_now() else ""
+            console.print(
+                f"  [{item.get('id')}] {item.get('text')}"
+                f"  （{item.get('tech')}，到期 {item.get('expires_at') or '无'}，"
+                f"事件 {item.get('source_event_id')}{mark}）",
+                markup=False)
+
+
+@memory.command("brief")
+@click.option("--mode", type=click.Choice(["survey", "planning", "coaching"]),
+              required=True, help="按哪个阶段生成简报")
+@click.option("--tech", required=True, help="当前技术（如 python / Spring Boot）")
+def memory_brief(mode: str, tech: str):
+    """预览某个 mode/技术下模型会看到的长期记忆简报（不调 LLM）。"""
+    from .adapters import learner
+    from .adapters.memory import ensure_view
+    from .domain import briefing as briefing_domain
+    from .domain import memory as memory_domain
+
+    if not config.LTM_ENABLED:
+        console.print("[yellow]长期记忆已关闭（LTM_ENABLED=false）。[/yellow]")
+        return
+    view = ensure_view()
+    profile = learner.load_profile().get(memory_domain.tech_key(tech), {})
+    roadmap = learner.load_roadmap(tech)
+    brief = briefing_domain.build_briefing(
+        view, mode=mode, tech=tech, profile=profile, roadmap=roadmap,
+        coach_facts=[], coach_open_items=[],
+        limits=config.ltm_brief_limits(mode))
+    console.print(Panel.fit(
+        f"🧾 长期记忆简报（{mode} / {brief.get('tech') or tech}）",
+        style="bold cyan"))
+    console.print(f"chars={len(brief.get('text') or '')}  "
+                  f"sections={len([s for s in brief.get('sections') or [] if s.get('items')])}  "
+                  f"included={len(brief.get('included_ids') or [])}  "
+                  f"dropped={len(brief.get('dropped') or [])}", markup=False)
+    if brief.get("text"):
+        console.print(brief["text"], markup=False)
+    else:
+        console.print("[dim]（当前没有 delta，briefing 为空）[/dim]")
+    counts = brief.get("counts") or {}
+    console.print(f"evidence={counts.get('evidence') or {}}  "
+                  f"route={counts.get('route') or {}}", markup=False)
+    if brief.get("dropped"):
+        console.print("[dim]dropped：[/dim]")
+        for item in brief["dropped"]:
+            console.print(f"  - {item.get('kind')} {item.get('id')} "
+                          f"({item.get('reason')})", markup=False)
+    console.print("[dim]CLI 不读取会话三舱：coach_facts / coach_open_items 按空处理；"
+                  "真实会话的去重会在集成后生效。[/dim]")
+
+
+@memory.command("recall")
+@click.argument("query", required=False)
+@click.option("--query-type", type=click.Choice(["lookup", "timeline"]),
+              default="lookup", show_default=True,
+              help="lookup=按条件查记录；timeline=按时间看事件")
+@click.option("--tech", default=None, help="技术名；不填查所有技术")
+@click.option("--kind", "kinds", multiple=True,
+              type=click.Choice(["capability", "preference", "fact", "goal", "open_item"]),
+              help="只查某一类记忆，可重复")
+@click.option("--status", "statuses", multiple=True,
+              type=click.Choice(["active", "archived", "revoked", "superseded",
+                                 "closed", "expired", "historical", "history", "any"]),
+              help="按状态过滤，可重复")
+@click.option("--evidence", "evidence_levels", multiple=True,
+              type=click.Choice(["verified", "claimed", "degraded", "unknown"]),
+              help="按证据等级过滤，可重复")
+@click.option("--key", "keys", multiple=True,
+              help="按记忆 key 过滤（如 self_level / time_budget / related），可重复")
+@click.option("--date-from", default=None, help="起始日期 YYYY-MM-DD")
+@click.option("--date-to", default=None, help="结束日期 YYYY-MM-DD")
+@click.option("--limit", type=int, default=None, help="返回条数")
+def memory_recall(query: str | None, query_type: str, tech: str | None,
+                  kinds: tuple[str, ...], statuses: tuple[str, ...],
+                  evidence_levels: tuple[str, ...], keys: tuple[str, ...],
+                  date_from: str | None, date_to: str | None,
+                  limit: int | None):
+    """按需查询长期记忆（5.1 结构化 + 事件时间线；不做向量检索）。"""
+    from .adapters import memory_search as search_store
+    from .domain import memory_search as search_domain
+
+    if not config.LTM_ENABLED:
+        console.print("[yellow]长期记忆已关闭（LTM_ENABLED=false）。[/yellow]")
+        return
+    limits = config.ltm_recall_limits()
+    if query_type == "timeline":
+        resolved_limit = limit or limits["timeline_limit"]
+        events = search_store.load_timeline()
+        hits = search_domain.filter_timeline(
+            events, query=query, tech=tech, date_from=date_from,
+            date_to=date_to, limit=resolved_limit)
+        text, used = search_domain.render_timeline(
+            hits, max_chars=limits["timeline_max_chars"])
+    else:
+        resolved_limit = limit or limits["top_k"]
+        records = search_store.load_records()
+        hits = search_domain.filter_records(
+            records, query=query, tech=tech, kinds=kinds or None,
+            statuses=statuses or None,
+            evidence=evidence_levels or None, keys=keys or None,
+            date_from=date_from, date_to=date_to, limit=resolved_limit)
+        text, used = search_domain.render_records(
+            hits, max_chars=limits["max_chars"])
+    console.print(Panel.fit(
+        f"🔎 记忆查询（{query_type}）", style="bold cyan"))
+    console.print(f"count={len(used)}  limit={resolved_limit}", markup=False)
+    console.print(text, markup=False)
+    console.print("[dim]lookup 是模型工具；timeline 仅 CLI 调试。"
+                  "BM25/语义未立项，按查询日志再评估。[/dim]")
+
+
+def _show_memory_archive() -> None:
+    """打印归档冷存储（超上限条目；不参与注入，只供查证/恢复）。"""
+    from .adapters.memory import archive_path, forgotten_ids, load_archive
+
+    rows, bad = load_archive()
+    deleted = forgotten_ids()
+    console.print(Panel.fit("🗄️ 长期记忆归档（冷存储，不注入提示词）", style="bold cyan"))
+    console.print(f"文件：{archive_path()}")
+    if bad:
+        console.print(f"[yellow]⚠️ {bad} 行损坏，已跳过[/yellow]")
+    if not rows:
+        console.print("[dim]归档为空。条目超过热视图上限时才会进入这里。[/dim]")
+        return
+    console.print(f"共 {len(rows)} 条：")
+    for row in rows:
+        text = row.get("text") or row.get("point") or ""
+        key = row.get("key") or ""
+        key_part = f"[{key}] " if key else ""
+        mark = "，已逻辑删除" if row.get("id") in deleted else ""
+        console.print(
+            f"  - [{row.get('kind')}] {row.get('id')} {key_part}{text}"
+            f"  （归档 {row.get('archived_at') or '-'}，来源 {row.get('source') or '-'}{mark}）",
+            markup=False)
+
+
+@memory.command("forget")
+@click.argument("target_id")
+def memory_forget(target_id: str):
+    """按 id 逻辑删除一条记忆（偏好 / 事实 / 目标 / 未决事项）。
+
+    TARGET_ID: `memory show` 输出的条目 id（如 pref:global:analogy）
+    """
+    from .adapters.memory import forget
+
+    result = forget(target_id)
+    if result.get("status") != "ok":
+        console.print(f"[red]❌ {result.get('error')}[/red]")
+        return
+    entry = result.get("entry") or {}
+    label = entry.get("text") or entry.get("point") or ""
+    where = "归档条目" if result.get("from_archive") else "条目"
+    console.print(f"✅ 已删除{where} [{result.get('kind')}] "
+                  f"{result.get('target_id')} {label}")
+    console.print("[dim]逻辑删除：事件日志保留原始记录，视图不再注入该条目。[/dim]")
+
+
+@memory.command("rebuild")
+def memory_rebuild():
+    """从事件日志重建物化视图（视图损坏/落后时用）。"""
+    from .adapters.memory import rebuild
+
+    if not config.LTM_ENABLED:
+        console.print("[yellow]长期记忆已关闭（LTM_ENABLED=false），未执行重建。[/yellow]")
+        return
+    view = rebuild()
+    caps = view.get("capabilities") or {}
+    goals = view.get("goals") or {}
+    goal_count = len(goals.get("global") or []) + sum(
+        len(rows) for rows in (goals.get("by_tech") or {}).values())
+    console.print(
+        f"✅ 视图已重建：{len(caps)} 个技术、"
+        f"{len(view.get('preferences') or [])} 条偏好、"
+        f"{len(view.get('facts') or [])} 条事实、"
+        f"{goal_count} 条目标、"
+        f"{len(view.get('open_items') or [])} 条未决事项"
+        f"（last_event_id={view.get('last_event_id') or '-'}）")
+
+
 if __name__ == "__main__":
     cli()

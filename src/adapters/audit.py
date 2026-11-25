@@ -182,6 +182,43 @@ def set_turn(thread_id: str | None, turn: int | None) -> None:
         _TURN_BY_THREAD[thread_id] = int(turn)
 
 
+def _resolve_context(
+    *,
+    origin: str | None = None,
+    run_id: str | None = None,
+    turn: int | None = None,
+) -> dict:
+    """解析当前事件的公共上下文；`audit()` 与调试落盘共用，避免两套口径。"""
+    resolved_origin = (
+        origin or _CONTEXT_ORIGIN.get() or os.getenv("AUDIT_ORIGIN") or "product"
+    )
+    resolved_origin = resolved_origin.strip().lower()
+    if resolved_origin not in ORIGINS:
+        resolved_origin = "unknown"
+    resolved_run_id = (
+        run_id if run_id is not None
+        else (_CONTEXT_RUN_ID.get() or os.getenv("AUDIT_RUN_ID") or None)
+    )
+    thread_id = _current_thread_id()
+    resolved_turn = turn if turn is not None else _TURN_BY_THREAD.get(thread_id)
+    return {
+        "thread_id": thread_id,
+        "step": _graph_context()[1],
+        "origin": resolved_origin,
+        "run_id": resolved_run_id or None,
+        "turn": resolved_turn,
+    }
+
+
+def current_context() -> dict:
+    """当前图/线程的公共上下文（thread_id/step/origin/run_id/turn）。
+
+    调试落盘（可能写入用户记忆原文）用它补齐与审计日志一致的归属字段；
+    不要在这里加正文，只返回元数据。
+    """
+    return _resolve_context()
+
+
 def audit(
     event: str,
     /,
@@ -207,29 +244,13 @@ def audit(
     公共字段由本函数注入且**优先级高于同名字段**（调用方传了 `ts=` 也不会覆盖），
     保证"每条事件都带得上会话标识"这条不变式不被局部代码破坏。
     """
-    resolved_origin = (
-        origin or _CONTEXT_ORIGIN.get() or os.getenv("AUDIT_ORIGIN") or "product"
-    )
-    resolved_origin = resolved_origin.strip().lower()
-    if resolved_origin not in ORIGINS:
-        resolved_origin = "unknown"
-    resolved_run_id = (
-        run_id if run_id is not None
-        else (_CONTEXT_RUN_ID.get() or os.getenv("AUDIT_RUN_ID") or None)
-    )
-    resolved_run_id = resolved_run_id or None
-    thread_id = _current_thread_id()
-    resolved_turn = turn if turn is not None else _TURN_BY_THREAD.get(thread_id)
+    ctx = _resolve_context(origin=origin, run_id=run_id, turn=turn)
     payload = {
         **fields,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "level": logging.getLevelName(level),
-        "thread_id": thread_id,
-        "step": _graph_context()[1],
+        **ctx,
         "event": event,
-        "origin": resolved_origin,
-        "run_id": resolved_run_id,
-        "turn": resolved_turn,
     }
     LOGGER.log(level, json.dumps(payload, ensure_ascii=False, default=str))
 
